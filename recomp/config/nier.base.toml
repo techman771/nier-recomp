@@ -1,0 +1,30 @@
+# XenonRecomp config for NieR (Xbox 360), title 0x535107E8.
+# tools/make_config.ps1 appends the generated explicit function bounds to produce nier.toml.
+
+[main]
+file_path = "../../Nier/default.xex"
+out_directory_path = "../out"
+switch_table_file_path = "nier_switch_tables.toml"
+
+# Optimizations stay off until the runtime works; turning them on changes what hooks can see.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+restgprlr_14_address = 0x825D17F0
+savegprlr_14_address = 0x825D17A0
+restfpr_14_address = 0x825D224C
+savefpr_14_address = 0x825D2200
+restvmx_14_address = 0x825D2538
+savevmx_14_address = 0x825D22A0
+restvmx_64_address = 0x825D25CC
+savevmx_64_address = 0x825D2334
+
+longjmp_address = 0x825D5AC0
+setjmp_address = 0x825D5DE0
+
