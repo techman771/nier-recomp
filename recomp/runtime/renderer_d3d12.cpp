@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -21,6 +22,7 @@
 #include <vector>
 #include "guest.h"
 #include "renderer.h"
+#include <xxHash/xxhash.h>   // shader cache keys
 
 using Microsoft::WRL::ComPtr;
 
@@ -463,18 +465,101 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return Check(gDevice->CreateDescriptorHeap(&copyRtvHeap, IID_PPV_ARGS(&gDepthCopyRtvHeap)), "depth copy RTV heap");
     }
 
-    ID3DBlob* ShaderBlob(const GuestShader& shader)
+    // Guest shaders compile on worker threads as soon as the GPU emulation first sees them
+    // (RendererPrepareShader), usually frames before a draw needs them, and the DXBC is cached on disk
+    // (recomp/shadercache, keyed by the HLSL's hash). Compiling on the render thread at first use made
+    // hitches of 100-500 ms whenever a new effect or enemy appeared.
+    ComPtr<ID3DBlob> CompileGuestShader(const GuestShader& shader)
     {
-        auto found = gShaderBlobs.find(shader.hash);
-        if (found != gShaderBlobs.end()) return found->second.Get();
-        ComPtr<ID3DBlob> blob, errors;
-        HRESULT result = D3DCompile(shader.hlsl.data(), shader.hlsl.size(), "guest", nullptr, nullptr, "main", shader.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &blob, &errors);
+        const char* profile = shader.pixel ? "ps_5_1" : "vs_5_1";
+        const uint64_t key = XXH3_64bits_withSeed(shader.hlsl.data(), shader.hlsl.size(), shader.pixel ? 1 : 2);
+        char path[128];
+        snprintf(path, sizeof(path), "..\\shadercache\\%s_%016llX_%016llX.dxbc", shader.pixel ? "ps" : "vs", (unsigned long long)shader.hash, (unsigned long long)key);
+        ComPtr<ID3DBlob> blob;
+        if (FILE* file = fopen(path, "rb"))
+        {
+            fseek(file, 0, SEEK_END);
+            const long size = ftell(file);
+            fseek(file, 0, SEEK_SET);
+            if (size > 0 && SUCCEEDED(D3DCreateBlob(size_t(size), &blob)) && fread(blob->GetBufferPointer(), 1, size_t(size), file) == size_t(size))
+            {
+                fclose(file);
+                return blob;
+            }
+            fclose(file);
+            blob.Reset();
+        }
+        ComPtr<ID3DBlob> errors;
+        HRESULT result = D3DCompile(shader.hlsl.data(), shader.hlsl.size(), "guest", nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &blob, &errors);
         if (FAILED(result))
         {
             Log("[shader] %s %016llX failed to compile: %s\n", shader.pixel ? "pixel" : "vertex", shader.hash, errors ? (const char*)errors->GetBufferPointer() : "unknown");
-            blob.Reset();
+            return nullptr;
         }
-        gShaderBlobs[shader.hash] = blob;
+        CreateDirectoryA("..\\shadercache", nullptr);
+        if (FILE* file = fopen(path, "wb"))
+        {
+            fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), file);
+            fclose(file);
+        }
+        return blob;
+    }
+
+    struct ShaderJobs
+    {
+        std::mutex mutex;
+        std::condition_variable work;
+        std::deque<std::shared_ptr<const GuestShader>> queue;
+        std::unordered_map<uint64_t, std::shared_future<ComPtr<ID3DBlob>>> results;   // by guest hash
+        std::unordered_map<uint64_t, std::shared_ptr<std::promise<ComPtr<ID3DBlob>>>> promises;
+        bool started = false;
+    } gShaderJobs;
+
+    void ShaderWorker()
+    {
+        while (true)
+        {
+            std::shared_ptr<const GuestShader> shader;
+            std::shared_ptr<std::promise<ComPtr<ID3DBlob>>> promise;
+            {
+                std::unique_lock lock(gShaderJobs.mutex);
+                gShaderJobs.work.wait(lock, [] { return !gShaderJobs.queue.empty(); });
+                shader = gShaderJobs.queue.front();
+                gShaderJobs.queue.pop_front();
+                promise = gShaderJobs.promises[shader->hash];
+                gShaderJobs.promises.erase(shader->hash);
+            }
+            promise->set_value(CompileGuestShader(*shader));
+        }
+    }
+
+    // Starts compiling a shader unless it is already compiled or queued; returns its result.
+    std::shared_future<ComPtr<ID3DBlob>> QueueShader(const std::shared_ptr<const GuestShader>& shader)
+    {
+        std::lock_guard lock(gShaderJobs.mutex);
+        if (!gShaderJobs.started)
+        {
+            gShaderJobs.started = true;
+            const unsigned workers = std::clamp(std::thread::hardware_concurrency() / 4, 2u, 6u);
+            for (unsigned i = 0; i < workers; i++) std::thread(ShaderWorker).detach();
+        }
+        auto found = gShaderJobs.results.find(shader->hash);
+        if (found != gShaderJobs.results.end()) return found->second;
+        auto promise = std::make_shared<std::promise<ComPtr<ID3DBlob>>>();
+        std::shared_future<ComPtr<ID3DBlob>> future = promise->get_future().share();
+        gShaderJobs.results[shader->hash] = future;
+        gShaderJobs.promises[shader->hash] = promise;
+        gShaderJobs.queue.push_back(shader);
+        gShaderJobs.work.notify_one();
+        return future;
+    }
+
+    ID3DBlob* ShaderBlob(const std::shared_ptr<GuestShader>& shader)
+    {
+        auto found = gShaderBlobs.find(shader->hash);
+        if (found != gShaderBlobs.end()) return found->second.Get();
+        ComPtr<ID3DBlob> blob = QueueShader(shader).get();   // usually ready by now
+        gShaderBlobs[shader->hash] = blob;
         return blob.Get();
     }
 
@@ -501,7 +586,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         auto found = gPipelines.find(key);
         if (found != gPipelines.end()) return found->second.Get();
 
-        ID3DBlob* vs = ShaderBlob(*draw.vs), * ps = ShaderBlob(*draw.ps);
+        ID3DBlob* vs = ShaderBlob(draw.vs), * ps = ShaderBlob(draw.ps);
         ComPtr<ID3D12PipelineState> pipeline;
         if (vs && ps)
         {
@@ -1688,3 +1773,4 @@ void RendererDumpStats()
 }
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
+void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader) { QueueShader(shader); }

@@ -336,6 +336,30 @@ speed. Measured with the sampling profiler (`NIER_PROFILE`), 20 s of the first f
   index are copied (fetch constants often cover a whole level's geometry): 30 fps.
 The command thread is now about 60% busy; the game's main thread is always busy.
 `NIER_HASH_EVERY_USE=1` and `NIER_NO_VERTEX_TRIM=1` turn the two shortcuts off for comparison.
+60 fps: the original runs 3D scenes at 30 fps (menus at 60). D3D queues each flip from the swap
+interrupt (`sub_8257A4B0`, reached only through the indirect call table); its swap word carries the
+present interval in bits 8-11 (2 in 3D scenes, 3 somewhere at boot), the flip waits that many vblanks
+after the previous one, and the GPU waits on a flip gate (`WAIT_REG_MEM` on the word at physical
+`0630E004`) until it has happened. `NIER_60FPS=1` (set by `run_boot.ps1` unless `-Fps30`) replaces the
+table entry with a wrapper that lowers the interval to 1, like the Series X FPS Boost. Game logic is
+time-based: at 60 fps every scene arrives at a later frame number and real time to reach the first
+fight is unchanged (~10,300 vblanks at 30 fps, ~11,250 at 60), so nothing runs at double speed.
+Speed work for 60 fps (first fight, 15 s): vertex range trimming now also applies when a shader writes
+r0 after its last vertex fetch or only r0's other components (the skinning shaders); vertex data is
+appended and swapped in place instead of resized (zero-filled) first; the frame's command list
+reserves capacity; index reads reuse a buffer; texture contents are hashed with XXH3 (every byte);
+the command thread polls for 4 ms before sleeping and the vblank thread spins its last 2 ms. Guest
+shaders compile on worker threads as soon as they are translated, with the DXBC cached on disk
+(`recomp/shadercache`, keyed by the HLSL's hash, ignored by git): compiling at first use on the render
+thread caused 100-500 ms hitches. Result: 59.8 fps in the fight with a warm cache (58.7 cold), the
+command thread ~40% busy and waiting on the flip gate the rest. The stats dump (profiler exit) now
+lists frame times in vblanks, on-time and late frames split into waiting / idle / working time, and
+each `WAIT_REG_MEM` location's count and total wait.
+Fast route to the fight: `recomp/newgame_args.txt` (Start every 60 frames skips the logos and menus;
+A at the "Overwrite previously-saved system data?" prompt keeps the default No; Left, A answers Yes
+to "Set your name as Nier?"). The opening credits can't be skipped; the fight starts around frame
+5,600 at 30 fps and 11,000 at 60 fps.
+
 Runs on the scripted path don't reach the same scene at the same frame number when speed changes
 (loading takes wall-clock time), so compare frames by scene, not by number.
 

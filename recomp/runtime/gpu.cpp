@@ -17,6 +17,7 @@
 #include "guest.h"
 #include "renderer.h"
 #include "xenos_shader.h"
+#include <xxHash/xxhash.h>   // texture content hashes (xxhash.lib is linked already)
 
 namespace
 {
@@ -45,6 +46,37 @@ namespace
     std::mutex gStatsMutex;
     std::map<uint32_t, uint64_t> gUnknownOpcodes;
     int gWaitTimeoutsLogged = 0, gCorruptLogged = 0;
+    struct WaitStats { uint64_t count = 0, ticks = 0; uint32_t lastReference = 0, mask = 0; };
+    std::map<uint64_t, WaitStats> gWaitStats;   // WAIT_REG_MEM by (info, polled location)
+
+    // Command thread time per frame (swap to swap): waiting in WAIT_REG_MEM, idle with the ring empty
+    // (waiting for the game's commands), and the rest (work). Summed separately for frames that took
+    // more than 1.5 vblanks, to see what makes 60 fps frames late.
+    struct FrameTiming { uint64_t frames = 0, total = 0, wait = 0, idle = 0; };
+    FrameTiming gOnTime, gLate;
+    uint64_t gFrameWaitTicks = 0, gFrameIdleTicks = 0;
+    LARGE_INTEGER gLastSwapTime{};
+    uint64_t gFrameTimeBins[6] = {};   // frame time in vblanks: <1.25, <1.75, <2.25, <2.75, <3.5, more
+
+    void NoteFrameTiming()
+    {
+        LARGE_INTEGER now, frequency;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        if (gLastSwapTime.QuadPart)
+        {
+            const uint64_t total = uint64_t(now.QuadPart - gLastSwapTime.QuadPart);
+            const double vblanks = double(total) * 60.0 / double(frequency.QuadPart);
+            gFrameTimeBins[vblanks < 1.25 ? 0 : vblanks < 1.75 ? 1 : vblanks < 2.25 ? 2 : vblanks < 2.75 ? 3 : vblanks < 3.5 ? 4 : 5]++;
+            FrameTiming& bucket = vblanks > 1.5 ? gLate : gOnTime;
+            bucket.frames++;
+            bucket.total += total;
+            bucket.wait += gFrameWaitTicks;
+            bucket.idle += gFrameIdleTicks;
+        }
+        gLastSwapTime = now;
+        gFrameWaitTicks = gFrameIdleTicks = 0;
+    }
     std::atomic<bool> gRunning{ false };
 
     struct Stream
@@ -272,9 +304,11 @@ namespace
         }
         RendererFrame output;
         output.frame = frame;
+        const size_t commandCount = gFrameCommands.size();
         output.commands = std::move(gFrameCommands);
         output.scanoutBase = gScanoutBase;
         gFrameCommands.clear();
+        gFrameCommands.reserve(commandCount + commandCount / 4 + 16);   // draws are large; avoid regrowing
         RendererSubmitFrame(std::move(output));
     }
 
@@ -336,6 +370,7 @@ namespace
         shader->hlsl = entry.info.hlsl;
         shader->pixel = stage == 1;
         entry.shader = shader;
+        if (entry.info.ok) RendererPrepareShader(shader);   // compile in the background, ahead of use
         char path[96];
         snprintf(path, sizeof(path), "..\\shaders\\%s_%016llX.hlsl", stage ? "ps" : "vs", capture.hash);
         if (FILE* file = fopen(path, "wb")) { fwrite(entry.info.hlsl.data(), 1, entry.info.hlsl.size(), file); fclose(file); }
@@ -352,12 +387,44 @@ namespace
         return (((offset & ~511u) << 3) + ((offset & 448) << 2) + (offset & 63) + ((y & 16) << 7) + ((((y & 8) >> 2) + (x >> 3)) & 3) * 64) >> logBytes;
     }
 
+    // Xenos endian modes: 1 swaps bytes in 16-bit units, 2 in 32-bit units, 3 swaps 16-bit halves.
+    void SwapInPlace(uint8_t* data, uint32_t bytes, uint32_t endian)
+    {
+        if (endian == 1)
+        {
+            uint32_t i = 0;
+            for (; i + 2 <= bytes && (i & 7); i += 2) std::swap(data[i], data[i + 1]);
+            for (; i + 8 <= bytes; i += 8)
+            {
+                uint64_t v;
+                memcpy(&v, data + i, 8);
+                v = ((v & 0x00FF00FF00FF00FFull) << 8) | ((v >> 8) & 0x00FF00FF00FF00FFull);
+                memcpy(data + i, &v, 8);
+            }
+            for (; i + 2 <= bytes; i += 2) std::swap(data[i], data[i + 1]);
+        }
+        else if (endian == 2)
+            for (uint32_t i = 0; i + 4 <= bytes; i += 4)
+            {
+                uint32_t v;
+                memcpy(&v, data + i, 4);
+                v = __builtin_bswap32(v);
+                memcpy(data + i, &v, 4);
+            }
+        else if (endian == 3)
+            for (uint32_t i = 0; i + 4 <= bytes; i += 4)
+            {
+                uint32_t v;
+                memcpy(&v, data + i, 4);
+                v = (v << 16) | (v >> 16);
+                memcpy(data + i, &v, 4);
+            }
+    }
+
     void CopySwapped(uint8_t* out, const uint8_t* in, uint32_t bytes, uint32_t endian)
     {
         memcpy(out, in, bytes);
-        if (endian == 1) for (uint32_t i = 0; i + 2 <= bytes; i += 2) std::swap(out[i], out[i + 1]);
-        else if (endian == 2) for (uint32_t i = 0; i + 4 <= bytes; i += 4) { std::swap(out[i], out[i + 3]); std::swap(out[i + 1], out[i + 2]); }
-        else if (endian == 3) for (uint32_t i = 0; i + 4 <= bytes; i += 4) { std::swap(out[i], out[i + 2]); std::swap(out[i + 1], out[i + 3]); }
+        SwapInPlace(out, bytes, endian);
     }
 
     std::map<uint32_t, uint64_t> gSubstitutedFormats;
@@ -526,21 +593,14 @@ namespace
         static const bool hashEveryUse = GetEnvironmentVariableA("NIER_HASH_EVERY_USE", nullptr, 0) > 0;   // debugging
         const bool large = !hashEveryUse && bytes + (levels > 1 ? mipBytes : 0) > 64 * 1024;
         HashMemo* memo = large ? &hashMemo[key] : nullptr;
-        uint64_t content = 1469598103934665603ull;
+        // Every byte is hashed (XXH3, many GB/s): a bone matrix rewritten in place may change only some
+        // of a texel's components, which sampling would miss.
+        uint64_t content = 0;
         if (memo && memo->frame == gFrames.load()) content = memo->hash;
-        else if (!large)
-        {
-            // Every word: a bone matrix rewritten in place may change only some of a texel's
-            // components, which sampling one word in four would miss (stale bones for one mesh).
-            for (uint64_t i = 0; i + 8 <= bytes; i += 8) content = (content ^ *(const uint64_t*)(source + i)) * 1099511628211ull;
-            if (levels > 1)
-                for (uint64_t i = 0; i + 8 <= mipBytes; i += 8) content = (content ^ *(const uint64_t*)(g_base + mipGuest + i)) * 1099511628211ull;
-        }
         else
         {
-            for (uint64_t i = 0; i < bytes; i += 16) content = (content ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
-            if (levels > 1)
-                for (uint64_t i = 0; i < mipBytes; i += 64) content = (content ^ *(const uint32_t*)(g_base + mipGuest + (i & ~3ull))) * 1099511628211ull;
+            content = XXH3_64bits(source, size_t(bytes));
+            if (levels > 1) content = XXH3_64bits_withSeed(g_base + mipGuest, size_t(mipBytes), content);
             if (memo) *memo = { gFrames.load(), content };
         }
 
@@ -759,7 +819,7 @@ namespace
             for (uint32_t i = 0; i < count; i++) out[i] = i + offset;
             return true;
         }
-        std::vector<uint8_t> raw;
+        static thread_local std::vector<uint8_t> raw;   // reused: no allocation or zero-fill per draw
         if (select == 0)
         {
             const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -913,12 +973,14 @@ namespace
             copies[copyCount++] = { slot, first, last - first, d1 & 3, g_base + PhysicalToGuest(d0 & ~3u) };
             totalBytes += last - first;
         }
-        draw.vertexData.resize(totalBytes);
+        // Appended rather than resized first: resizing zero-fills, which cost as much as the copy.
+        draw.vertexData.reserve(totalBytes);
         uint32_t written = 0;
         for (uint32_t i = 0; i < copyCount; i++)
         {
             const VertexCopy& copy = copies[i];
-            CopySwapped(draw.vertexData.data() + written, copy.source + copy.first, copy.bytes, copy.endian);
+            draw.vertexData.insert(draw.vertexData.end(), copy.source + copy.first, copy.source + copy.first + copy.bytes);
+            SwapInPlace(draw.vertexData.data() + written, copy.bytes, copy.endian);
             draw.vertexBase[copy.slot] = written - copy.first;
             written += copy.bytes;
         }
@@ -1181,6 +1243,8 @@ namespace
         case PM4_WAIT_REG_MEM:
         {
             uint32_t waitInfo = s.Next(), poll = s.Next(), reference = s.Next(), mask = s.Next();
+            LARGE_INTEGER waitBegin, waitEnd;
+            QueryPerformanceCounter(&waitBegin);
             for (DWORD start = GetTickCount(); !Compare(waitInfo, PollValue(waitInfo, poll) & mask, reference); SwitchToThread())
             {
                 if (GetTickCount() - start > 200)
@@ -1188,6 +1252,17 @@ namespace
                     if (gWaitTimeoutsLogged++ < 8) Log("[gpu] WAIT_REG_MEM gave up: info 0x%X poll 0x%X ref 0x%X mask 0x%X\n", waitInfo, poll, reference, mask);
                     break;
                 }
+            }
+            QueryPerformanceCounter(&waitEnd);
+            gFrameWaitTicks += uint64_t(waitEnd.QuadPart - waitBegin.QuadPart);
+            {
+                // Per distinct wait (condition and polled location): how often and how long (GpuDumpStats).
+                std::lock_guard lock(gStatsMutex);
+                WaitStats& stats = gWaitStats[(uint64_t(waitInfo) << 32) | poll];
+                stats.count++;
+                stats.ticks += uint64_t(waitEnd.QuadPart - waitBegin.QuadPart);
+                stats.lastReference = reference;
+                stats.mask = mask;
             }
             break;
         }
@@ -1216,6 +1291,7 @@ namespace
         {
             uint64_t frame = gFrames.fetch_add(1) + 1;
             gFrameDrawsLogged = 0;
+            NoteFrameTiming();
             if (frame == gCaptureFrame + 1)
             {
                 LogSetCaptureFile(nullptr);
@@ -1370,21 +1446,31 @@ namespace
         PPCContext ctx;
         gGpuContext = &ctx;
         gGpuPcr = AttachGuestThread(ctx);
-        uint32_t idle = 0;
+        // The game often waits for the GPU to pass a marker right after submitting it, so new commands
+        // are picked up by polling (yielding) for a few milliseconds after the last work; only a longer
+        // idle stretch sleeps. Sleep(1) wakes 1-2 ms late, which used to push 60 fps frames past their vblank.
+        LARGE_INTEGER frequency, lastWork, now;
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&lastWork);
+        const int64_t pollTicks = frequency.QuadPart * 4 / 1000;
         while (true)
         {
             uint32_t write = R32(MMIO_BASE + REG_CP_RB_WPTR * 4) & (gRingDwords - 1);
             if (write == gReadIndex)
             {
-                if (++idle > 256) Sleep(1);
+                LARGE_INTEGER before;
+                QueryPerformanceCounter(&before);
+                if (before.QuadPart - lastWork.QuadPart > pollTicks) Sleep(1);
                 else SwitchToThread();
+                QueryPerformanceCounter(&now);
+                gFrameIdleTicks += uint64_t(now.QuadPart - before.QuadPart);
                 continue;
             }
-            idle = 0;
             ExecuteStream({ gRingBase, gRingDwords, gReadIndex, write }, 0);
             gReadIndex = write;
             W32(MMIO_BASE + REG_CP_RB_RPTR * 4, gReadIndex);
             if (gWritebackAddress) W32(gWritebackAddress, gReadIndex);
+            QueryPerformanceCounter(&lastWork);
         }
     }
 
@@ -1398,11 +1484,16 @@ namespace
         const int64_t period = frequency.QuadPart * 1001 / 60000;
         while (true)
         {
+            // Sleep until about 2 ms before the vblank, then yield until it: Sleep(1) alone made
+            // vblanks up to a millisecond late, and late vblanks delay 60 fps flips.
             next.QuadPart += period;
-            for (LARGE_INTEGER now;; Sleep(1))
+            const int64_t margin = frequency.QuadPart * 2 / 1000;
+            for (LARGE_INTEGER now;;)
             {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= next.QuadPart) break;
+                if (next.QuadPart - now.QuadPart > margin) Sleep(1);
+                else SwitchToThread();
             }
             W32(MMIO_BASE + REG_VBLANK_STATUS * 4, 1);
             gVblanks++;
@@ -1429,6 +1520,41 @@ namespace
 
 uint64_t GpuFrameCount() { return gFrames.load(); }
 
+void GpuResetFrameTiming()
+{
+    std::lock_guard lock(gStatsMutex);
+    gOnTime = {};
+    gLate = {};
+    for (auto& bin : gFrameTimeBins) bin = 0;
+    gWaitStats.clear();
+}
+
+// 60 fps (NIER_60FPS=1): D3D queues each flip from the swap interrupt (sub_8257A4B0, reached only
+// through the indirect call table). Its swap word carries the present interval in bits 8-11 (2 in
+// 3D scenes: 30 fps); the flip may happen that many vblanks after the previous one, and the GPU waits
+// for it. An interval of 1 lets 3D scenes present every vblank, like the Series X's FPS Boost.
+extern "C" PPC_FUNC(__imp__sub_8257A4B0);
+namespace
+{
+    PPC_FUNC(QueueFlipEveryVblank)
+    {
+        const uint32_t word = ctx.r3.u32, interval = (word >> 8) & 0xF;
+        static std::atomic<int> logged{ 0 };
+        if (interval > 1 && logged++ == 0) Log("[gpu] 60 fps: present interval %u lowered to 1\n", interval);
+        if (interval > 1) ctx.r3.u64 = (word & ~0xF00u) | 0x100u;
+        __imp__sub_8257A4B0(ctx, base);
+    }
+}
+
+void GpuInstallHooks()
+{
+    if (GetEnvironmentVariableA("NIER_60FPS", nullptr, 0) > 0)
+    {
+        PPC_LOOKUP_FUNC(g_base, 0x8257A4B0) = QueueFlipEveryVblank;
+        Log("[gpu] NIER_60FPS: flips may happen every vblank\n");
+    }
+}
+
 void GpuDumpStats()
 {
     Log("[gpu] %llu frames, %llu draws, %llu indirect buffers, %llu fences, %llu CP interrupts, %llu vblanks, ring read %u\n", gFrames.load(), gDraws.load(), gIndirect.load(), gFences.load(), gCpInterrupts.load(), gVblanks.load(), gReadIndex);
@@ -1440,6 +1566,20 @@ void GpuDumpStats()
     Log("[gpu] shaders seen: %zu vertex, %zu pixel\n", gShaderLibrary[0].size(), gShaderLibrary[1].size());
     Log("[gpu] %llu draws submitted, %llu resolves, %llu draws skipped\n", gSubmittedDraws.load(), gResolves.load(), gSkippedDraws.load());
     std::lock_guard lock(gStatsMutex);
+    {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        const auto ms = [&](uint64_t ticks, uint64_t frames) { return frames ? double(ticks) * 1000.0 / frequency.QuadPart / frames : 0.0; };
+        Log("[gpu] frame times in vblanks: <1.25: %llu, 1.25-1.75: %llu, 1.75-2.25: %llu, 2.25-2.75: %llu, 2.75-3.5: %llu, more: %llu\n",
+            gFrameTimeBins[0], gFrameTimeBins[1], gFrameTimeBins[2], gFrameTimeBins[3], gFrameTimeBins[4], gFrameTimeBins[5]);
+        for (const auto* bucket : { &gOnTime, &gLate })
+            Log("[gpu] %s frames: %llu, average %.2f ms = %.2f waiting (WAIT_REG_MEM) + %.2f idle (ring empty) + %.2f working\n", bucket == &gOnTime ? "on-time" : "late",
+                (unsigned long long)bucket->frames, ms(bucket->total, bucket->frames), ms(bucket->wait, bucket->frames), ms(bucket->idle, bucket->frames),
+                ms(bucket->total - bucket->wait - bucket->idle, bucket->frames));
+        for (const auto& [key, stats] : gWaitStats)
+            Log("[gpu] WAIT_REG_MEM info 0x%X poll 0x%X (last ref 0x%X mask 0x%X): %llu waits, %.1f ms total\n", uint32_t(key >> 32), uint32_t(key),
+                stats.lastReference, stats.mask, (unsigned long long)stats.count, double(stats.ticks) * 1000.0 / frequency.QuadPart);
+    }
     for (const auto& [reason, count] : gSkipReasons) Log("[gpu] skipped: %s x%llu\n", reason.c_str(), count);
     for (const auto& [format, count] : gSubstitutedFormats) Log("[gpu] texture format %u substituted x%llu\n", format, count);
     for (const auto& [opcode, count] : gUnknownOpcodes) Log("[gpu] unhandled opcode 0x%02X seen %llu times\n", opcode, count);

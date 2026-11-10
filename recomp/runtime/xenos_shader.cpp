@@ -415,8 +415,10 @@ float3 CubeDirection(float3 c)
             const bool mini = (w[1] >> 30) & 1;
             if (mini || stride == 0) stride = lastStride; else lastStride = stride;
             result.vertexSlots.insert(slot);
-            if (source != 0 || sourceChannel != 0) indexedOtherwise = true;
-            if (dest == 0) indexWritten = true;
+            // Only writes to r0.x that happen before a vertex fetch reads it matter; this fetch's own
+            // result lands after its address was read. Dest swizzle 7 leaves a component unwritten.
+            if (source != 0 || sourceChannel != 0 || indexWritten) indexedOtherwise = true;
+            if (dest == 0 && (destSwizzle & 7) != 7) indexWritten = true;
             {
                 TranslatedShader::VertexUse& use = result.vertexUse[slot];
                 if (use.stride && use.stride != stride * 4) indexedOtherwise = true;
@@ -632,7 +634,7 @@ float3 CubeDirection(float3 c)
             }
             result.hlsl = hlsl;
             result.ok = !failed;
-            result.directVertexIndex = !pixel && !indexWritten && !indexedOtherwise;
+            result.directVertexIndex = !pixel && !indexedOtherwise;   // see EmitVertexFetch
         }
     };
 }

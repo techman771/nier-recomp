@@ -190,6 +190,7 @@ namespace
     {
         while (GpuFrameCount() < firstFrame) Sleep(50);
         Log("[profile] sampling from frame %llu for %.0f s\n", (unsigned long long)GpuFrameCount(), seconds);
+        GpuResetFrameTiming();
 
         const DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
         std::unordered_map<DWORD, HANDLE> handles;

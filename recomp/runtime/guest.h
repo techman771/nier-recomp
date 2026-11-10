@@ -32,7 +32,9 @@ void AudioDumpStats();
 uint64_t GpuFrameCount();
 void GpuRequestCapture();   // F12: log every draw of the next frame and save its image
 void ProfilerInit();        // NIER_PROFILE=<frame>,<seconds>: sampling profile into the log
-void NoteGuestSwap();       // the game submitted a frame (for NIER_FIXED_TIME)
+void GpuResetFrameTiming(); // restart the frame time statistics (the profiler does at its start)
+void GpuInstallHooks();    // replaces indirect-call table entries (NIER_60FPS)
+void NoteGuestSwap();      // the game submitted a frame (for NIER_FIXED_TIME)
 uint64_t FixedElapsed100ns();   // NIER_FIXED_TIME's elapsed time
 void DumpGuestThreads();   // logs every guest thread's stack and last imports
 void WatchInit();

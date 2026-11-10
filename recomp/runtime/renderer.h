@@ -123,3 +123,5 @@ void RendererDumpStats();
 // Called by the renderer (after the frame's GPU work) with a write-back resolve's pixels, RGBA8 rows.
 void GpuWriteResolvedPixels(const RendererResolve& resolve, const uint8_t* rgba, uint32_t rowPitch);
 void RendererSaveFrame(uint64_t frame);   // save that frame's image to recomp/frames (any thread)
+// Starts compiling a newly translated guest shader in the background (any thread).
+void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader);

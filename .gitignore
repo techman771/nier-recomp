@@ -29,3 +29,4 @@
 *.iso
 *.ppm
 /recomp/captures/
+/recomp/shadercache/

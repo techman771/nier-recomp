@@ -108,6 +108,7 @@ uint32_t LoadGame(const std::string& gameDir)
     for (auto* m = PPCFuncMappings; m->host; ++m, ++mapped)
         PPC_LOOKUP_FUNC(g_base, m->guest) = m->host;
     Log("mapped %zu functions, entry 0x%08zX\n", mapped, image.entry_point);
+    GpuInstallHooks();
 
     // ParseImage leaves non-thunk import slots holding their record in host byte order.
     auto* imports = reinterpret_cast<const Xex2ImportHeader*>(getOptHeaderPtr(file.data(), XEX_HEADER_IMPORT_LIBRARIES));
