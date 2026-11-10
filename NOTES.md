@@ -213,6 +213,12 @@ the low half of each 32-bit word and y from the high half (Xenia: offsets 0, 16)
 them the other way round, which swapped every 16-bit attribute pair: texture coordinates came out as
 (v, u), so textures were smeared into stripes, and much of the store's geometry was garbled.
 
+Packed 10/11-bit vertex formats: names list fields from the most significant bit (Xenia):
+`k_10_11_11` (16) is x 11 bits at bit 0, y 11 at 11, z 10 at 22; `k_11_11_10` (17) is x 10 at 0,
+y 11 at 10, z 11 at 21. The translator had the two swapped, which scrambled every character's
+normals (format 16): faces under Nier's hood rendered black, cloth looked glossy, Yonah was lit
+wrongly. Fixed; the user confirmed Nier and Yonah now match the reference video.
+
 Textures are made readable for every shader stage (`kShaderRead` in `renderer_d3d12.cpp`), not just
 pixel shaders: the bone texture is read by vertex shaders, and with the pixel-shader state alone a
 vertex shader may read it before the upload into it has finished.

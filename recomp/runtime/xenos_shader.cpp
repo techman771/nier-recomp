@@ -64,8 +64,10 @@ float PackedField(uint w, uint offset, uint bits, bool isSigned, bool isInt)
     return isSigned ? (isInt ? float(s) : max(float(s) / scale, -1.0)) : (isInt ? float(u) : float(u) / scale);
 }
 float4 Fetch2101010(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 10, s, i), PackedField(w, 10, 10, s, i), PackedField(w, 20, 10, s, i), PackedField(w, 30, 2, s, i)); }
-float4 Fetch101111(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 10, s, i), PackedField(w, 10, 11, s, i), PackedField(w, 21, 11, s, i), 1.0); }
-float4 Fetch111110(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 11, s, i), PackedField(w, 11, 11, s, i), PackedField(w, 22, 10, s, i), 1.0); }
+// k_11_11_10: x 10 bits at 0, y 11 at 10, z 11 at 21.
+float4 FetchK11_11_10(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 10, s, i), PackedField(w, 10, 11, s, i), PackedField(w, 21, 11, s, i), 1.0); }
+// k_10_11_11: x 11 bits at 0, y 11 at 11, z 10 at 22.
+float4 FetchK10_11_11(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 11, s, i), PackedField(w, 11, 11, s, i), PackedField(w, 22, 10, s, i), 1.0); }
 float4 Fetch16F(uint a, uint n)
 {
     float4 v = float4(0, 0, 0, 1);
@@ -430,8 +432,10 @@ float3 CubeDirection(float3 c)
             {
             case 6: fetch = "Fetch8888(a_, " + flags + ")"; break;
             case 7: fetch = "Fetch2101010(a_, " + flags + ")"; break;
-            case 16: fetch = "Fetch101111(a_, " + flags + ")"; break;
-            case 17: fetch = "Fetch111110(a_, " + flags + ")"; break;
+            // Format names list fields from the most significant bit (Xenia): k_10_11_11 (16) is
+            // x 11 bits at 0, y 11 at 11, z 10 at 22; k_11_11_10 (17) is x 10 at 0, y 11 at 10, z 11 at 21.
+            case 16: fetch = "FetchK10_11_11(a_, " + flags + ")"; break;
+            case 17: fetch = "FetchK11_11_10(a_, " + flags + ")"; break;
             case 25: fetch = "Fetch16(a_, 2, " + flags + ")"; break;
             case 26: fetch = "Fetch16(a_, 4, " + flags + ")"; break;
             case 31: fetch = "Fetch16F(a_, 2)"; break;
