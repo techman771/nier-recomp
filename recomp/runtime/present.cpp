@@ -15,6 +15,9 @@ namespace
         case WM_SIZE:
             if (w != SIZE_MINIMIZED) RendererResize(LOWORD(l), HIWORD(l));
             return 0;
+        case WM_KEYDOWN:
+            if (w == VK_F12) GpuRequestCapture();   // capture the next frame for debugging
+            return DefWindowProcA(window, message, w, l);
         case WM_CLOSE:
             fflush(stdout);
             TerminateProcess(GetCurrentProcess(), 0);

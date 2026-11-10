@@ -257,6 +257,26 @@ format 22 (`k_24_8`) with the depth in every channel, as Xenia does. Depth buffe
 `R24G8_TYPELESS` so they can be read. The shadow map pass and the scene depth (`07A7D000`,
 `072E2000`, `14D55000` in the prologue) are real now.
 
+Auto-exposure and resolve write-back: the scene is rendered in HDR (RGBM) and the game measures its
+brightness by resolving each downsampling step into the next mip level of one texture (`07184000`
+512x512, levels at `07284000`, `072C4000` ... `072DC000`, then `0767A000`), sampling the levels with
+set-LOD. The CPU then reads the result to set the exposure constant (`c0`) of the next frames.
+Gameplay (not the cutscenes, which use fixed exposure) turned white because resolves only existed as
+host textures. Now:
+- a texture whose base is a resolved surface gets its mip levels from the resolved surfaces at the
+  level addresses, combined into one mipmapped host texture and recopied when a level is rewritten;
+- resolves of 64x64 texels or less are read back after the frame's GPU work and written into guest
+  memory as the copy hardware would (tiled, red/blue swap, endian swap from `RB_COPY_DEST_INFO`).
+  `NIER_RESOLVE_WRITEBACK=all` writes back every resolve (slow), `none` disables it.
+
+Gameplay renders at 768x432 into 800-pixel-wide EDRAM surfaces (cutscenes use 1280x720) and runs
+well below real time (about 15-20 fps game speed in the first fight).
+
+Scripted path into gameplay (the first fight in the prologue starts around frame 10600):
+`recomp/gameplay_args.txt` holds the `-AutoPress` string (the opening sequence above, then Start /
+Left / A to skip the cutscene). F12 in the game window logs every draw of the next frame to
+`recomp/captures/capture_f<frame>.log` and saves its image (not yet verified).
+
 ALU exports follow Xenia's rules (`ucode.h`, `GetConstant0WriteMask` / `GetConstant1WriteMask`): both
 the vector and scalar results go to the vector destination, components in both write masks receive
 1.0, and with the scalar-relative bit set, components in neither receive 0.0. Getting this wrong left

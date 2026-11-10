@@ -116,11 +116,27 @@ namespace
     }
 }
 
+namespace { FILE* gCaptureLog = nullptr; }
+
+void LogSetCaptureFile(FILE* file)
+{
+    std::lock_guard lock(gLogMutex);
+    if (gCaptureLog) fclose(gCaptureLog);
+    gCaptureLog = file;
+}
+
 void Log(const char* format, ...)
 {
     std::lock_guard lock(gLogMutex);
     va_list arguments;
     va_start(arguments, format);
+    if (gCaptureLog)
+    {
+        va_list copy;
+        va_copy(copy, arguments);
+        vfprintf(gCaptureLog, format, copy);
+        va_end(copy);
+    }
     vprintf(format, arguments);
     va_end(arguments);
     fflush(stdout);

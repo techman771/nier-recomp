@@ -181,6 +181,8 @@ namespace
     struct MovieSource { TextureDescriptor y, u, v; bool valid = false; };
     MovieSource gMovie;
     uint64_t gLogDrawsAt = ~0ull;
+    std::atomic<bool> gCaptureRequested{ false };
+    uint64_t gCaptureFrame = ~0ull;
 
     constexpr uint32_t PRIM_QUAD_LIST = 13, FORMAT_8 = 2;
 
@@ -649,6 +651,16 @@ namespace
         resolve.width = gRegisters[0x231A] & 0x3FFF;
         resolve.height = (gRegisters[0x231A] >> 16) & 0x3FFF;
         resolve.swapRedBlue = resolve.copyColor && ((gRegisters[0x231B] >> 24) & 1);
+        // Small colour resolves are also written back to guest memory: the game reads its luminance
+        // reduction on the CPU to set exposure, and full-screen write-backs would cost too much.
+        static const int writeBackMode = [] {
+            char value[16];
+            if (!GetEnvironmentVariableA("NIER_RESOLVE_WRITEBACK", value, sizeof(value))) return 0;
+            return _stricmp(value, "all") == 0 ? 1 : _stricmp(value, "none") == 0 ? 2 : 0;
+        }();
+        resolve.destEndian = gRegisters[0x231B] & 7;
+        resolve.destFormat = (gRegisters[0x231B] >> 7) & 0x3F;
+        resolve.writeBack = resolve.copyColor && writeBackMode != 2 && (writeBackMode == 1 || resolve.width * resolve.height <= 64 * 64);
 
         // The copy is issued as a rect list whose corners give the copied rectangle in screen space.
         // Reading the EDRAM side subtracts the window offset; the destination uses screen space.
@@ -814,6 +826,13 @@ namespace
         const uint32_t primitive = initiator & 0x3F;
         std::vector<uint32_t> sequence;
         if (!ReadIndices(initiator, source, sequence)) { SkipDraw("unreadable index buffer"); return; }
+        if (primitive == 1)
+        {
+            static int logged = 0;   // point lists: what they are and how big (debugging)
+            if (logged++ < 12)
+                Log("[gpu] point list f%llu: %zu points vs %016llX ps %016llX point size %08X minmax %08X program %08X misc %08X vte %08X target %X\n",
+                    GpuFrameCount(), sequence.size(), vs->shader->hash, ps->shader->hash, r[0x2280], r[0x2281], r[0x2180], r[0x2181], r[0x2206], draw.target.edramBase);
+        }
         if (!AssemblePrimitives(primitive, sequence, draw)) { SkipDraw("primitive type " + std::to_string(primitive)); return; }
         if (draw.indices.empty()) return;
         draw.vertexCount = uint32_t(draw.indices.size());
@@ -865,7 +884,34 @@ namespace
                 static int mismatches = 0;
                 if (mismatches++ < 8) Log("[gpu] texture slot %u: shader samples %s, fetch constant dimension %u\n", slot, binding.cube ? "a cube" : "2D", t.dimension);
             }
-            if (gResolvedBases.count(t.base)) binding.resolvedBase = t.base;
+            if (gResolvedBases.count(t.base))
+            {
+                binding.resolvedBase = t.base;
+                // Levels written by resolves (the luminance reduction renders each step into the next
+                // mip level). Layout as in DecodeTexture for 32-bit texels without packed levels:
+                // each level padded to 32x32-texel tiles and 4 KB, one after another.
+                if (t.mipAddress && t.tiled && t.dimension == 1 && !t.packedMips && t.maxLevel)
+                {
+                    uint32_t logW = 0, logH = 0;
+                    while ((1u << logW) < t.width) logW++;
+                    while ((1u << logH) < t.height) logH++;
+                    uint32_t largest = std::max(t.width, t.height), logLargest = 0;
+                    while ((2u << logLargest) <= largest) logLargest++;
+                    const uint32_t levels = std::min({ t.maxLevel, logLargest, 14u });
+                    uint64_t offset = 0;
+                    for (uint32_t level = 1; level <= levels; level++)
+                    {
+                        const uint32_t address = t.mipAddress + uint32_t(offset);
+                        if (!gResolvedBases.count(address)) break;
+                        binding.resolvedLevels[binding.resolvedLevelCount++] = address;
+                        const uint64_t pitch = (std::max(1u << logW >> level, 1u) + 31) & ~31u, rows = (std::max(1u << logH >> level, 1u) + 31) & ~31u;
+                        offset += (pitch * rows * 4 + 4095) & ~4095ull;
+                    }
+                    static std::set<uint32_t> logged;
+                    if (binding.resolvedLevelCount && logged.size() < 8 && logged.insert(t.base).second)
+                        Log("[gpu] resolved mip chain at %08X: %u resolved levels after the base\n", t.base, binding.resolvedLevelCount);
+                }
+            }
             else
             {
                 binding.decoded = DecodeTexture(t, binding);
@@ -946,7 +992,7 @@ namespace
         BuildDraw(initiator, source);
         uint64_t frame = gFrames.load();
         if (frame != gLogDrawsAt) return;
-        if (gFrameDrawsLogged++ > 600) return;
+        if (gFrameDrawsLogged++ > 5000) return;
         const uint32_t* r = gRegisters;
         char line[2048];
         int used = snprintf(line, sizeof(line), "[draw f%llu] prim %u src %u count %u mode %u surf %08X col %08X dep %08X blend %08X cctl %08X dctl %08X vte %08X vp %08X/%08X %08X/%08X sciss %08X-%08X prog %08X vs %016llX ps %016llX vf0 %08X %08X copy %08X->%08X p%08X info %08X:",
@@ -1045,6 +1091,24 @@ namespace
         {
             uint64_t frame = gFrames.fetch_add(1) + 1;
             gFrameDrawsLogged = 0;
+            if (frame == gCaptureFrame + 1)
+            {
+                LogSetCaptureFile(nullptr);
+                Log("[capture] frame %llu captured\n", gCaptureFrame);
+                gCaptureFrame = ~0ull;
+            }
+            if (gCaptureRequested.exchange(false))
+            {
+                // The frame starting now is logged draw by draw and its image saved.
+                gCaptureFrame = frame;
+                gLogDrawsAt = frame;
+                CreateDirectoryA("..\\captures", nullptr);
+                char path[96];
+                snprintf(path, sizeof(path), "..\\captures\\capture_f%llu.log", frame);
+                LogSetCaptureFile(fopen(path, "w"));
+                RendererSaveFrame(frame);
+                Log("[capture] capturing frame %llu\n", frame);
+            }
             PresentCurrentFrame(frame);
             if (frame <= 3 || frame % 600 == 0)
                 Log("[gpu] frame %llu: %llu draws, %llu indirect buffers, %llu fences, %llu CP interrupts, %llu vblanks\n", frame, gDraws.load(), gIndirect.load(), gFences.load(), gCpInterrupts.load(), gVblanks.load());
@@ -1373,4 +1437,25 @@ GUEST_IMPORT(ExGetXConfigSetting)
     if (buffer && size >= 4) W32(buffer, value);
     if (required) W16(required, 4);
     ctx.r3.u64 = X_STATUS_SUCCESS;
+}
+
+void GpuRequestCapture() { gCaptureRequested = true; }
+
+// Writes a resolve's pixels into guest memory the way the copy hardware lays out a 32-bit colour
+// destination: tiled with the destination pitch, red/blue swapped if requested, then endian-swapped.
+void GpuWriteResolvedPixels(const RendererResolve& resolve, const uint8_t* rgba, uint32_t rowPitch)
+{
+    static std::set<uint32_t> loggedFormats;
+    if (loggedFormats.size() < 8 && loggedFormats.insert(resolve.destFormat).second)
+        Log("[gpu] writing resolves back to guest memory (destination format %u, endian %u, e.g. %08X %ux%u)\n", resolve.destFormat, resolve.destEndian, resolve.destBase, resolve.width, resolve.height);
+    const uint32_t pitch = (resolve.width + 31) & ~31u;
+    uint8_t* destination = g_base + PhysicalToGuest(resolve.destBase);
+    for (uint32_t y = 0; y < resolve.height; y++)
+        for (uint32_t x = 0; x < resolve.width; x++)
+        {
+            uint8_t texel[4];
+            memcpy(texel, rgba + size_t(y) * rowPitch + x * 4, 4);
+            if (resolve.swapRedBlue) std::swap(texel[0], texel[2]);
+            CopySwapped(destination + uint64_t(TiledOffset(x, y, pitch, 2)) * 4, texel, 4, resolve.destEndian);
+        }
 }

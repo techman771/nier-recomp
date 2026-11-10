@@ -42,6 +42,8 @@ struct TextureBinding
     bool valid = false;
     std::shared_ptr<DecodedTexture> decoded;   // null when the texture is a resolved render target
     uint32_t resolvedBase = 0;
+    uint32_t resolvedLevels[14] = {};          // guest addresses of levels 1.. that are resolved surfaces too
+    uint32_t resolvedLevelCount = 0;
     uint8_t swizzle[4] = { 0, 1, 2, 3 };       // 0-3 channel, 4 zero, 5 one
     bool point = false;
     bool cube = false;                         // the shader samples this slot as a cube map
@@ -90,6 +92,8 @@ struct RendererResolve
     int destX = 0, destY = 0;                       // where it lands in the destination
     uint32_t copyWidth = 0, copyHeight = 0;
     bool swapRedBlue = false;
+    bool writeBack = false;                         // also copy the result into guest memory
+    uint32_t destEndian = 0, destFormat = 0;        // RB_COPY_DEST_INFO fields, for the write-back
     bool clearColor = false, clearDepth = false;
     uint32_t colorClear = 0, depthClear = 0;
     RenderTargetKey depth;
@@ -113,3 +117,6 @@ void RendererSubmitMovieFrame(uint64_t frame, const RendererPlane& y, const Rend
 void RendererSubmitFrame(RendererFrame&& frame);
 
 void RendererDumpStats();
+// Called by the renderer (after the frame's GPU work) with a write-back resolve's pixels, RGBA8 rows.
+void GpuWriteResolvedPixels(const RendererResolve& resolve, const uint8_t* rgba, uint32_t rowPitch);
+void RendererSaveFrame(uint64_t frame);   // save that frame's image to recomp/frames (any thread)

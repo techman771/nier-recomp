@@ -87,12 +87,20 @@ float4 PSMain(Interpolated input) : SV_Target
     ComPtr<ID3D12Resource> gBackBuffers[kBackBuffers];
     ComPtr<ID3D12Resource> gTextures[3];
     ComPtr<ID3D12Resource> gUpload, gReadback;
+    // Resolves written back to guest memory: copied into this buffer during the frame, handed to the
+    // GPU emulation once the frame's work has finished.
+    constexpr UINT64 kWriteBackBytes = 8u << 20;
+    ComPtr<ID3D12Resource> gWriteBack;
+    UINT64 gWriteBackUsed = 0;
+    struct PendingWriteBack { RendererResolve resolve; UINT64 offset; UINT rowPitch; };
+    std::vector<PendingWriteBack> gPendingWriteBacks;
     UINT64 gUploadCapacity = 0, gReadbackCapacity = 0;
     UINT gRtvStep = 0;
     UINT64 gFenceValue = 0;
     HANDLE gFenceEvent = nullptr, gFrameWait = nullptr;
 
     std::set<uint64_t> gFramesToSave;
+    std::atomic<uint64_t> gRequestedSave{ 0 };   // from other threads; picked up by the render thread
     std::atomic<uint64_t> gSubmitted{ 0 }, gPresented{ 0 }, gMovieImages{ 0 }, gLateImages{ 0 };
     uint64_t gGapBins[8];
     uint64_t gLastHash = 0;
@@ -258,7 +266,16 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         uint32_t width = 0, height = 0;
         bool swapRedBlue = false;
         bool depth = false;   // R32_FLOAT depth copy rather than a color copy
+        uint64_t version = 0; // bumped by every resolve into it
     };
+    // A resolved base plus resolved levels, combined into one mipmapped texture.
+    struct ResolvedChain
+    {
+        ComPtr<ID3D12Resource> texture;
+        uint32_t width = 0, height = 0, levels = 0;
+        std::vector<std::pair<ID3D12Resource*, uint64_t>> copied;   // per level: source and version last copied
+    };
+    std::unordered_map<uint32_t, ResolvedChain> gResolvedChains;
     struct SystemConstants
     {
         float ndcScale[2], ndcOffset[2];
@@ -676,11 +693,80 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return texture.Get();
     }
 
+    // Builds (or refreshes) the mipmapped texture for a resolved base with resolved levels. Levels whose
+    // resolve surface changed since the last copy are copied again, in command order.
+    ID3D12Resource* ResolvedChainFor(const TextureBinding& binding, ResolvedResource& base, UINT& levelsOut)
+    {
+        std::vector<ResolvedResource*> sources{ &base };
+        for (uint32_t i = 0; i < binding.resolvedLevelCount; i++)
+        {
+            auto level = gResolved.find(binding.resolvedLevels[i]);
+            if (level == gResolved.end() || level->second.depth || !level->second.texture) break;
+            sources.push_back(&level->second);
+        }
+        const UINT levels = UINT(sources.size());
+        if (levels < 2) return nullptr;
+        ResolvedChain& chain = gResolvedChains[binding.resolvedBase];
+        if (!chain.texture || chain.width != base.width || chain.height != base.height || chain.levels != levels)
+        {
+            if (chain.texture) gRetired.push_back(std::move(chain.texture));
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = base.width;
+            desc.Height = base.height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = UINT16(levels);
+            desc.Format = kTargetFormat;
+            desc.SampleDesc.Count = 1;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&chain.texture)), "resolved mip chain")) return nullptr;
+            chain.width = base.width;
+            chain.height = base.height;
+            chain.levels = levels;
+            chain.copied.assign(levels, { nullptr, 0 });
+        }
+        bool started = false;
+        for (UINT level = 0; level < levels; level++)
+        {
+            ResolvedResource& source = *sources[level];
+            if (chain.copied[level].first == source.texture.Get() && chain.copied[level].second == source.version) continue;
+            if (!started)
+            {
+                auto toCopy = Transition(chain.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                gList->ResourceBarrier(1, &toCopy);
+                started = true;
+            }
+            const UINT levelWidth = std::max(chain.width >> level, 1u), levelHeight = std::max(chain.height >> level, 1u);
+            D3D12_BOX box{ 0, 0, 0, std::min(levelWidth, source.width), std::min(levelHeight, source.height), 1 };
+            auto toSource = Transition(source.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gList->ResourceBarrier(1, &toSource);
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = chain.texture.Get();
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.SubresourceIndex = level;
+            from.pResource = source.texture.Get();
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            gList->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+            auto back = Transition(source.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gList->ResourceBarrier(1, &back);
+            chain.copied[level] = { source.texture.Get(), source.version };
+        }
+        if (started)
+        {
+            auto toRead = Transition(chain.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gList->ResourceBarrier(1, &toRead);
+        }
+        levelsOut = levels;
+        return chain.texture.Get();
+    }
+
     void WriteTextureDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, const TextureBinding& binding)
     {
         ID3D12Resource* resource = nullptr;
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
         bool swap = false, depthCopy = false;
+        UINT chainLevels = 1;
         if (binding.valid && binding.decoded)
         {
             resource = GetDecoded(*binding.decoded);
@@ -695,6 +781,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 swap = found->second.swapRedBlue;
                 depthCopy = found->second.depth;
                 if (depthCopy) format = kDepthCopyFormat;
+                if (!depthCopy && binding.resolvedLevelCount)
+                    if (ID3D12Resource* chain = ResolvedChainFor(binding, found->second, chainLevels)) resource = chain;
             }
         }
         // The view must match how the shader declares the slot; a texture of the other kind binds nothing.
@@ -702,7 +790,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (resource && isCube != binding.cube) resource = nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = format;
-        const UINT mipLevels = (binding.valid && binding.decoded && !binding.baseOnly && resource) ? binding.decoded->levels : 1;
+        UINT mipLevels = (binding.valid && binding.decoded && !binding.baseOnly && resource) ? binding.decoded->levels : 1;
+        if (binding.valid && !binding.decoded && !binding.baseOnly) mipLevels = chainLevels;
         if (binding.cube)
         {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
@@ -852,6 +941,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             destination.width = resolve.width;
             destination.height = resolve.height;
             destination.depth = true;
+            destination.version++;
             destination.swapRedBlue = false;
             created = true;
         }
@@ -950,6 +1040,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             created = true;
         }
         destination.swapRedBlue = resolve.swapRedBlue;
+        destination.version++;
 
         SetTargetState(*source, D3D12_RESOURCE_STATE_COPY_SOURCE);
         if (!created)
@@ -974,7 +1065,33 @@ float PSMain(float4 position : SV_Position) : SV_Target
             D3D12_BOX box{ UINT(sourceX), UINT(sourceY), 0, UINT(sourceX + copyWidth), UINT(sourceY + copyHeight), 1 };
             gList->CopyTextureRegion(&to, UINT(destX), UINT(destY), 0, &from, &box);
         }
-        auto toRead = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_STATES finalCopyState = D3D12_RESOURCE_STATE_COPY_DEST;
+        if (resolve.writeBack)
+        {
+            if (!gWriteBack) gWriteBack = MakeBuffer(kWriteBackBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_DESC desc = destination.texture->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            UINT64 size = 0;
+            gDevice->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &size);
+            const UINT64 offset = (gWriteBackUsed + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+            if (gWriteBack && offset + size <= kWriteBackBytes)
+            {
+                auto toSource = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                gList->ResourceBarrier(1, &toSource);
+                footprint.Offset = offset;
+                D3D12_TEXTURE_COPY_LOCATION readTo{}, readFrom{};
+                readTo.pResource = gWriteBack.Get();
+                readTo.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                readTo.PlacedFootprint = footprint;
+                readFrom.pResource = destination.texture.Get();
+                readFrom.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                gList->CopyTextureRegion(&readTo, 0, 0, 0, &readFrom, nullptr);
+                gWriteBackUsed = offset + size;
+                gPendingWriteBacks.push_back({ resolve, offset, footprint.Footprint.RowPitch });
+                finalCopyState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            }
+        }
+        auto toRead = Transition(destination.texture.Get(), finalCopyState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gList->ResourceBarrier(1, &toRead);
         ApplyResolveClears(resolve);
     }
@@ -1321,6 +1438,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             gList->DrawInstanced(3, 1, 0, 0);
         }
 
+        if (uint64_t requested = gRequestedSave.exchange(0)) gFramesToSave.insert(requested);
         uint64_t saveLabel = 0;
         bool saving = !gFramesToSave.empty() && frame >= *gFramesToSave.begin();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT saveFootprint{};
@@ -1370,6 +1488,20 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (movie) RecordImageTiming(planes[0]);
         WaitForGpu();
         gRetired.clear();   // the frame's GPU work is complete
+        if (!gPendingWriteBacks.empty())
+        {
+            void* mapped = nullptr;
+            D3D12_RANGE range{ 0, SIZE_T(gWriteBackUsed) };
+            if (SUCCEEDED(gWriteBack->Map(0, &range, &mapped)))
+            {
+                for (const PendingWriteBack& pending : gPendingWriteBacks)
+                    GpuWriteResolvedPixels(pending.resolve, static_cast<const uint8_t*>(mapped) + pending.offset, pending.rowPitch);
+                D3D12_RANGE none{ 0, 0 };
+                gWriteBack->Unmap(0, &none);
+            }
+            gPendingWriteBacks.clear();
+        }
+        gWriteBackUsed = 0;
         if (saving)
         {
             WriteSavedFrame(saveLabel, saveFootprint);
@@ -1518,3 +1650,5 @@ void RendererDumpStats()
         Log("[present] gaps in refreshes: 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7+:%llu\n", gGapBins[0], gGapBins[1], gGapBins[2], gGapBins[3], gGapBins[4], gGapBins[5], gGapBins[6], gGapBins[7]);
     }
 }
+
+void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
