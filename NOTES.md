@@ -232,7 +232,30 @@ How it was found: dumped draw data (`NIER_DUMP_DRAW`) skinned on the CPU reprodu
 the bone matrices were wrong; write watches (`NIER_WATCH_WRITE`) and a memory scan (`NIER_SCAN`)
 followed the matrices back through the copies to the hierarchy pass, and a hardware breakpoint
 (`NIER_BREAK`) on `sub_821898F0` showed the mask's last two bytes unset.
-The store floor still lacks the stone-tile pattern seen in the reference video.
+Texture address modes: every texture used to be sampled with clamp addressing, so tiling textures
+(floors, shelves, walls, building facades, with coordinates far outside 0-1) smeared their edge
+texels into stripes; only textures used within 0-1 (product labels) looked right. The fetch
+constant's clamp modes (dword 0 bits 10-12 for x, 13-15 for y) now pick the sampler, mapped as Xenia
+does: repeat -> wrap, mirrored repeat -> mirror, clamp to edge / halfway -> clamp, the mirror-clamps ->
+mirror once, clamp to border -> border. The renderer has 50 samplers (point/linear x 5 x 5 address
+modes) in a sampler descriptor table (root parameter 4; static samplers can't back an indexed
+array); the shader samples `samplers[samplerIndex[slot]]`. Border colour is transparent black for
+now (the fetch constant's border colour is not read yet). Found with `NIER_DUMP_TEX=<base>[,...]`,
+which writes a decoded texture to `recomp/captures/` (`tools/tex2png.py` converts it), plus
+per-triangle texture-coordinate checks of dumped draws.
+
+Character materials (Nier's shader `C67CA1BB...`): t7 colour atlas (BC1), t8 normal map (CTX1), t9 BC3
+material parameters (all four channels feed the lighting), t1 a 64x64 `k_16_16_16_16_EXPAND` cube
+that is the main (ambient) lighting, not a reflection: zeroing it leaves only the head visible. The
+cube's data is float16 (values cluster at 0x3C00 = 1.0, range 0.04-15.6), as Xenia uploads EXPAND
+formats; its sign modes (two's complement on every channel) are ignored for float formats, as in
+Xenia. With the texture coordinate and address mode fixes, close-ups match the reference video.
+`NIER_SHADER_PATCH=<hash>|<find>|<replace>[;;...]` edits a translated shader's HLSL before compiling
+(e.g. zero a term to see what it contributes); the log lists each texture format's component swizzle.
+
+An intermittent crash was seen once at startup in the game's D3D setup (`sub_825A5FE8` writing guest
+address 0x10, called from `sub_825A5858` / `sub_825A7B60`); the next boots were fine. Not yet
+investigated.
 
 Mipmaps follow Xenia's `GetGuestTextureLayout`: levels 1 and up start at the fetch constant's mip
 address (dword 5); each level's pitch and height come from the power-of-two base size shifted down

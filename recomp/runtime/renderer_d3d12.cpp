@@ -222,6 +222,7 @@ float4 PSMain(Interpolated input) : SV_Target
     constexpr UINT64 kArenaBytes = 256ull * 1024 * 1024;
     constexpr UINT kDrawDescriptors = 262144, kTargetSlots = 256;
     constexpr UINT kTextureSlots = 32;   // descriptors per draw: one per fetch constant
+    constexpr UINT kSamplerCount = 50;   // 2 filters x 5 x 5 address modes (CreateDrawObjects)
     constexpr DXGI_FORMAT kTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     const char kRectGeometry[] = R"(
@@ -285,7 +286,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         float ndcScale[2], ndcOffset[2];
         uint32_t bypassViewport, padding[3];
         uint32_t vertexBase[96];
-        uint32_t samplerPoint[32];
+        uint32_t samplerPoint[32];   // per slot: sampler index (shader name samplerIndex)
         float texScale[32][4];
         uint32_t boolConstants[8];
         uint32_t texSign[32];
@@ -294,7 +295,10 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
 
     ComPtr<ID3D12RootSignature> gDrawRoot;
     ComPtr<ID3D12PipelineState> gBlitPipeline;
-    ComPtr<ID3D12DescriptorHeap> gDrawSrvHeap, gTargetRtvHeap;
+    ComPtr<ID3D12DescriptorHeap> gDrawSrvHeap, gTargetRtvHeap, gSamplerHeap;
+
+    // The draw root signature plus its sampler table (root parameter 4).
+    void BindDrawRoot();
     ComPtr<ID3D12Resource> gArena;
     ComPtr<ID3DBlob> gRectBlob;
     uint8_t* gArenaCpu = nullptr;
@@ -351,7 +355,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors = kTextureSlots;
         range.RegisterSpace = 1;   // space 0 t16 is the vertex buffer
-        D3D12_ROOT_PARAMETER parameters[4]{};
+        // Samplers: every filter and per-axis address mode combination, in a descriptor table
+        // (s0-s49; an indexed sampler array can't use static samplers). A draw picks one per texture
+        // slot: filter * 25 + addressU * 5 + addressV, modes in kSamplerAddressModes order, so index 0
+        // is linear clamp (what the blit and depth copy shaders use as s0).
+        D3D12_DESCRIPTOR_RANGE samplerRange{};
+        samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        samplerRange.NumDescriptors = kSamplerCount;
+        D3D12_ROOT_PARAMETER parameters[5]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[1].Descriptor.ShaderRegister = 1;
@@ -360,21 +371,36 @@ float PSMain(float4 position : SV_Position) : SV_Target
         parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[3].DescriptorTable.NumDescriptorRanges = 1;
         parameters[3].DescriptorTable.pDescriptorRanges = &range;
-        D3D12_STATIC_SAMPLER_DESC samplers[2]{};
-        samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
-        samplers[1] = samplers[0];
-        samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samplers[1].ShaderRegister = 1;
+        parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[4].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[4].DescriptorTable.pDescriptorRanges = &samplerRange;
         D3D12_ROOT_SIGNATURE_DESC signature{};
-        signature.NumParameters = 4;
+        signature.NumParameters = 5;
         signature.pParameters = parameters;
-        signature.NumStaticSamplers = 2;
-        signature.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> blob, errors;
         if (!Check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors), "draw root signature serialize")) return false;
         if (!Check(gDevice->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&gDrawRoot)), "draw root signature")) return false;
+
+        static const D3D12_TEXTURE_ADDRESS_MODE kSamplerAddressModes[5] = { D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE, D3D12_TEXTURE_ADDRESS_MODE_BORDER };
+        D3D12_DESCRIPTOR_HEAP_DESC samplerHeap{};
+        samplerHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        samplerHeap.NumDescriptors = kSamplerCount;
+        samplerHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (!Check(gDevice->CreateDescriptorHeap(&samplerHeap, IID_PPV_ARGS(&gSamplerHeap)), "sampler heap")) return false;
+        const UINT samplerStep = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        for (UINT i = 0; i < kSamplerCount; i++)
+        {
+            D3D12_SAMPLER_DESC sampler{};
+            sampler.Filter = i < 25 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
+            sampler.AddressU = kSamplerAddressModes[(i % 25) / 5];
+            sampler.AddressV = kSamplerAddressModes[i % 5];
+            sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            D3D12_CPU_DESCRIPTOR_HANDLE handle = gSamplerHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += SIZE_T(i) * samplerStep;
+            gDevice->CreateSampler(&sampler, handle);
+        }
 
         D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
         srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -851,7 +877,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         for (UINT i = 0; i < kTextureSlots; i++)
         {
             const TextureBinding& binding = draw.textures[i];
-            s->samplerPoint[i] = binding.point ? 1 : 0;
+            s->samplerPoint[i] = (binding.point ? 25 : 0) + binding.addressU * 5 + binding.addressV;   // sampler index
             s->texScale[i][0] = binding.scale[0];
             s->texScale[i][1] = binding.scale[1];
             s->texSign[i] = binding.valid ? binding.sign : 0;
@@ -872,7 +898,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         D3D12_RECT scissor{ draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3] };
         gList->RSSetViewports(1, &viewport);
         gList->RSSetScissorRects(1, &scissor);
-        gList->SetGraphicsRootSignature(gDrawRoot.Get());
+        BindDrawRoot();
         gList->SetPipelineState(pipeline);
         gList->SetGraphicsRootConstantBufferView(0, constants.gpu);
         gList->SetGraphicsRootConstantBufferView(1, system.gpu);
@@ -998,7 +1024,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 gList->RSSetViewports(1, &viewport);
                 gList->RSSetScissorRects(1, &scissor);
-                gList->SetGraphicsRootSignature(gDrawRoot.Get());
+                BindDrawRoot();
                 gList->SetPipelineState(gDepthCopyPipeline.Get());
                 gList->SetGraphicsRootConstantBufferView(0, constants.gpu);
                 gList->SetGraphicsRootDescriptorTable(3, gpu);
@@ -1125,14 +1151,20 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return list.empty() ? ShownSurface{} : list[(gExecutingFrame / 60) % list.size()];
     }
 
+    void BindDrawRoot()
+    {
+        gList->SetGraphicsRootSignature(gDrawRoot.Get());
+        gList->SetGraphicsRootDescriptorTable(4, gSamplerHeap->GetGPUDescriptorHandleForHeapStart());
+    }
+
     void ExecuteGuestCommands(const RendererFrame& frame)
     {
         uint32_t shownCopies = 0;
         gExecutingFrame = frame.frame;
         gArenaOffset = 0;
         gDrawSrvUsed = 0;
-        ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get() };
-        gList->SetDescriptorHeaps(1, heaps);
+        ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
+        gList->SetDescriptorHeaps(2, heaps);
         for (const auto& command : frame.commands)
         {
             if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
@@ -1180,7 +1212,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         D3D12_RECT scissor{ 0, 0, LONG(gWidth), LONG(gHeight) };
         gList->RSSetViewports(1, &viewport);
         gList->RSSetScissorRects(1, &scissor);
-        gList->SetGraphicsRootSignature(gDrawRoot.Get());
+        BindDrawRoot();
         gList->SetPipelineState(gBlitPipeline.Get());
         gList->SetGraphicsRootDescriptorTable(3, gpu);
         gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

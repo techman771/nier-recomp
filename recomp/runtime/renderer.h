@@ -46,6 +46,9 @@ struct TextureBinding
     uint32_t resolvedLevelCount = 0;
     uint8_t swizzle[4] = { 0, 1, 2, 3 };       // 0-3 channel, 4 zero, 5 one
     bool point = false;
+    // Address modes per axis, as host sampler modes: 0 clamp, 1 wrap, 2 mirror, 3 mirror once,
+    // 4 border (kSamplerAddressModes in renderer_d3d12.cpp).
+    uint8_t addressU = 0, addressV = 0;
     bool cube = false;                         // the shader samples this slot as a cube map
     bool baseOnly = false;                     // the fetch constant's mip filter says base map only
     float scale[2] = { 1.0f, 1.0f };

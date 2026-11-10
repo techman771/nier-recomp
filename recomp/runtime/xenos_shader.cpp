@@ -14,14 +14,15 @@ cbuffer System : register(b1)
     float2 ndcScale; float2 ndcOffset;
     uint bypassViewport; uint3 systemPadding;
     uint4 vbBase[24];
-    uint4 samplerPoint[8];
+    uint4 samplerIndex[8];   // per texture slot: filter * 25 + address U * 5 + address V
     float4 texScale[32];
     uint4 boolConstants[2];
     uint4 texSign[8];
 };
 ByteAddressBuffer vb : register(t16);
-SamplerState linearSampler : register(s0);
-SamplerState pointSampler : register(s1);
+SamplerState samplers[50] : register(s0);
+#define linearSampler samplers[0]
+#define pointSampler samplers[25]
 struct Interpolated { float4 position : SV_Position; float4 t[16] : TEXCOORD0; };
 bool BoolConstant(uint index) { return (boolConstants[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
 float4 F32(uint a, uint n)
@@ -483,8 +484,9 @@ float3 CubeDirection(float3 c)
             const std::string call = (pixel && !registerLod) ? ".Sample(" : ".SampleLevel(";
             const std::string level = (pixel && !registerLod) ? ")" : registerLod ? ", lod_)" : ", 0)";
             char sample[384];
-            snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u%spointSampler, %s%s : t%u%slinearSampler, %s%s)",
-                slot / 4, slot % 4, slot, call.c_str(), where.c_str(), level.c_str(), slot, call.c_str(), where.c_str(), level.c_str());
+            // The sampler (filter and per-axis address modes from the fetch constant) is chosen per draw.
+            snprintf(sample, sizeof(sample), "t%u%ssamplers[samplerIndex[%u][%u]], %s%s",
+                slot, call.c_str(), slot / 4, slot % 4, where.c_str(), level.c_str());
             body += OpenPredicate(w[1] >> 31, w[2] >> 31);
             body += std::string("        float4 f_ = ApplySign(") + sample + Format(", texSign[%d][%d]);\n", int(slot / 4), int(slot % 4));
             WriteFetched(dest, w[1] & 0xFFF);
@@ -603,6 +605,26 @@ float3 CubeDirection(float3 c)
     return output;
 }
 )";
+            }
+            // NIER_SHADER_PATCH=<hash>|<find>|<replace>[;;...] edits a translated shader's HLSL before it
+            // is compiled (debugging: e.g. zero one term to see what it contributes).
+            static const std::string patches = [] {
+                const char* value = std::getenv("NIER_SHADER_PATCH");
+                return value ? std::string(value) : std::string();
+            }();
+            for (size_t start = 0; start < patches.size();)
+            {
+                size_t end = patches.find(";;", start);
+                if (end == std::string::npos) end = patches.size();
+                const std::string entry = patches.substr(start, end - start);
+                const size_t bar1 = entry.find('|'), bar2 = bar1 == std::string::npos ? bar1 : entry.find('|', bar1 + 1);
+                if (bar2 != std::string::npos && strtoull(entry.substr(0, bar1).c_str(), nullptr, 16) == result.hash)
+                {
+                    const std::string find = entry.substr(bar1 + 1, bar2 - bar1 - 1), replace = entry.substr(bar2 + 1);
+                    for (size_t at = hlsl.find(find); at != std::string::npos; at = hlsl.find(find, at + replace.size()))
+                        hlsl.replace(at, find.size(), replace);
+                }
+                start = end + 2;
             }
             result.hlsl = hlsl;
             result.ok = !failed;

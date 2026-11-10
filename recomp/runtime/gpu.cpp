@@ -613,6 +613,30 @@ namespace
                     }
                 }
             }
+        // NIER_DUMP_TEX=<physical base>[,...] writes the decoded base level (host layout) to captures/,
+        // with a header: format, width, height, row pitch, rows (debugging).
+        static const std::set<uint32_t> dumpTextures = [] {
+            std::set<uint32_t> bases;
+            char value[512];
+            if (GetEnvironmentVariableA("NIER_DUMP_TEX", value, sizeof(value)))
+                for (char* item = strtok(value, ","); item; item = strtok(nullptr, ",")) bases.insert(strtoul(item, nullptr, 16));
+            return bases;
+        }();
+        if (dumpTextures.count(t.base))
+        {
+            CreateDirectoryA("..\\captures", nullptr);
+            char path[96];
+            snprintf(path, sizeof(path), "..\\captures\\tex_%08X.bin", t.base);
+            if (FILE* file = fopen(path, "wb"))
+            {
+                const DecodedTexture::Subresource& sub = decoded->subresources[0];
+                const uint32_t header[6] = { uint32_t(format), decoded->width, decoded->height, sub.rowPitch, sub.rows, t.format };
+                fwrite(header, 4, 6, file);
+                fwrite(decoded->data.data() + sub.offset, 1, size_t(sub.rowPitch) * sub.rows, file);
+                fclose(file);
+                Log("[gpu] dumped texture %08X (%ux%u format %u, pitch %u, tiled %d, endian %u, levels %u, packed %d)\n", t.base, t.width, t.height, t.format, t.pitch, t.tiled ? 1 : 0, t.endian, levels, t.packedMips ? 1 : 0);
+            }
+        }
         gDecodedTextures[key] = decoded;
         return decoded;
     }
@@ -914,7 +938,19 @@ namespace
             const uint32_t* c = &r[REG_FETCH_CONSTANTS + slot * 6];
             const uint32_t swizzle = (c[3] >> 1) & 0xFFF;
             for (int i = 0; i < 4; i++) binding.swizzle[i] = (swizzle >> (i * 3)) & 7;
+            {
+                static std::set<uint32_t> seenSwizzles;   // which component swizzles each format uses (debugging)
+                if (seenSwizzles.size() < 32 && seenSwizzles.insert(t.format << 16 | swizzle).second)
+                    Log("[gpu] texture format %u (%ux%u) swizzle %c%c%c%c\n", t.format, t.width, t.height,
+                        "xyzw01??"[binding.swizzle[0]], "xyzw01??"[binding.swizzle[1]], "xyzw01??"[binding.swizzle[2]], "xyzw01??"[binding.swizzle[3]]);
+            }
             binding.point = ((c[3] >> 19) & 3) == 0;
+            // Clamp modes (dword 0 bits 10-12 for x, 13-15 for y), mapped as Xenia does: repeat,
+            // mirrored repeat, clamp to edge, mirror clamp to edge, clamp halfway (as clamp), mirror
+            // clamp halfway, clamp to border, mirror clamp to border (the mirror-clamps as mirror once).
+            static const uint8_t kHostAddress[8] = { 1, 2, 0, 3, 0, 3, 4, 3 };   // host: 0 clamp, 1 wrap, 2 mirror, 3 mirror once, 4 border
+            binding.addressU = kHostAddress[(c[0] >> 10) & 7];
+            binding.addressV = kHostAddress[(c[0] >> 13) & 7];
             if (t.height == 1)
             {
                 static int logged = 0;   // one-row textures (bone matrices): how they are filtered
@@ -987,7 +1023,7 @@ namespace
                 return hashes;
             }();
             auto dumpEntry = dumpShaders.find(vs->shader->hash);
-            if (dumpEntry != dumpShaders.end() && gLogDrawsAt && gFrames.load() >= gLogDrawsAt && dumpEntry->second < 3)
+            if (dumpEntry != dumpShaders.end() && gLogDrawsAt && gFrames.load() >= gLogDrawsAt && dumpEntry->second < 40)
             {
                 CreateDirectoryA("..\\captures", nullptr);
                 char path[128];
