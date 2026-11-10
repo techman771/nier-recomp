@@ -171,6 +171,99 @@ void FatalGuest(const char* reason, PPCContext& ctx)
 
 void InstallCrashHandler() { AddVectoredExceptionHandler(1, CrashHandler); }
 
+// NIER_WATCH_WRITE=<guest address>,<bytes>: logs which guest functions write that range (debugging).
+// The page is write-protected in every window that maps it; a write faults, is logged, and is
+// replayed by single-stepping with the page writable, after which the protection is restored.
+namespace
+{
+    uint32_t gWatchStart = 0, gWatchBytes = 0;
+    std::vector<uint8_t*> gWatchPages;   // host addresses of the watched page in each window
+    thread_local bool tWatchStepping = false;
+    std::map<std::string, int> gWatchSeen;
+
+    void ProtectWatch(bool on)
+    {
+        DWORD old;
+        for (uint8_t* page : gWatchPages) VirtualProtect(page, 4096, on ? PAGE_READONLY : PAGE_READWRITE, &old);
+    }
+
+    LONG WINAPI WatchHandler(EXCEPTION_POINTERS* info)
+    {
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_SINGLE_STEP && tWatchStepping)
+        {
+            tWatchStepping = false;
+            ProtectWatch(true);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || info->ExceptionRecord->ExceptionInformation[0] != 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const uint8_t* fault = reinterpret_cast<const uint8_t*>(info->ExceptionRecord->ExceptionInformation[1]);
+        bool ours = false;
+        for (uint8_t* page : gWatchPages) ours = ours || (fault >= page && fault < page + 4096);
+        if (!ours) return EXCEPTION_CONTINUE_SEARCH;
+
+        const uint32_t guest = uint32_t(fault - g_base);
+        const uint32_t offset = guest & 0x1FFFFFFF, start = gWatchStart & 0x1FFFFFFF;
+        static const uint64_t fromFrame = [] {
+            char text[32];
+            return GetEnvironmentVariableA("NIER_WATCH_FROM", text, sizeof(text)) ? strtoull(text, nullptr, 10) : 0ull;
+        }();
+        if (offset + 16 > start && offset < start + gWatchBytes && GpuFrameCount() >= fromFrame)
+        {
+            // Guest call chain from the faulting context.
+            CONTEXT context = *info->ContextRecord;
+            std::string chain;
+            uint32_t last = 0;
+            for (int i = 0, shown = 0; i < 32 && context.Rip && shown < 6; i++)
+            {
+                const uint32_t function = GuestFunctionFor(context.Rip);
+                if (function && function != last)
+                {
+                    char text[16];
+                    snprintf(text, sizeof(text), " %08X", function);
+                    chain += text;
+                    shown++;
+                }
+                last = function;
+                DWORD64 imageBase = 0;
+                auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+                if (!entry) break;
+                void* handlerData = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
+            }
+            if (gWatchSeen[chain]++ < 3)
+            {
+                Log("[watch] write to %08X (+%u) by%s (frame %llu)\n", guest, offset - start, chain.c_str(), GpuFrameCount());
+                if (PPCContext* ctx = CurrentContext())
+                    Log("[watch]   r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r31=%08X lr=%08llX\n",
+                        ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->r9.u32, ctx->r10.u32, ctx->r11.u32, ctx->r31.u32, ctx->lr);
+            }
+        }
+        ProtectWatch(false);
+        tWatchStepping = true;
+        info->ContextRecord->EFlags |= 0x100;   // trap after the write, then protect again
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+}
+
+void WatchInit()
+{
+    char value[64];
+    if (!GetEnvironmentVariableA("NIER_WATCH_WRITE", value, sizeof(value))) return;
+    gWatchStart = strtoul(value, nullptr, 16);
+    const char* comma = strchr(value, ',');
+    gWatchBytes = comma ? strtoul(comma + 1, nullptr, 0) : 16;
+    const uint32_t page = (gWatchStart & 0x1FFFFFFF) & ~0xFFFu;
+    if ((gWatchStart >> 29) >= 5)   // physical: watch it in each window
+        for (uint32_t window : { 0xA0000000u, 0xC0000000u }) gWatchPages.push_back(g_base + window + page);   // they share storage
+    else gWatchPages.push_back(g_base + (gWatchStart & ~0xFFFu));
+    AddVectoredExceptionHandler(1, WatchHandler);
+    ProtectWatch(true);
+    Log("[watch] watching writes to %08X, %u bytes\n", gWatchStart, gWatchBytes);
+}
+
 namespace
 {
     struct ThreadRecord
@@ -271,6 +364,8 @@ int main(int argc, char** argv)
     PresenterInit();
     BuildFunctionIndex();
     uint32_t entry = LoadGame(gameDir);
+    ProfilerInit();
+    WatchInit();
 
     std::thread([] {
         while (true)

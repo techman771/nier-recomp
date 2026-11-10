@@ -49,7 +49,7 @@ float4 Fetch16(uint a, uint n, bool isSigned, bool isInt)
     for (uint i = 0; i < n; i++)
     {
         uint w = vb.Load(a + (i / 2) * 4);
-        uint u = (w >> ((i & 1) ? 0 : 16)) & 65535;
+        uint u = (w >> ((i & 1) ? 16 : 0)) & 65535;   // x in the low half (Xenia: offsets 0, 16)
         int s = int(u << 16) >> 16;
         v[i] = isSigned ? (isInt ? float(s) : Snorm(s, 16)) : (isInt ? float(u) : float(u) / 65535.0);
     }
@@ -71,7 +71,7 @@ float4 Fetch16F(uint a, uint n)
     for (uint i = 0; i < n; i++)
     {
         uint w = vb.Load(a + (i / 2) * 4);
-        v[i] = f16tof32((w >> ((i & 1) ? 0 : 16)) & 65535);
+        v[i] = f16tof32((w >> ((i & 1) ? 16 : 0)) & 65535);   // x in the low half
     }
     return v;
 }
@@ -130,6 +130,8 @@ float3 CubeDirection(float3 c)
         std::string body;
         int maxRegister = 1;
         uint32_t lastStride = 0;
+        bool indexWritten = false;      // something may overwrite r0.x (the vertex index)
+        bool indexedOtherwise = false;  // a vertex fetch addresses with something other than r0.x
         bool failed = false;
         std::string scalarAfter;   // statement run after the scalar result exists (predicate updates, kills)
         bool exportsDepth = false;
@@ -320,6 +322,8 @@ float3 CubeDirection(float3 c)
             const uint32_t vectorMask = (w[0] >> 16) & 0xF, scalarMask = (w[0] >> 20) & 0xF;
             const bool vectorClamp = (w[0] >> 24) & 1, scalarClamp = (w[0] >> 25) & 1;
             const uint32_t scalarOp = (w[0] >> 26) & 0x3F, vectorOp = (w[2] >> 24) & 0x1F;
+            if (!isExport && (((w[0] >> 6) & 1) || ((w[0] >> 14) & 1) || (vectorDest == 0 && (vectorMask & 1)) || (scalarDest == 0 && (scalarMask & 1))))
+                indexWritten = true;   // relative destinations could be r0 too
             body += OpenPredicate(w[1] >> 28, w[1] >> 27);
             if (vectorOp == 29)
             {
@@ -408,6 +412,14 @@ float3 CubeDirection(float3 c)
             const bool mini = (w[1] >> 30) & 1;
             if (mini || stride == 0) stride = lastStride; else lastStride = stride;
             result.vertexSlots.insert(slot);
+            if (source != 0 || sourceChannel != 0) indexedOtherwise = true;
+            if (dest == 0) indexWritten = true;
+            {
+                TranslatedShader::VertexUse& use = result.vertexUse[slot];
+                if (use.stride && use.stride != stride * 4) indexedOtherwise = true;
+                use.stride = stride * 4;
+                use.end = std::max(use.end, offset * 4 + 16);   // 16: the largest element
+            }
 
             char address[160];
             snprintf(address, sizeof(address), "vbBase[%u][%u] + uint(%s.%c) * %u + %u", slot / 4, slot % 4, Register(source).c_str(), "xyzw"[sourceChannel], stride * 4, offset * 4);
@@ -451,6 +463,7 @@ float3 CubeDirection(float3 c)
             }
             if (opcode != 1) { Fail(Format("texture opcode %d", int(opcode))); return; }
             const int source = (w[0] >> 5) & 0x3F, dest = (w[0] >> 12) & 0x3F;
+            if (dest == 0) indexWritten = true;
             const uint32_t slot = (w[0] >> 20) & 0x1F;
             const uint32_t dimension = (w[2] >> 14) & 3;   // 1D, 2D, 3D or stacked, cube
             if (dimension == 2) { Fail("3D texture fetch"); return; }
@@ -593,6 +606,7 @@ float3 CubeDirection(float3 c)
             }
             result.hlsl = hlsl;
             result.ok = !failed;
+            result.directVertexIndex = !pixel && !indexWritten && !indexedOtherwise;
         }
     };
 }

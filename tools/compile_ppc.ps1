@@ -1,5 +1,7 @@
 # Builds recomp/build/nier.exe from the recompiled code and the runtime. Load devshell.ps1 first.
-param([string]$Opt = '/O2')
+# The runtime is optimized too (it emulates the GPU's command processor, which bounds gameplay speed);
+# -RuntimeOpt /Od gives a debuggable runtime. Symbols (/Z7) are kept either way.
+param([string]$Opt = '/O2', [string]$RuntimeOpt = '/O2')
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'recomp\build'
 New-Item -ItemType Directory -Force $build | Out-Null
@@ -19,7 +21,7 @@ $ninja = @(
     "  description = `$in",
     "",
     "rule rt",
-    "  command = clang-cl $common /Od /Z7 /EHsc -I../runtime -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
+    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
     "  description = `$in",
     "",
     "rule link",
@@ -31,7 +33,10 @@ $ninja = @(
 )
 $objects = @()
 foreach ($s in $sources) { $ninja += "build $s.obj: cxx ../out/$s"; $objects += "$s.obj" }
-foreach ($s in $runtime) { $ninja += "build rt_$s.obj: rt ../runtime/$s | ../runtime/guest.h"; $objects += "rt_$s.obj" }
+# Every runtime header is an implicit dependency (no compiler dependency tracking here), so a header
+# change rebuilds all runtime files.
+$headers = (Get-ChildItem (Join-Path $root 'recomp\runtime') -Filter *.h | ForEach-Object { "../runtime/$($_.Name)" }) -join ' '
+foreach ($s in $runtime) { $ninja += "build rt_$s.obj: rt ../runtime/$s | $headers"; $objects += "rt_$s.obj" }
 $ninja += "build nier.exe: link $($objects -join ' ')"
 Set-Content -Encoding ascii (Join-Path $build 'build.ninja') $ninja
 ninja -C $build -k 0

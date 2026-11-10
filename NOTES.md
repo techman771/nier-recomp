@@ -205,8 +205,29 @@ fetches, six-face textures as `TextureCube`; used by the character materials). T
 credits, the snow-sky shot and the Grimoire scene ("Take it and save your daughter...") play through.
 Only 24 draws a run are skipped (primitive type 1). The scene looks like the game: textured ruined
 buildings, fences, snow, fog and light shafts. Characters render with plausible
-materials. Remaining visible fault: the cinematic letterbox bars are translucent grey instead of
-solid.
+materials. The cinematic letterbox bars are translucent in the real game too (checked against a
+reference video of the Xbox version, https://www.youtube.com/watch?v=7UjhobXbIU0, 0:00-5:00).
+
+16-bit vertex formats (`k_16_16`, `k_16_16_16_16` and their float versions) take component x from
+the low half of each 32-bit word and y from the high half (Xenia: offsets 0, 16). The translator had
+them the other way round, which swapped every 16-bit attribute pair: texture coordinates came out as
+(v, u), so textures were smeared into stripes, and much of the store's geometry was garbled.
+
+Textures are made readable for every shader stage (`kShaderRead` in `renderer_d3d12.cpp`), not just
+pixel shaders: the bone texture is read by vertex shaders, and with the pixel-shader state alone a
+vertex shader may read it before the upload into it has finished.
+
+Open: in the Grimoire scene (frame ~11650 on the scripted path), Nier's skeleton has 94 bones but
+bones 92 and 93 (probably the attachments, e.g. the pipe he holds) arrive in the bone texture in
+local space, and bones 94+ are unwritten. Vertices weighted to bone 93 land near the world origin,
+which draws a black beam from Nier's hand across the screen, and the pipe's lower half is
+detached. CPU skinning of the dumped data reproduces it, so the bone data itself is wrong, not the
+shader. The chain found so far: the bone texture (`07693000`) is filled by `sub_825AC5C0` (transposes
+4x4 matrices) from a source array (`415BBDB0` at frame 11641), which is filled by `memcpy`
+(`sub_825D3010`) of 0x1730 bytes (92 bones and three rows) called from `sub_8258DDE8`. Next: find
+why bones 92-93 are left out (copy length, or a later step that should finish them), i.e. a likely
+CPU recompilation bug in that path. The store floor also still lacks the stone-tile pattern seen in
+the reference video.
 
 Mipmaps follow Xenia's `GetGuestTextureLayout`: levels 1 and up start at the fetch constant's mip
 address (dword 5); each level's pitch and height come from the power-of-two base size shifted down
@@ -269,8 +290,20 @@ host textures. Now:
   memory as the copy hardware would (tiled, red/blue swap, endian swap from `RB_COPY_DEST_INFO`).
   `NIER_RESOLVE_WRITEBACK=all` writes back every resolve (slow), `none` disables it.
 
-Gameplay renders at 768x432 into 800-pixel-wide EDRAM surfaces (cutscenes use 1280x720) and runs
-well below real time (about 15-20 fps game speed in the first fight).
+Gameplay renders at 768x432 into 800-pixel-wide EDRAM surfaces (cutscenes use 1280x720).
+
+Performance: the GPU command thread (PM4 parsing, texture decoding, vertex copies) bounded gameplay
+speed. Measured with the sampling profiler (`NIER_PROFILE`), 20 s of the first fight:
+- runtime built `/Od`: 7 fps (under the profiler); `compile_ppc.ps1` now builds the runtime `/O2`
+  too (`-RuntimeOpt /Od` for a debuggable runtime; symbols are kept either way): 17 fps;
+- textures over 64 KB are hashed once per frame instead of on every use (small ones, such as bone
+  matrices, are still hashed on every use, every byte), and when a vertex shader addresses vertices
+  only with the unmodified vertex index, only the vertices between a draw's smallest and largest
+  index are copied (fetch constants often cover a whole level's geometry): 30 fps.
+The command thread is now about 60% busy; the game's main thread is always busy.
+`NIER_HASH_EVERY_USE=1` and `NIER_NO_VERTEX_TRIM=1` turn the two shortcuts off for comparison.
+Runs on the scripted path don't reach the same scene at the same frame number when speed changes
+(loading takes wall-clock time), so compare frames by scene, not by number.
 
 Scripted path into gameplay (the first fight in the prologue starts around frame 10600):
 `recomp/gameplay_args.txt` holds the `-AutoPress` string (the opening sequence above, then Start /
@@ -295,6 +328,16 @@ after the frame's GPU work completes.
 
 Test runs open the window on the secondary monitor (`NIER_MONITOR=secondary`, set by `run_boot.ps1`;
 a number picks a monitor by enumeration order).
+
+More debugging switches:
+- `NIER_PROFILE=<frame>,<seconds>[,exit]`: samples every thread about 1000 times a second from that
+  guest frame on and logs each busy thread's hot functions, inclusive time, callers and waits;
+  `exit` ends the process after the report.
+- `NIER_DUMP_DRAW=<vs hash>[,...]` with `-LogDrawsAt <frame>`: writes the next three draws with each
+  shader to `recomp/captures/` (byte-swapped vertex data, indices, constants, the slot 16 texture).
+- `NIER_WATCH_WRITE=<guest address>,<bytes>` (and `NIER_WATCH_FROM=<frame>`): write-protects that
+  page (in both physical windows for 0xA/0xC addresses) and logs the guest call chain and registers
+  of each writer.
 
 `NIER_PS_DEBUG=<hash>=<HLSL float4 expression>[;...]` replaces a pixel shader's colour with any
 expression over its registers (`r[n]`), inputs and textures; splitting by `input.position.x` shows

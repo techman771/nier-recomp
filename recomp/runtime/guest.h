@@ -31,6 +31,8 @@ void GpuDumpStats();
 void AudioDumpStats();
 uint64_t GpuFrameCount();
 void GpuRequestCapture();   // F12: log every draw of the next frame and save its image
+void ProfilerInit();        // NIER_PROFILE=<frame>,<seconds>: sampling profile into the log
+void WatchInit();           // NIER_WATCH_WRITE=<guest address>,<bytes>: log the guest code writing there
 void LogSetCaptureFile(FILE* file);   // also copy log output to this file (null to stop)
 bool PresenterHasFocus();
 void PresenterInit();

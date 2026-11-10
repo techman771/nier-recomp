@@ -26,6 +26,10 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+    // Textures are read by vertex shaders too (bone matrices for skinning), so "readable" covers
+    // every shader stage; with the pixel-shader state alone, a vertex shader could read a texture
+    // before an upload into it had finished.
+    constexpr D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     constexpr UINT kBackBuffers = 3;
     constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -651,7 +655,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (existing.Width == desc.Width && existing.Height == desc.Height && existing.DepthOrArraySize == desc.DepthOrArraySize && existing.Format == desc.Format && existing.MipLevels == desc.MipLevels)
             {
                 texture = found->second.texture;
-                auto toCopy = Transition(texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                auto toCopy = Transition(texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
                 gList->ResourceBarrier(1, &toCopy);
             }
             else gRetired.push_back(std::move(found->second.texture));
@@ -687,7 +691,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             source.PlacedFootprint = footprint;
             gList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         }
-        auto barrier = Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto barrier = Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
         gList->ResourceBarrier(1, &barrier);
         gDecoded[decoded.key] = { texture, decoded.contentHash };
         return texture.Get();
@@ -720,7 +724,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             desc.MipLevels = UINT16(levels);
             desc.Format = kTargetFormat;
             desc.SampleDesc.Count = 1;
-            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&chain.texture)), "resolved mip chain")) return nullptr;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, kShaderRead, nullptr, IID_PPV_ARGS(&chain.texture)), "resolved mip chain")) return nullptr;
             chain.width = base.width;
             chain.height = base.height;
             chain.levels = levels;
@@ -733,13 +737,13 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (chain.copied[level].first == source.texture.Get() && chain.copied[level].second == source.version) continue;
             if (!started)
             {
-                auto toCopy = Transition(chain.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                auto toCopy = Transition(chain.texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
                 gList->ResourceBarrier(1, &toCopy);
                 started = true;
             }
             const UINT levelWidth = std::max(chain.width >> level, 1u), levelHeight = std::max(chain.height >> level, 1u);
             D3D12_BOX box{ 0, 0, 0, std::min(levelWidth, source.width), std::min(levelHeight, source.height), 1 };
-            auto toSource = Transition(source.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            auto toSource = Transition(source.texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gList->ResourceBarrier(1, &toSource);
             D3D12_TEXTURE_COPY_LOCATION to{}, from{};
             to.pResource = chain.texture.Get();
@@ -748,13 +752,13 @@ float PSMain(float4 position : SV_Position) : SV_Target
             from.pResource = source.texture.Get();
             from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             gList->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
-            auto back = Transition(source.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            auto back = Transition(source.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kShaderRead);
             gList->ResourceBarrier(1, &back);
             chain.copied[level] = { source.texture.Get(), source.version };
         }
         if (started)
         {
-            auto toRead = Transition(chain.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            auto toRead = Transition(chain.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
             gList->ResourceBarrier(1, &toRead);
         }
         levelsOut = levels;
@@ -954,10 +958,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
         else
         {
-            auto toTarget = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto toTarget = Transition(destination.texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_RENDER_TARGET);
             gList->ResourceBarrier(1, &toTarget);
         }
-        auto toRead = Transition(source->texture.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto toRead = Transition(source->texture.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kShaderRead);
         gList->ResourceBarrier(1, &toRead);
 
         // Clip the copied rectangle to both surfaces.
@@ -1002,8 +1006,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gList->DrawInstanced(3, 1, 0, 0);
             }
         }
-        auto toWrite = Transition(source->texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        auto toSample = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto toWrite = Transition(source->texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        auto toSample = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
         D3D12_RESOURCE_BARRIER after[2] = { toWrite, toSample };
         gList->ResourceBarrier(2, after);
         ApplyResolveClears(resolve);
@@ -1045,7 +1049,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         SetTargetState(*source, D3D12_RESOURCE_STATE_COPY_SOURCE);
         if (!created)
         {
-            auto toCopy = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto toCopy = Transition(destination.texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
             gList->ResourceBarrier(1, &toCopy);
         }
         D3D12_TEXTURE_COPY_LOCATION to{}, from{};
@@ -1091,7 +1095,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 finalCopyState = D3D12_RESOURCE_STATE_COPY_SOURCE;
             }
         }
-        auto toRead = Transition(destination.texture.Get(), finalCopyState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto toRead = Transition(destination.texture.Get(), finalCopyState, kShaderRead);
         gList->ResourceBarrier(1, &toRead);
         ApplyResolveClears(resolve);
     }
@@ -1399,7 +1403,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
             }
             D3D12_RESOURCE_BARRIER toRead[3];
-            for (int i = 0; i < 3; i++) toRead[i] = Transition(gTextures[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            for (int i = 0; i < 3; i++) toRead[i] = Transition(gTextures[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
             gList->ResourceBarrier(3, toRead);
         }
 
@@ -1470,7 +1474,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (movie)
         {
             D3D12_RESOURCE_BARRIER toCopyDest[3];
-            for (int i = 0; i < 3; i++) toCopyDest[i] = Transition(gTextures[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (int i = 0; i < 3; i++) toCopyDest[i] = Transition(gTextures[i].Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
             gList->ResourceBarrier(3, toCopyDest);
         }
         gList->Close();

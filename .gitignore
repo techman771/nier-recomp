@@ -28,3 +28,4 @@
 *.sfd
 *.iso
 *.ppm
+/recomp/captures/

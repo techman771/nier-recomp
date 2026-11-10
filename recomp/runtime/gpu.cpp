@@ -376,7 +376,7 @@ namespace
             return texture;
         }();
         std::lock_guard lock(gStatsMutex);
-        gSubstitutedFormats[format]++;
+        if (gSubstitutedFormats[format]++ == 0) Log("[gpu] texture format %u not decoded; substituting white (frame %llu)\n", format, GpuFrameCount());
         return white;
     }
 
@@ -518,10 +518,31 @@ namespace
         // into the same host texture rather than creating a new one each time.
         const uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1) ^ (uint64_t(levels) << 58) ^ (uint64_t(t.mipAddress) << 4);
         const uint8_t* source = g_base + guest;
+        // Hashing the contents on every use dominated the command thread. Small textures (bone
+        // matrices, rewritten between draws) are still hashed every time; larger ones once per frame,
+        // since the game streams them in between frames.
+        struct HashMemo { uint64_t frame = ~0ull, hash = 0; };
+        static std::unordered_map<uint64_t, HashMemo> hashMemo;
+        static const bool hashEveryUse = GetEnvironmentVariableA("NIER_HASH_EVERY_USE", nullptr, 0) > 0;   // debugging
+        const bool large = !hashEveryUse && bytes + (levels > 1 ? mipBytes : 0) > 64 * 1024;
+        HashMemo* memo = large ? &hashMemo[key] : nullptr;
         uint64_t content = 1469598103934665603ull;
-        for (uint64_t i = 0; i < bytes; i += 16) content = (content ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
-        if (levels > 1)
-            for (uint64_t i = 0; i < mipBytes; i += 64) content = (content ^ *(const uint32_t*)(g_base + mipGuest + (i & ~3ull))) * 1099511628211ull;
+        if (memo && memo->frame == gFrames.load()) content = memo->hash;
+        else if (!large)
+        {
+            // Every word: a bone matrix rewritten in place may change only some of a texel's
+            // components, which sampling one word in four would miss (stale bones for one mesh).
+            for (uint64_t i = 0; i + 8 <= bytes; i += 8) content = (content ^ *(const uint64_t*)(source + i)) * 1099511628211ull;
+            if (levels > 1)
+                for (uint64_t i = 0; i + 8 <= mipBytes; i += 8) content = (content ^ *(const uint64_t*)(g_base + mipGuest + i)) * 1099511628211ull;
+        }
+        else
+        {
+            for (uint64_t i = 0; i < bytes; i += 16) content = (content ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
+            if (levels > 1)
+                for (uint64_t i = 0; i < mipBytes; i += 64) content = (content ^ *(const uint32_t*)(g_base + mipGuest + (i & ~3ull))) * 1099511628211ull;
+            if (memo) *memo = { gFrames.load(), content };
+        }
 
         binding.scale[0] = float(t.width) / float(widthBlocks * blockSize);
         binding.scale[1] = float(t.height) / float(heightBlocks * blockSize);
@@ -837,16 +858,45 @@ namespace
         if (draw.indices.empty()) return;
         draw.vertexCount = uint32_t(draw.indices.size());
 
+        // Vertex buffers: when the shader addresses vertices with the plain vertex index, only the
+        // vertices between the draw's smallest and largest index are copied (a fetch constant often
+        // covers a whole level's geometry). The base is then shifted so index * stride still lands
+        // on the copied bytes (unsigned wrap-around is fine).
+        uint32_t minIndex = 0xFFFFFFFF, maxIndex = 0;
+        static const bool noTrim = GetEnvironmentVariableA("NIER_NO_VERTEX_TRIM", nullptr, 0) > 0;   // debugging
+        if (vs->info.directVertexIndex && !noTrim)
+            for (uint32_t index : draw.indices) { minIndex = std::min(minIndex, index); maxIndex = std::max(maxIndex, index); }
+        struct VertexCopy { uint32_t slot, first, bytes, endian; const uint8_t* source; };
+        VertexCopy copies[96];
+        uint32_t copyCount = 0, totalBytes = 0;
         for (uint32_t slot : vs->info.vertexSlots)
         {
             const uint32_t d0 = r[REG_FETCH_CONSTANTS + slot * 2], d1 = r[REG_FETCH_CONSTANTS + slot * 2 + 1];
             if ((d0 & 3) != 3) { SkipDraw("vertex fetch constant not set"); return; }
             const uint32_t bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
             if (bytes > 0x1000000) { SkipDraw("oversized vertex buffer"); return; }
-            const size_t offset = draw.vertexData.size();
-            draw.vertexData.resize(offset + bytes);
-            CopySwapped(draw.vertexData.data() + offset, g_base + PhysicalToGuest(d0 & ~3u), bytes, d1 & 3);
-            draw.vertexBase[slot] = uint32_t(offset);
+            uint32_t first = 0, last = bytes;
+            auto use = vs->info.vertexUse.find(slot);
+            if (vs->info.directVertexIndex && minIndex <= maxIndex && use != vs->info.vertexUse.end() && use->second.stride)
+            {
+                const uint64_t from = uint64_t(minIndex) * use->second.stride, to = uint64_t(maxIndex) * use->second.stride + use->second.end;
+                if (from < bytes)
+                {
+                    first = uint32_t(from) & ~3u;
+                    last = uint32_t(std::min<uint64_t>(to, bytes));
+                }
+            }
+            copies[copyCount++] = { slot, first, last - first, d1 & 3, g_base + PhysicalToGuest(d0 & ~3u) };
+            totalBytes += last - first;
+        }
+        draw.vertexData.resize(totalBytes);
+        uint32_t written = 0;
+        for (uint32_t i = 0; i < copyCount; i++)
+        {
+            const VertexCopy& copy = copies[i];
+            CopySwapped(draw.vertexData.data() + written, copy.source + copy.first, copy.bytes, copy.endian);
+            draw.vertexBase[copy.slot] = written - copy.first;
+            written += copy.bytes;
         }
 
         memcpy(draw.constants.data(), &r[0x4000], draw.constants.size() * 4);
@@ -865,6 +915,11 @@ namespace
             const uint32_t swizzle = (c[3] >> 1) & 0xFFF;
             for (int i = 0; i < 4; i++) binding.swizzle[i] = (swizzle >> (i * 3)) & 7;
             binding.point = ((c[3] >> 19) & 3) == 0;
+            if (t.height == 1)
+            {
+                static int logged = 0;   // one-row textures (bone matrices): how they are filtered
+                if (logged++ < 2) Log("[gpu] one-row texture slot %u dimension %u format %u width %u: mag filter %u min filter %u mip filter %u, dword3 %08X\n", slot, t.dimension, t.format, t.width, (c[3] >> 19) & 3, (c[3] >> 21) & 3, (c[3] >> 23) & 3, c[3]);
+            }
             binding.baseOnly = ((c[3] >> 23) & 3) == 2;   // mip filter: base map only
             // Sign modes belong to the texture's components; the view's swizzle has already moved them.
             const uint32_t signs = (c[0] >> 2) & 0xFF;
@@ -918,6 +973,40 @@ namespace
                 if (!binding.decoded) continue;
             }
             binding.valid = true;
+        }
+
+        // NIER_DUMP_DRAW=<vertex shader hash>: writes the next draws with that shader (from the
+        // -LogDrawsAt frame on) to captures/: byte-swapped vertex data, indices, vertex constants and
+        // the texture in slot 16 (bone matrices), for offline analysis (debugging).
+        {
+            static std::map<uint64_t, int> dumpShaders = [] {   // hash -> draws dumped so far
+                std::map<uint64_t, int> hashes;
+                char value[512];
+                if (GetEnvironmentVariableA("NIER_DUMP_DRAW", value, sizeof(value)))
+                    for (char* item = strtok(value, ","); item; item = strtok(nullptr, ",")) hashes[strtoull(item, nullptr, 16)] = 0;
+                return hashes;
+            }();
+            auto dumpEntry = dumpShaders.find(vs->shader->hash);
+            if (dumpEntry != dumpShaders.end() && gLogDrawsAt && gFrames.load() >= gLogDrawsAt && dumpEntry->second < 3)
+            {
+                CreateDirectoryA("..\\captures", nullptr);
+                char path[128];
+                snprintf(path, sizeof(path), "..\\captures\\draw_%016llX_%d.bin", (unsigned long long)vs->shader->hash, dumpEntry->second++);
+                if (FILE* file = fopen(path, "wb"))
+                {
+                    // Header: counts, then each block; slot 95's base within the vertex data.
+                    const uint32_t header[6] = { uint32_t(draw.vertexData.size()), uint32_t(draw.indices.size()), uint32_t(draw.constants.size()),
+                                                 draw.textures[16].decoded ? uint32_t(draw.textures[16].decoded->data.size()) : 0u, draw.vertexBase[95],
+                                                 draw.textures[16].decoded ? draw.textures[16].decoded->width : 0u };
+                    fwrite(header, 4, 6, file);
+                    fwrite(draw.vertexData.data(), 1, draw.vertexData.size(), file);
+                    fwrite(draw.indices.data(), 4, draw.indices.size(), file);
+                    fwrite(draw.constants.data(), 4, draw.constants.size(), file);
+                    if (draw.textures[16].decoded) fwrite(draw.textures[16].decoded->data.data(), 1, draw.textures[16].decoded->data.size(), file);
+                    fclose(file);
+                    Log("[gpu] dumped draw to %s (frame %llu, t16 fetch constant dword 0 %08X)\n", path, gFrames.load(), gRegisters[REG_FETCH_CONSTANTS + 16 * 6]);
+                }
+            }
         }
 
         // A disabled viewport means the shader already outputs window coordinates.
