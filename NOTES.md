@@ -205,10 +205,18 @@ fetches, six-face textures as `TextureCube`; used by the character materials). T
 credits, the snow-sky shot and the Grimoire scene ("Take it and save your daughter...") play through.
 Only 24 draws a run are skipped (primitive type 1). The scene looks like the game: textured ruined
 buildings, fences, snow, fog and light shafts. Characters render with plausible
-materials. Remaining visible faults: a few over-bright patches on character reflections (the cube
-map is sampled at its sharpest level because mipmaps and the set-LOD fetch, opcode 24, aren't
-supported), the cinematic letterbox bars are translucent grey instead of solid, and only base mip
-levels are bound.
+materials. Remaining visible fault: the cinematic letterbox bars are translucent grey instead of
+solid.
+
+Mipmaps follow Xenia's `GetGuestTextureLayout`: levels 1 and up start at the fetch constant's mip
+address (dword 5); each level's pitch and height come from the power-of-two base size shifted down
+and padded to 32x32-block tiles, and each level (all six faces for a cube) is padded to 4 KB. From
+the packed level (shorter side 16 texels or less) on, the remaining levels share that level's tile at
+`GetPackedMipOffset` positions; when the base itself is packed, all mips share one tile at the mip
+address. The max level is dword 4 bits 6-9; mip filter "base map" (dword 3 bits 23-24 = 2) binds
+the base only. The set-LOD fetch (opcode 24) stores a level that fetches with "use register LOD"
+(dword 1 bit 29) sample with `SampleLevel`; the character shaders use it to blur reflections on
+rough surfaces, and without it they looked like chrome.
 
 Scalar ALU ops read source 3 with Xenia's component rule: one-operand ops use swizzle component 3,
 two-operand ops use component 3 then component 0. The translator used components 0 and 1, which only

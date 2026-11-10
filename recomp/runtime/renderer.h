@@ -29,8 +29,12 @@ struct DecodedTexture
     uint64_t contentHash = 0;   // changes when the guest rewrites the texture
     uint32_t width = 0, height = 0, rowPitch = 0;
     uint32_t faces = 1;                         // 6 for a cube map, faces stored one after another
+    uint32_t levels = 1;                        // mip levels, the base included
     GuestTextureFormat format = GuestTextureFormat::RGBA8;
     std::vector<uint8_t> data;
+    // Where each subresource (face * levels + level, D3D order) starts in `data`, and its row pitch.
+    struct Subresource { size_t offset = 0; uint32_t rowPitch = 0, rows = 0; };
+    std::vector<Subresource> subresources;
 };
 
 struct TextureBinding
@@ -41,6 +45,7 @@ struct TextureBinding
     uint8_t swizzle[4] = { 0, 1, 2, 3 };       // 0-3 channel, 4 zero, 5 one
     bool point = false;
     bool cube = false;                         // the shader samples this slot as a cube map
+    bool baseOnly = false;                     // the fetch constant's mip filter says base map only
     float scale[2] = { 1.0f, 1.0f };
     uint32_t sign = 0;   // 2-bit sign mode per output component, bit 8: 8-bit host data (two's complement applies)
 };

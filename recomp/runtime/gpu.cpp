@@ -145,6 +145,8 @@ namespace
         uint32_t base, format, width, height, pitch, endian;
         bool tiled, packedMips;
         uint32_t dimension;   // 0 1D, 1 2D or stacked, 2 3D, 3 cube
+        uint32_t mipAddress;  // physical address of levels 1 and up (0 when there are none)
+        uint32_t maxLevel;
     };
 
     // Texture fetch constants are 6 dwords per slot; type 2 marks a texture.
@@ -170,6 +172,8 @@ namespace
         out.pitch = ((c[0] >> 22) & 0x1FF) << 5;
         out.tiled = (c[0] >> 31) & 1;
         out.packedMips = (c[5] >> 11) & 1;
+        out.mipAddress = c[5] & 0xFFFFF000;
+        out.maxLevel = (c[4] >> 6) & 0xF;
         return true;
     }
 
@@ -366,6 +370,7 @@ namespace
             texture->width = texture->height = 4;
             texture->rowPitch = 16;
             texture->data.assign(64, 255);
+            texture->subresources.push_back({ 0, 16, 4 });
             return texture;
         }();
         std::lock_guard lock(gStatsMutex);
@@ -428,13 +433,93 @@ namespace
         const uint64_t bytes = faceStride * (faces - 1) + faceBytes;
         if (faceBytes == 0 || uint64_t(guest) + bytes > 0x100000000ull) return nullptr;
 
+        // Mip levels (Xenia texture_util.cc GetGuestTextureLayout). Level L >= 1 lives in the mip
+        // area; its pitch and height come from the power-of-two base size shifted down, padded to
+        // 32x32 blocks, and each level (all faces) is padded to 4 KB. From the "packed" level on
+        // (shorter side 16 texels or less), the remaining levels share that level's tile at fixed
+        // offsets.
+        const auto logCeil = [](uint32_t v) { uint32_t n = 0; while ((1u << n) < v) n++; return n; };
+        const auto logFloor = [](uint32_t v) { uint32_t n = 0; while ((2u << n) <= v) n++; return n; };
+        const auto alignUp = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
+        const auto packedOffset = [&](uint32_t level, uint32_t& x, uint32_t& y) {
+            // Xenia GetPackedMipOffset for 2D textures, in blocks; false when the level isn't packed.
+            const uint32_t lw = logCeil(t.width), lh = logCeil(t.height), ls = std::min(lw, lh);
+            x = y = 0;
+            if (!t.packedMips || ls > 4 + level) return false;
+            const uint32_t packedBase = ls > 4 ? ls - 4 : 0, packed = level - packedBase;
+            if (packed < 3)
+            {
+                if (lw > lh) y = 16 >> packed; else x = 16 >> packed;
+            }
+            else
+            {
+                if (lw > lh) x = (1u << (lw - packedBase)) >> (packed - 2);
+                else y = (1u << (lh - packedBase)) >> (packed - 2);
+            }
+            x /= blockSize;
+            y /= blockSize;
+            return true;
+        };
+        const uint32_t mipPage = t.mipAddress >> 12;
+        uint32_t levels = 1;
+        if (mipPage && t.tiled && t.dimension != 0)
+            levels = std::min(t.maxLevel, logFloor(std::max(t.width, t.height))) + 1;
+        const uint32_t packedLevel = t.packedMips ? (std::min(logCeil(t.width), logCeil(t.height)) > 4 ? std::min(logCeil(t.width), logCeil(t.height)) - 4 : 0) : 32;
+        const uint32_t pow2Width = 1u << logCeil(t.width), pow2Height = 1u << logCeil(t.height);
+        struct GuestLevel { uint64_t offset = 0; uint32_t pitchBlocks = 0, rows = 0; uint64_t faceStride = 0; uint32_t packX = 0, packY = 0; };
+        std::vector<GuestLevel> guestLevels(levels);
+        uint64_t mipBytes = 0;
+        const auto storageLayout = [&](uint32_t shift, GuestLevel& g) {
+            const uint32_t levelWidth = std::max(pow2Width >> shift, 1u), levelHeight = std::max(pow2Height >> shift, 1u);
+            g.pitchBlocks = uint32_t(alignUp((levelWidth + blockSize - 1) / blockSize, 32));
+            g.rows = uint32_t(alignUp((levelHeight + blockSize - 1) / blockSize, 32));
+            g.faceStride = alignUp(uint64_t(g.pitchBlocks) * g.rows * blockBytes, 4096);
+        };
+        if (levels > 1 && packedLevel == 0)
+        {
+            // The base is already in a packed tile, so every mip shares one tile at the mip address,
+            // laid out with the base size's pitch.
+            GuestLevel tail;
+            storageLayout(0, tail);
+            for (uint32_t level = 1; level < levels; level++)
+            {
+                guestLevels[level] = tail;
+                packedOffset(level, guestLevels[level].packX, guestLevels[level].packY);
+            }
+            mipBytes = tail.faceStride * faces;
+        }
+        else if (levels > 1)
+        {
+            // Levels 1 up to the packed level each have their own storage, one after another; the
+            // packed level's tile also holds every smaller level.
+            uint64_t offset = 0;
+            const uint32_t lastStored = std::min(levels - 1, packedLevel);
+            for (uint32_t level = 1; level <= lastStored; level++)
+            {
+                storageLayout(level, guestLevels[level]);
+                guestLevels[level].offset = offset;
+                if (level == packedLevel) packedOffset(level, guestLevels[level].packX, guestLevels[level].packY);
+                offset += guestLevels[level].faceStride * faces;
+            }
+            for (uint32_t level = lastStored + 1; level < levels; level++)
+            {
+                guestLevels[level] = guestLevels[lastStored];
+                packedOffset(level, guestLevels[level].packX, guestLevels[level].packY);
+            }
+            mipBytes = offset;
+        }
+        const uint32_t mipGuest = mipPage ? PhysicalToGuest(t.mipAddress) : 0;
+        if (levels > 1 && uint64_t(mipGuest) + mipBytes > 0x100000000ull) levels = 1;
+
         // A texture is identified by where it lives and its shape; its contents can change (bone
         // matrices are rewritten every frame), so they're tracked by a separate hash and re-uploaded
         // into the same host texture rather than creating a new one each time.
-        const uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1);
+        const uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1) ^ (uint64_t(levels) << 58) ^ (uint64_t(t.mipAddress) << 4);
         const uint8_t* source = g_base + guest;
         uint64_t content = 1469598103934665603ull;
         for (uint64_t i = 0; i < bytes; i += 16) content = (content ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
+        if (levels > 1)
+            for (uint64_t i = 0; i < mipBytes; i += 64) content = (content ^ *(const uint32_t*)(g_base + mipGuest + (i & ~3ull))) * 1099511628211ull;
 
         binding.scale[0] = float(t.width) / float(widthBlocks * blockSize);
         binding.scale[1] = float(t.height) / float(heightBlocks * blockSize);
@@ -449,38 +534,62 @@ namespace
         decoded->height = heightBlocks * blockSize;
         decoded->rowPitch = ctx1 ? widthBlocks * 4 * 4 : widthBlocks * blockBytes;
         decoded->faces = faces;
-        const size_t decodedFaceBytes = size_t(decoded->rowPitch) * heightBlocks * (ctx1 ? 4 : 1);
-        decoded->data.resize(decodedFaceBytes * faces);
+        decoded->levels = levels;
 
-        // A surface with a dimension of 16 or less lives inside a shared 32x32 tile, offset along
-        // its short axis: textures wider than tall start 16 down, the rest start 16 across.
-        uint32_t packedX = 0, packedY = 0;
-        const auto logCeil = [](uint32_t v) { uint32_t n = 0; while ((1u << n) < v) n++; return n; };
-        if (t.tiled && t.packedMips && std::min(logCeil(t.width), logCeil(t.height)) <= 4)
-        {
-            if (logCeil(t.width) > logCeil(t.height)) packedY = 16 / blockSize;
-            else packedX = 16 / blockSize;
-        }
+        // Host layout: for each face, each level's rows (CTX1 expands to RGBA8 texel rows).
+        size_t total = 0;
+        decoded->subresources.resize(size_t(faces) * levels);
+        for (uint32_t face = 0; face < faces; face++)
+            for (uint32_t level = 0; level < levels; level++)
+            {
+                const uint32_t w = std::max(decoded->width >> level, 1u), h = std::max(decoded->height >> level, 1u);
+                const uint32_t wb = (w + blockSize - 1) / blockSize, hb = (h + blockSize - 1) / blockSize;
+                DecodedTexture::Subresource& sub = decoded->subresources[size_t(face) * levels + level];
+                sub.offset = total;
+                sub.rowPitch = ctx1 ? wb * 16 : wb * blockBytes;
+                sub.rows = ctx1 ? hb * 4 : hb;
+                total += size_t(sub.rowPitch) * sub.rows;
+            }
+        decoded->data.resize(total);
 
         for (uint32_t face = 0; face < faces; face++)
-        {
-            const uint8_t* faceSource = source + faceStride * face;
-            for (uint32_t y = 0; y < heightBlocks; y++)
+            for (uint32_t level = 0; level < levels; level++)
             {
-                uint8_t* row = decoded->data.data() + decodedFaceBytes * face + size_t(y) * decoded->rowPitch * (ctx1 ? 4 : 1);
-                for (uint32_t x = 0; x < widthBlocks; x++)
+                const DecodedTexture::Subresource& sub = decoded->subresources[size_t(face) * levels + level];
+                const uint32_t w = std::max(decoded->width >> level, 1u), h = std::max(decoded->height >> level, 1u);
+                const uint32_t wb = (w + blockSize - 1) / blockSize, hb = (h + blockSize - 1) / blockSize;
+                const uint8_t* levelSource;
+                uint32_t levelPitch, packX = 0, packY = 0;
+                if (level == 0)
                 {
-                    const uint32_t index = t.tiled ? TiledOffset(x + packedX, y + packedY, pitchBlocks, logBytes) : y * pitchBlocks + x;
-                    if (ctx1)
+                    levelSource = source + faceStride * face;
+                    levelPitch = pitchBlocks;
+                    if (t.tiled) packedOffset(0, packX, packY);
+                }
+                else
+                {
+                    const GuestLevel& g = guestLevels[level];
+                    levelSource = g_base + mipGuest + g.offset + g.faceStride * face;
+                    levelPitch = g.pitchBlocks;
+                    packX = g.packX;
+                    packY = g.packY;
+                }
+                for (uint32_t y = 0; y < hb; y++)
+                {
+                    uint8_t* row = decoded->data.data() + sub.offset + size_t(y) * sub.rowPitch * (ctx1 ? 4 : 1);
+                    for (uint32_t x = 0; x < wb; x++)
                     {
-                        uint8_t block[8];
-                        CopySwapped(block, faceSource + uint64_t(index) * blockBytes, 8, t.endian);
-                        DecodeCtx1Block(block, row + size_t(x) * 16, decoded->rowPitch);
+                        const uint32_t index = t.tiled ? TiledOffset(x + packX, y + packY, levelPitch, logBytes) : y * levelPitch + x;
+                        if (ctx1)
+                        {
+                            uint8_t block[8];
+                            CopySwapped(block, levelSource + uint64_t(index) * blockBytes, 8, t.endian);
+                            DecodeCtx1Block(block, row + size_t(x) * 16, sub.rowPitch);
+                        }
+                        else CopySwapped(row + size_t(x) * blockBytes, levelSource + uint64_t(index) * blockBytes, blockBytes, t.endian);
                     }
-                    else CopySwapped(row + size_t(x) * blockBytes, faceSource + uint64_t(index) * blockBytes, blockBytes, t.endian);
                 }
             }
-        }
         gDecodedTextures[key] = decoded;
         return decoded;
     }
@@ -737,6 +846,7 @@ namespace
             const uint32_t swizzle = (c[3] >> 1) & 0xFFF;
             for (int i = 0; i < 4; i++) binding.swizzle[i] = (swizzle >> (i * 3)) & 7;
             binding.point = ((c[3] >> 19) & 3) == 0;
+            binding.baseOnly = ((c[3] >> 23) & 3) == 2;   // mip filter: base map only
             // Sign modes belong to the texture's components; the view's swizzle has already moved them.
             const uint32_t signs = (c[0] >> 2) & 0xFF;
             binding.sign = 0;

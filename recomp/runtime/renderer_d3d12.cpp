@@ -619,7 +619,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         desc.Width = decoded.width;
         desc.Height = decoded.height;
         desc.DepthOrArraySize = UINT16(decoded.faces);
-        desc.MipLevels = 1;
+        desc.MipLevels = UINT16(decoded.levels);
         desc.Format = DecodedFormat(decoded.format);
         desc.SampleDesc.Count = 1;
 
@@ -631,7 +631,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         {
             if (found->second.contentHash == decoded.contentHash) return found->second.texture.Get();
             const D3D12_RESOURCE_DESC existing = found->second.texture->GetDesc();
-            if (existing.Width == desc.Width && existing.Height == desc.Height && existing.DepthOrArraySize == desc.DepthOrArraySize && existing.Format == desc.Format)
+            if (existing.Width == desc.Width && existing.Height == desc.Height && existing.DepthOrArraySize == desc.DepthOrArraySize && existing.Format == desc.Format && existing.MipLevels == desc.MipLevels)
             {
                 texture = found->second.texture;
                 auto toCopy = Transition(texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -646,23 +646,25 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)), "guest texture")) return nullptr;
         }
 
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6];
-        UINT rows[6] = {};
+        const UINT subresources = UINT(decoded.subresources.size());
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresources);
+        std::vector<UINT> rows(subresources);
         UINT64 total = 0;
-        const UINT faces = std::min(decoded.faces, 6u);
-        gDevice->GetCopyableFootprints(&desc, 0, faces, 0, footprints, rows, nullptr, &total);
+        gDevice->GetCopyableFootprints(&desc, 0, subresources, 0, footprints.data(), rows.data(), nullptr, &total);
         ArenaBlock block = ArenaAlloc(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        const size_t faceBytes = decoded.data.size() / faces;
-        for (UINT face = 0; face < faces; face++)
+        for (UINT index = 0; index < subresources; index++)
         {
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = footprints[face];
-            for (UINT row = 0; row < rows[face]; row++)
-                memcpy(block.cpu + footprint.Offset + UINT64(row) * footprint.Footprint.RowPitch, decoded.data.data() + faceBytes * face + size_t(row) * decoded.rowPitch, decoded.rowPitch);
+            const DecodedTexture::Subresource& sub = decoded.subresources[index];
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = footprints[index];
+            const UINT copyRows = std::min(rows[index], sub.rows);
+            const UINT copyBytes = std::min(UINT(footprint.Footprint.RowPitch), sub.rowPitch);
+            for (UINT row = 0; row < copyRows; row++)
+                memcpy(block.cpu + footprint.Offset + UINT64(row) * footprint.Footprint.RowPitch, decoded.data.data() + sub.offset + size_t(row) * sub.rowPitch, copyBytes);
             footprint.Offset += block.offset;
             D3D12_TEXTURE_COPY_LOCATION destination{}, source{};
             destination.pResource = texture.Get();
             destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            destination.SubresourceIndex = face;
+            destination.SubresourceIndex = index;
             source.pResource = gArena.Get();
             source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             source.PlacedFootprint = footprint;
@@ -700,15 +702,16 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (resource && isCube != binding.cube) resource = nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = format;
+        const UINT mipLevels = (binding.valid && binding.decoded && !binding.baseOnly && resource) ? binding.decoded->levels : 1;
         if (binding.cube)
         {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            view.TextureCube.MipLevels = 1;
+            view.TextureCube.MipLevels = mipLevels;
         }
         else
         {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            view.Texture2D.MipLevels = 1;
+            view.Texture2D.MipLevels = mipLevels;
         }
         // A resolve that swapped red and blue changes which channel each guest component reads.
         auto channel = [&](int i)

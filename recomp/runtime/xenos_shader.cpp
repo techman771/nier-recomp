@@ -441,7 +441,14 @@ float3 CubeDirection(float3 c)
         void EmitTextureFetch(const uint32_t* w)
         {
             const uint32_t opcode = w[0] & 0x1F;
-            if (opcode == 24) return;   // set texture LOD: only base levels are bound so far
+            if (opcode == 24)
+            {
+                // Set texture LOD: later fetches that use the register LOD sample at this level.
+                const int lodSource = (w[0] >> 5) & 0x3F;
+                body += OpenPredicate(w[1] >> 31, w[2] >> 31);
+                body += "        lod_ = " + Register(lodSource) + "." + "xyzw"[(w[0] >> 26) & 3] + ";\n    }\n";
+                return;
+            }
             if (opcode != 1) { Fail(Format("texture opcode %d", int(opcode))); return; }
             const int source = (w[0] >> 5) & 0x3F, dest = (w[0] >> 12) & 0x3F;
             const uint32_t slot = (w[0] >> 20) & 0x1F;
@@ -457,8 +464,11 @@ float3 CubeDirection(float3 c)
             // 1D textures are bound as one-row 2D textures.
             if (oneD) coordinates = "float2(" + coordinates + ", 0.5)";
             const std::string where = cube ? "CubeDirection(" + coordinates + ")" : coordinates + Format(" * texScale[%d].xy", int(slot));
-            // Vertex shaders have no derivatives, so they sample the base level explicitly.
-            const std::string call = pixel ? ".Sample(" : ".SampleLevel(", level = pixel ? ")" : ", 0)";
+            // Fetches flagged "use register LOD" sample the level set by opcode 24. Vertex shaders have
+            // no derivatives, so they always sample an explicit level.
+            const bool registerLod = (w[1] >> 29) & 1;
+            const std::string call = (pixel && !registerLod) ? ".Sample(" : ".SampleLevel(";
+            const std::string level = (pixel && !registerLod) ? ")" : registerLod ? ", lod_)" : ", 0)";
             char sample[384];
             snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u%spointSampler, %s%s : t%u%slinearSampler, %s%s)",
                 slot / 4, slot % 4, slot, call.c_str(), where.c_str(), level.c_str(), slot, call.c_str(), where.c_str(), level.c_str());
@@ -539,7 +549,7 @@ float3 CubeDirection(float3 c)
             hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input)" + (exportsDepth ? "" : " : SV_Target0") +
                                 "\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 }; float4 oDepth = (float4)0;\n"
                           : "Interpolated main(uint vertexId : SV_VertexID)\n{\n    float4 oPos = float4(0, 0, 0, 1); float4 oPointSize = (float4)0;\n    float4 oT[16];\n    for (int i_ = 0; i_ < 16; i_++) oT[i_] = (float4)0;\n";
-            hlsl += Format("    float4 r[%d];\n    for (int i_ = 0; i_ < %d; i_++) r[i_] = (float4)0;\n    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0;\n", maxRegister, maxRegister);
+            hlsl += Format("    float4 r[%d];\n    for (int i_ = 0; i_ < %d; i_++) r[i_] = (float4)0;\n    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0; float lod_ = 0.0;\n", maxRegister, maxRegister);
             if (pixel) hlsl += Format("    for (int i_ = 0; i_ < %d; i_++) r[i_] = input.t[i_];\n", std::min(maxRegister, 16));
             else hlsl += "    r[0].x = float(vertexId);\n";
             hlsl += body;
