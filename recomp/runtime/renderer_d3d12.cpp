@@ -256,6 +256,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         ComPtr<ID3D12Resource> texture;
         uint32_t width = 0, height = 0;
         bool swapRedBlue = false;
+        bool depth = false;   // R32_FLOAT depth copy rather than a color copy
     };
     struct SystemConstants
     {
@@ -283,6 +284,26 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
 
     struct DepthResource { ComPtr<ID3D12Resource> texture; UINT dsvIndex = 0; };
     constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    constexpr DXGI_FORMAT kDepthResourceFormat = DXGI_FORMAT_R24G8_TYPELESS;   // readable as R24_UNORM_X8
+    constexpr DXGI_FORMAT kDepthCopyFormat = DXGI_FORMAT_R32_FLOAT;
+
+    // Depth resolves: draw a triangle over the copied rectangle that loads the depth buffer.
+    const char kDepthCopyShader[] = R"(
+Texture2D<float> depthSource : register(t0);
+cbuffer Copy : register(b0) { int2 destOrigin; int2 sourceOrigin; int scale; int3 padding; };
+float4 VSMain(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+float PSMain(float4 position : SV_Position) : SV_Target
+{
+    int2 p = (int2(position.xy) - destOrigin) * scale + sourceOrigin;
+    return depthSource.Load(int3(p, 0));
+}
+)";
+    ComPtr<ID3D12PipelineState> gDepthCopyPipeline;
+    ComPtr<ID3D12DescriptorHeap> gDepthCopyRtvHeap;
     std::unordered_map<uint64_t, DepthResource> gDepths;
     ComPtr<ID3D12DescriptorHeap> gDepthDsvHeap;
     UINT gDepthDsvStep = 0, gDepthsCreated = 0;
@@ -372,7 +393,23 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = kBackBufferFormat;
         desc.SampleDesc.Count = 1;
-        return Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gBlitPipeline)), "blit pipeline");
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gBlitPipeline)), "blit pipeline")) return false;
+
+        ComPtr<ID3DBlob> copyVs, copyPs;
+        if (FAILED(D3DCompile(kDepthCopyShader, sizeof(kDepthCopyShader) - 1, "depthcopy", nullptr, nullptr, "VSMain", "vs_5_1", 0, 0, &copyVs, &shaderErrors)) ||
+            FAILED(D3DCompile(kDepthCopyShader, sizeof(kDepthCopyShader) - 1, "depthcopy", nullptr, nullptr, "PSMain", "ps_5_1", 0, 0, &copyPs, &shaderErrors)))
+        {
+            Log("[d3d12] depth copy shader failed: %s\n", shaderErrors ? (const char*)shaderErrors->GetBufferPointer() : "unknown");
+            return false;
+        }
+        desc.VS = { copyVs->GetBufferPointer(), copyVs->GetBufferSize() };
+        desc.PS = { copyPs->GetBufferPointer(), copyPs->GetBufferSize() };
+        desc.RTVFormats[0] = kDepthCopyFormat;
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gDepthCopyPipeline)), "depth copy pipeline")) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC copyRtvHeap{};
+        copyRtvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        copyRtvHeap.NumDescriptors = 1;
+        return Check(gDevice->CreateDescriptorHeap(&copyRtvHeap, IID_PPV_ARGS(&gDepthCopyRtvHeap)), "depth copy RTV heap");
     }
 
     ID3DBlob* ShaderBlob(const GuestShader& shader)
@@ -529,7 +566,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         desc.Height = key.height;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
-        desc.Format = kDepthFormat;
+        desc.Format = kDepthResourceFormat;
         desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         D3D12_CLEAR_VALUE clear{};
@@ -537,7 +574,10 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         clear.DepthStencil.Depth = 1.0f;
         if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&created.texture)), "depth target")) return nullptr;
         DepthResource& stored = gDepths[mapKey] = std::move(created);
-        gDevice->CreateDepthStencilView(stored.texture.Get(), nullptr, DepthView(stored));
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+        dsvDesc.Format = kDepthFormat;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        gDevice->CreateDepthStencilView(stored.texture.Get(), &dsvDesc, DepthView(stored));
         gList->ClearDepthStencilView(DepthView(stored), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
         Log("[d3d12] depth target at EDRAM 0x%X: %ux%u\n", key.edramBase, key.width, key.height);
         return &stored;
@@ -559,6 +599,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         case GuestTextureFormat::BC2: return DXGI_FORMAT_BC2_UNORM;
         case GuestTextureFormat::BC3: return DXGI_FORMAT_BC3_UNORM;
         case GuestTextureFormat::R8: return DXGI_FORMAT_R8_UNORM;
+        case GuestTextureFormat::RGBA16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         default: return DXGI_FORMAT_R8G8B8A8_UNORM;
         }
     }
@@ -613,7 +654,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     {
         ID3D12Resource* resource = nullptr;
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        bool swap = false;
+        bool swap = false, depthCopy = false;
         if (binding.valid && binding.decoded)
         {
             resource = GetDecoded(*binding.decoded);
@@ -626,6 +667,8 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             {
                 resource = found->second.texture.Get();
                 swap = found->second.swapRedBlue;
+                depthCopy = found->second.depth;
+                if (depthCopy) format = kDepthCopyFormat;
             }
         }
         // The view must match how the shader declares the slot; a texture of the other kind binds nothing.
@@ -644,7 +687,12 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             view.Texture2D.MipLevels = 1;
         }
         // A resolve that swapped red and blue changes which channel each guest component reads.
-        auto channel = [&](int i) { uint32_t c = binding.swizzle[i]; return (swap && (c == 0 || c == 2)) ? 2 - c : c; };
+        auto channel = [&](int i)
+        {
+            const uint32_t c = binding.swizzle[i];
+            if (depthCopy) return c < 4 ? 0u : c;   // every channel reads the depth
+            return (swap && (c == 0 || c == 2)) ? 2 - c : c;
+        };
         view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(channel(0), channel(1), channel(2), channel(3));
         gDevice->CreateShaderResourceView(resource, &view, handle);
     }
@@ -749,8 +797,103 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         }
     }
 
+    void ExecuteDepthResolve(const RendererResolve& resolve)
+    {
+        DepthResource* source = GetDepth(resolve.depth);
+        if (!source || !resolve.width || !resolve.height) return;
+        ResolvedResource& destination = gResolved[resolve.destBase];
+        bool created = false;
+        if (!destination.texture || !destination.depth || destination.width != resolve.width || destination.height != resolve.height)
+        {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = resolve.width;
+            desc.Height = resolve.height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = kDepthCopyFormat;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE clear{};
+            clear.Format = kDepthCopyFormat;
+            clear.Color[0] = 1.0f;
+            if (destination.texture) gRetired.push_back(std::move(destination.texture));
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&destination.texture)), "depth resolve texture")) return;
+            destination.width = resolve.width;
+            destination.height = resolve.height;
+            destination.depth = true;
+            destination.swapRedBlue = false;
+            created = true;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = gDepthCopyRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        gDevice->CreateRenderTargetView(destination.texture.Get(), nullptr, rtv);
+        if (created)
+        {
+            const FLOAT farDepth[4] = { 1.0f, 0, 0, 0 };
+            gList->ClearRenderTargetView(rtv, farDepth, 0, nullptr);
+        }
+        else
+        {
+            auto toTarget = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            gList->ResourceBarrier(1, &toTarget);
+        }
+        auto toRead = Transition(source->texture.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        gList->ResourceBarrier(1, &toRead);
+
+        // Clip the copied rectangle to both surfaces.
+        int sourceX = resolve.sourceX, sourceY = resolve.sourceY, destX = resolve.destX, destY = resolve.destY;
+        int copyWidth = int(resolve.copyWidth), copyHeight = int(resolve.copyHeight);
+        const int scale = int(std::max(1u, resolve.scale));
+        if (sourceX < 0) { destX -= sourceX / scale; copyWidth += sourceX / scale; sourceX = 0; }
+        if (sourceY < 0) { destY -= sourceY / scale; copyHeight += sourceY / scale; sourceY = 0; }
+        D3D12_RESOURCE_DESC sourceDesc = source->texture->GetDesc();
+        copyWidth = std::min({ copyWidth, (int(sourceDesc.Width) - sourceX) / scale, int(resolve.width) - destX });
+        copyHeight = std::min({ copyHeight, (int(sourceDesc.Height) - sourceY) / scale, int(resolve.height) - destY });
+        if (copyWidth > 0 && copyHeight > 0)
+        {
+            const UINT slot = gDrawSrvUsed;
+            gDrawSrvUsed += 16;
+            if (gDrawSrvUsed <= kDrawDescriptors)
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+                cpu.ptr += SIZE_T(slot) * gSrvStep;
+                D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+                gpu.ptr += UINT64(slot) * gSrvStep;
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                view.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                view.Texture2D.MipLevels = 1;
+                gDevice->CreateShaderResourceView(source->texture.Get(), &view, cpu);
+
+                ArenaBlock constants = ArenaAlloc(256, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+                const int32_t values[8] = { destX, destY, sourceX, sourceY, scale, 0, 0, 0 };
+                memcpy(constants.cpu, values, sizeof(values));
+                D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(resolve.width), float(resolve.height), 0.0f, 1.0f };
+                D3D12_RECT scissor{ destX, destY, destX + copyWidth, destY + copyHeight };
+                gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                gList->RSSetViewports(1, &viewport);
+                gList->RSSetScissorRects(1, &scissor);
+                gList->SetGraphicsRootSignature(gDrawRoot.Get());
+                gList->SetPipelineState(gDepthCopyPipeline.Get());
+                gList->SetGraphicsRootConstantBufferView(0, constants.gpu);
+                gList->SetGraphicsRootDescriptorTable(3, gpu);
+                gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                gList->DrawInstanced(3, 1, 0, 0);
+            }
+        }
+        auto toWrite = Transition(source->texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        auto toSample = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_BARRIER after[2] = { toWrite, toSample };
+        gList->ResourceBarrier(2, after);
+        ApplyResolveClears(resolve);
+    }
+
     void ExecuteResolve(const RendererResolve& resolve)
     {
+        if (resolve.copyDepth) { ExecuteDepthResolve(resolve); return; }
         if (!resolve.copyColor) { ApplyResolveClears(resolve); return; }
         TargetResource* source = GetTarget(resolve.source);
         if (!source) return;
@@ -759,7 +902,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
 
         ResolvedResource& destination = gResolved[resolve.destBase];
         bool created = false;
-        if (!destination.texture || destination.width != width || destination.height != height)
+        if (!destination.texture || destination.depth || destination.width != width || destination.height != height)
         {
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -775,6 +918,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination.texture)), "resolve texture")) return;
             destination.width = width;
             destination.height = height;
+            destination.depth = false;
             created = true;
         }
         destination.swapRedBlue = resolve.swapRedBlue;
@@ -808,8 +952,8 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     }
 
     // NIER_SHOW_SURFACE=<hex guest address>[@n] displays that resolved surface instead of the scanout;
-    // with @n, the n-th copy to it in each frame. A comma-separated list shows one entry per frame in
-    // turn, so consecutive saved frames capture each one (debugging).
+    // with @n, the n-th copy to it in each frame. A comma-separated list shows each entry for 60 frames
+    // in turn (not per frame: the window is on screen), so save frames 60 apart to capture each one.
     constexpr uint32_t kSnapshotBase = 0xFFFFF000;
     struct ShownSurface { uint32_t base = 0, occurrence = 0; };
     uint64_t gExecutingFrame = 0;
@@ -829,7 +973,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
                 }
             return entries;
         }();
-        return list.empty() ? ShownSurface{} : list[gExecutingFrame % list.size()];
+        return list.empty() ? ShownSurface{} : list[(gExecutingFrame / 60) % list.size()];
     }
 
     void ExecuteGuestCommands(const RendererFrame& frame)
@@ -846,7 +990,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             else
             {
                 const RendererResolve& resolve = std::get<RendererResolve>(command);
-                if (Shown().occurrence && resolve.copyColor && resolve.destBase == Shown().base && ++shownCopies == Shown().occurrence)
+                if (Shown().occurrence && (resolve.copyColor || resolve.copyDepth) && resolve.destBase == Shown().base && ++shownCopies == Shown().occurrence)
                 {
                     RendererResolve snapshot = resolve;
                     snapshot.destBase = kSnapshotBase;
@@ -870,11 +1014,12 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
         gpu.ptr += UINT64(slot) * gSrvStep;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-        view.Format = kTargetFormat;
+        view.Format = found->second.depth ? kDepthCopyFormat : kTargetFormat;
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        // NIER_SHOW_ALPHA=1 shows the alpha channel as grey (debugging).
+        // NIER_SHOW_ALPHA=1 shows the alpha channel as grey (debugging). Depth copies show as grey.
         static const bool showAlpha = GetEnvironmentVariableA("NIER_SHOW_ALPHA", nullptr, 0) > 0;
-        view.Shader4ComponentMapping = showAlpha ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3, 5) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Shader4ComponentMapping = found->second.depth ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 5)
+                                     : showAlpha ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3, 5) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Texture2D.MipLevels = 1;
         gDevice->CreateShaderResourceView(found->second.texture.Get(), &view, cpu);
 

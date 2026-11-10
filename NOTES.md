@@ -201,9 +201,37 @@ Rect lists use a geometry shader, which MoltenVK won't have. Decoded textures ar
 New Game now reaches the prologue (`C_TOKYO_FIELD_01`) and renders 3D: indexed draws with primitive
 restart, depth/stencil targets, depth-only passes, predicates and kills in the translator, packed vertex
 formats, the address register, pixel depth export, and cube maps (the `CUBE` instruction, cube
-fetches, six-face textures as `TextureCube`; used by reflective building materials). Shaders still
-skipped: vertex texture fetch (8) and a "vertex format 0" fetch in shaders whose control flow looks
-wrong (6).
+fetches, six-face textures as `TextureCube`; used by reflective building materials). The opening
+credits, the snow-sky shot and the Grimoire scene ("Take it and save your daughter...") play through.
+A 4-minute run executes about 237,000 draws with none failing and about 850 skipped (8 shaders with
+vertex texture fetch, and 24 draws of primitive type 1). The scene now looks like the game: textured
+ruined buildings, fences, snow, fog and light shafts. Remaining visible faults: the cinematic
+letterbox bars are translucent grey instead of solid, and only base mip levels are bound.
+
+Texture formats decoded: 2 (R8), 6 (RGBA8), 18-20 (BC1-3), 29 (`k_16_16_16_16_EXPAND`, uploaded as
+half floats like Xenia), 60 (`k_CTX1`, decoded on the CPU to (x, y, y, y) following Xenia's
+`texture_load_ctx1`), and 22 when it is a depth resolve.
+
+Scalar "constant" ops (opcodes 42-47: MULsc/ADDsc/SUBsc with a constant and a register) take the
+constant from source 3's register with swizzle component 3, and a temporary whose index is
+`opcode bit 0 | src3_sel << 1 | swizzle bits 2-5`, with swizzle component 0 (Xenia
+`scalar_const_reg_op_src_temp_reg`). Getting the bit order and components wrong made every scene
+vertex shader compute the fog factor from the wrong register, so all surfaces came out as flat fog
+colour.
+
+Physical memory windows: on the console, 0xA0000000 and 0xC0000000 show the same physical memory.
+D3D writes vertex shader microcode through one and copies it into command buffers through the other,
+so with separate memory every game vertex shader arrived as zeros except the fetch instructions D3D
+patches in (they "translated" into shaders that drew nothing; roughly 43,000 draws a run were lost).
+`memory.cpp` now maps one 512 MB section at both addresses inside the 4 GB reservation (placeholders:
+`VirtualAlloc2` / `MapViewOfFile3`, Windows 10 1803+). The 0xE0000000 window is offset by 4 KB on the
+console, which 64 KB mapping granularity can't express, so it is still separate. Linux and macOS
+will need the same arrangement with `memfd_create` / `shm_open` and `mmap`.
+
+Depth resolves (copy source 4) draw the depth buffer into an R32_FLOAT texture, which shaders sample as
+format 22 (`k_24_8`) with the depth in every channel, as Xenia does. Depth buffers are created
+`R24G8_TYPELESS` so they can be read. The shadow map pass and the scene depth (`07A7D000`,
+`072E2000`, `14D55000` in the prologue) are real now.
 
 ALU exports follow Xenia's rules (`ucode.h`, `GetConstant0WriteMask` / `GetConstant1WriteMask`): both
 the vector and scalar results go to the vector destination, components in both write masks receive
@@ -214,19 +242,17 @@ used to print them relative).
 
 Register meanings were checked against Xenia's `register_table.inc` and `registers.h`; every bit field
 used here matches. `SQ_PS_CONST` reads 0x000FF100, so pixel constants do start at 256. Not yet
-handled: alpha test (`RB_COLORCONTROL` at 0x2202), culling, depth resolves (copy source 4; shadow
-maps and the scene depth at `072E2000` / `14D55000` are sampled as a white stand-in), and EDRAM
-addresses wrapping every 2048 tiles. Lighting looks harsh and blocky, likely from those depth
-textures.
+handled: alpha test (`RB_COLORCONTROL` at 0x2202), culling, vertex texture fetch, mipmaps, and EDRAM
+addresses wrapping every 2048 tiles.
 
 Render targets are keyed by EDRAM address and width, with height covering the rest of EDRAM, because
 the same address is reused at several sizes in one frame; replaced resolve textures are retired only
 after the frame's GPU work completes.
 
 Debugging switches: `NIER_SHOW_SURFACE=<hex>` shows a resolved surface instead of the scanout;
-`<hex>@n` picks the n-th copy to that address in a frame, and a comma-separated list shows one entry
-per frame in turn (save consecutive frames to capture each pass; the log says which frame shows
-which). `NIER_SHOW_ALPHA=1` shows the alpha channel. `NIER_SKIP_SHADER=<hash>,...` drops draws using
+`<hex>@n` picks the n-th copy to that address in a frame, and a comma-separated list shows each entry
+for 60 frames in turn (never per frame, which flickers badly in the visible window; save frames 60
+apart to capture each pass; the log says which frame shows which). `NIER_SHOW_ALPHA=1` shows the alpha channel. `NIER_SKIP_SHADER=<hash>,...` drops draws using
 those shaders. `NIER_NO_DEPTH=1` disables depth and stencil, `NIER_D3D_DEBUG=1` routes D3D12 debug-layer messages into
 the log, `-LogDrawsAt <frame>` logs every draw's state. Crashes print a symbolized host stack from
 `nier.pdb`. Scripted path from boot to the prologue (about frame 9200):

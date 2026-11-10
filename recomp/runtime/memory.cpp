@@ -72,9 +72,50 @@ namespace
     uint32_t RoundPage(uint32_t size, uint32_t page) { return (size + page - 1) & ~(page - 1); }
 }
 
+namespace
+{
+    // On the console, physical memory is visible through several 512 MB windows: 0xA0000000 (64 KB
+    // pages) and 0xC0000000 (16 MB pages) show the same bytes. D3D writes vertex shader microcode
+    // through one and copies it into command buffers through the other, so the windows must share
+    // storage. One pagefile-backed section is mapped at both addresses inside a single 4 GB
+    // reservation, using placeholders (Windows 10 1803+). The 0xE0000000 window is offset by 4 KB
+    // on the console, which 64 KB mapping granularity can't express; it stays separate memory.
+    uint8_t* ReserveGuestSpace()
+    {
+        using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+        using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+        HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
+        auto virtualAlloc2 = kernelbase ? (VirtualAlloc2Fn)GetProcAddress(kernelbase, "VirtualAlloc2") : nullptr;
+        auto mapViewOfFile3 = kernelbase ? (MapViewOfFile3Fn)GetProcAddress(kernelbase, "MapViewOfFile3") : nullptr;
+        if (!virtualAlloc2 || !mapViewOfFile3) return nullptr;
+
+        constexpr uint64_t kWindow = 0x20000000;
+        HANDLE section = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0, DWORD(kWindow), nullptr);
+        if (!section) return nullptr;
+        uint8_t* base = (uint8_t*)virtualAlloc2(GetCurrentProcess(), nullptr, 0x100000000ull, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        if (!base) return nullptr;
+        // Split the placeholder into [0, A0000000), the A and C windows, and [E0000000, 4 GB).
+        bool ok = VirtualFree(base, 0xA0000000, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                  VirtualFree(base + 0xA0000000, kWindow, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                  VirtualFree(base + 0xC0000000, kWindow, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        ok = ok && virtualAlloc2(GetCurrentProcess(), base, 0xA0000000, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        ok = ok && mapViewOfFile3(section, GetCurrentProcess(), base + 0xA0000000, 0, kWindow, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        ok = ok && mapViewOfFile3(section, GetCurrentProcess(), base + 0xC0000000, 0, kWindow, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        ok = ok && virtualAlloc2(GetCurrentProcess(), base + 0xE0000000, kWindow, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        if (!ok) Log("[memory] mapping the physical memory windows failed (error %lu)\n", GetLastError());
+        return ok ? base : nullptr;
+    }
+}
+
 void MemoryInit()
 {
-    g_base = (uint8_t*)VirtualAlloc(nullptr, 0x100000000ull, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    g_base = ReserveGuestSpace();
+    if (g_base) Log("[memory] physical windows 0xA0000000 and 0xC0000000 share storage\n");
+    else
+    {
+        Log("[memory] falling back to unshared physical windows\n");
+        g_base = (uint8_t*)VirtualAlloc(nullptr, 0x100000000ull, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
     if (!g_base) { Log("cannot commit 4GB of guest memory (error %lu)\n", GetLastError()); ExitProcess(1); }
     DWORD old;
     VirtualProtect(g_base, 0x10000, PAGE_NOACCESS, &old);  // catch guest null pointer use

@@ -60,7 +60,16 @@ def alu(words):
         out.append("%s%d.%s = %s(%s, %s, %s)" % (prefix, vec_dest, mask(vmask), name, src(1, words), src(2, words), src(3, words)))
     if smask:
         name = SCA[sop] if sop < len(SCA) else "?%d" % sop
-        out.append("%s%d.%s = %s(%s)" % (prefix, sca_dest, mask(smask), name, src(3, words)))
+        if 42 <= sop <= 47:
+            # Constant op register: constant = source 3's register (swizzle component 3), register index
+            # = opcode bit 0 | src3_sel << 1 | swizzle bits 2-5 (swizzle component 0).
+            swz = d1 & 0xFF
+            neg = "-" if (d1 >> 24) & 1 else ""
+            temp = (sop & 1) | (((d2 >> 29) & 1) << 1) | (swz & 0x3C)
+            operands = "%sc%d.%s, %sr%d.%s" % (neg, d2 & 0xFF, "xyzw"[((swz >> 6) + 3) & 3], neg, temp, "xyzw"[swz & 3])
+        else:
+            operands = src(3, words)
+        out.append("%s%d.%s = %s(%s)" % (prefix, sca_dest, mask(smask), name, operands))
     return "  ;  ".join(out) or "alu-nop"
 
 

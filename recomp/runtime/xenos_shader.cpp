@@ -157,6 +157,7 @@ float3 CubeDirection(float3 c)
                 const bool addressed = slot == 0 ? ((w[1] >> 31) & 1) : ((w[1] >> 30) & 1);
                 if (addressed && ((w[1] >> 29) & 1)) out = Format("c[%d + a0]", pixel ? reg + 256 : reg);
                 else out = Format("c[%d]", pixel ? reg + 256 : reg);
+                if ((w[0] >> 7) & 1) out = "abs(" + out + ")";   // abs_constants
             }
             out += Swizzle((w[1] >> kSwizzleShift[index]) & 0xFF);
             return ((w[1] >> kNegate[index]) & 1) ? "(-" + out + ")" : out;
@@ -247,13 +248,20 @@ float3 CubeDirection(float3 c)
             case 49: return "cos(" + x + ")";
             case 42: case 43: case 44: case 45: case 46: case 47:
             {
-                // The second operand is a register whose index is split across other fields.
-                const uint32_t swizzle = (w[1] & 0xFF);
-                const int reg = int((op & 1) | (swizzle & 0x3C) | (((w[2] >> 29) & 1) << 5));
-                const int channel = int(((swizzle & 3) + 3) & 3);
-                const std::string other = Register(reg) + "." + "xyzw"[channel];
+                // Constant op register (Xenia's ParseAluInstruction): a constant (source 3's register,
+                // swizzle component 3) and a temporary whose index is built from the opcode's low bit,
+                // the source 3 select bit and swizzle bits 2-5 (component 0). Source 3's negate and the
+                // abs-constants flag apply to both; the constant's relative mode comes from const_1.
+                const uint32_t swizzle = w[1] & 0xFF;
+                const int constant = int(w[2] & 0xFF) + (pixel ? 256 : 0);
+                const int temp = int((op & 1) | (((w[2] >> 29) & 1) << 1) | (swizzle & 0x3C));
+                const bool relative = ((w[1] >> 30) & 1) && ((w[1] >> 29) & 1);
+                std::string a = Format(relative ? "c[%d + a0]" : "c[%d]", constant) + "." + "xyzw"[((swizzle >> 6) + 3) & 3];
+                std::string b = Register(temp) + "." + "xyzw"[swizzle & 3];
+                if ((w[0] >> 7) & 1) { a = "abs(" + a + ")"; b = "abs(" + b + ")"; }
+                if ((w[1] >> 24) & 1) { a = "(-" + a + ")"; b = "(-" + b + ")"; }
                 const char* symbol = (op == 42 || op == 43) ? " * " : (op == 44 || op == 45) ? " + " : " - ";
-                return x + symbol + other;
+                return a + symbol + b;
             }
             case 27: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " == 0.0 ? 0.0 : 1.0)";
             case 28: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " != 0.0 ? 0.0 : 1.0)";

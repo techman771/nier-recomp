@@ -276,6 +276,13 @@ namespace
         for (uint32_t w : words) hash = (hash ^ w) * 1099511628211ull;
         gShaders[stage].hash = hash;
         gShaders[stage].words = words;
+        if (!gShaderLibrary[stage].count(hash) && words.size() > 24 && !words[0] && !words[1] && !words[2])
+        {
+            // Real programs never start with zeros. This happened when D3D read microcode through a
+            // physical-memory window that didn't share storage with the one it was written through.
+            static int warned = 0;
+            if (warned++ < 4) Log("[gpu] %s shader %016llX starts with zeros; its microcode was probably read from the wrong memory\n", stage ? "pixel" : "vertex", hash);
+        }
         if (!gShaderLibrary[stage].count(hash))
         {
             CreateDirectoryA("..\\shaders", nullptr);
@@ -358,10 +365,33 @@ namespace
         return white;
     }
 
+    // CTX1 (format 60): a two-channel DXT-style block, as decoded by Xenia's texture_load_ctx1.
+    // Dword 0 holds the endpoints (r0 in bits 8-15, g0 in 0-7, r1 in 24-31, g1 in 16-23); dword 1 holds
+    // a 2-bit index per texel, row by row from the low bits: 0 = endpoint 0, 1 = endpoint 1, 2 and 3
+    // = the points a third and two thirds of the way. Output is RGBA8 as (x, y, y, y), matching
+    // Xenia's RGGG swizzle for the R8G8 host format.
+    void DecodeCtx1Block(const uint8_t* block, uint8_t* out, uint32_t rowPitch)
+    {
+        uint32_t ends, indices;
+        memcpy(&ends, block, 4);
+        memcpy(&indices, block + 4, 4);
+        const uint32_t r0 = (ends >> 8) & 0xFF, g0 = ends & 0xFF, r1 = ends >> 24, g1 = (ends >> 16) & 0xFF;
+        static const uint32_t kWeight1[4] = { 0, 3, 1, 2 };   // thirds of endpoint 1 for each index
+        for (uint32_t y = 0; y < 4; y++)
+            for (uint32_t x = 0; x < 4; x++)
+            {
+                const uint32_t w1 = kWeight1[(indices >> ((y * 4 + x) * 2)) & 3], w0 = 3 - w1;
+                const uint8_t r = uint8_t((r0 * w0 + r1 * w1) / 3), g = uint8_t((g0 * w0 + g1 * w1) / 3);
+                uint8_t* texel = out + size_t(y) * rowPitch + x * 4;
+                texel[0] = r; texel[1] = g; texel[2] = g; texel[3] = g;
+            }
+    }
+
     std::shared_ptr<DecodedTexture> DecodeTexture(const TextureDescriptor& t, TextureBinding& binding)
     {
         GuestTextureFormat format;
         uint32_t blockSize = 1, blockBytes = 4, logBytes = 2;
+        bool ctx1 = false;   // decoded on the CPU into RGBA8 rather than uploaded as blocks
         switch (t.format)
         {
         case 2: format = GuestTextureFormat::R8; blockBytes = 1; logBytes = 0; break;
@@ -369,6 +399,8 @@ namespace
         case 18: format = GuestTextureFormat::BC1; blockSize = 4; blockBytes = 8; logBytes = 3; break;
         case 19: format = GuestTextureFormat::BC2; blockSize = 4; blockBytes = 16; logBytes = 4; break;
         case 20: format = GuestTextureFormat::BC3; blockSize = 4; blockBytes = 16; logBytes = 4; break;
+        case 29: format = GuestTextureFormat::RGBA16F; blockBytes = 8; logBytes = 3; break;   // k_16_16_16_16_EXPAND
+        case 60: format = GuestTextureFormat::RGBA8; blockSize = 4; blockBytes = 8; logBytes = 3; ctx1 = true; break;   // k_CTX1
         default:
             return SubstituteTexture(t.format);
         }
@@ -397,9 +429,9 @@ namespace
         decoded->format = format;
         decoded->width = widthBlocks * blockSize;
         decoded->height = heightBlocks * blockSize;
-        decoded->rowPitch = widthBlocks * blockBytes;
+        decoded->rowPitch = ctx1 ? widthBlocks * 4 * 4 : widthBlocks * blockBytes;
         decoded->faces = faces;
-        const size_t decodedFaceBytes = size_t(decoded->rowPitch) * heightBlocks;
+        const size_t decodedFaceBytes = size_t(decoded->rowPitch) * heightBlocks * (ctx1 ? 4 : 1);
         decoded->data.resize(decodedFaceBytes * faces);
 
         // A surface with a dimension of 16 or less lives inside a shared 32x32 tile, offset along
@@ -417,11 +449,17 @@ namespace
             const uint8_t* faceSource = source + faceStride * face;
             for (uint32_t y = 0; y < heightBlocks; y++)
             {
-                uint8_t* row = decoded->data.data() + decodedFaceBytes * face + size_t(y) * decoded->rowPitch;
+                uint8_t* row = decoded->data.data() + decodedFaceBytes * face + size_t(y) * decoded->rowPitch * (ctx1 ? 4 : 1);
                 for (uint32_t x = 0; x < widthBlocks; x++)
                 {
                     const uint32_t index = t.tiled ? TiledOffset(x + packedX, y + packedY, pitchBlocks, logBytes) : y * pitchBlocks + x;
-                    CopySwapped(row + size_t(x) * blockBytes, faceSource + uint64_t(index) * blockBytes, blockBytes, t.endian);
+                    if (ctx1)
+                    {
+                        uint8_t block[8];
+                        CopySwapped(block, faceSource + uint64_t(index) * blockBytes, 8, t.endian);
+                        DecodeCtx1Block(block, row + size_t(x) * 16, decoded->rowPitch);
+                    }
+                    else CopySwapped(row + size_t(x) * blockBytes, faceSource + uint64_t(index) * blockBytes, blockBytes, t.endian);
                 }
             }
         }
@@ -464,7 +502,9 @@ namespace
         uint32_t scale;
         RendererResolve resolve;
         resolve.source = CurrentTarget(scale);
-        resolve.copyColor = (control & 7) == 0;     // depth copies (source 4) aren't supported yet
+        resolve.copyColor = (control & 7) == 0;     // color target 0; 1-3 (other targets) aren't used
+        resolve.copyDepth = (control & 7) == 4;
+        resolve.scale = scale;
         resolve.clearColor = (control >> 8) & 1;
         resolve.clearDepth = (control >> 9) & 1;
         resolve.colorClear = gRegisters[0x231E];
@@ -473,7 +513,7 @@ namespace
         static int clearsLogged = 0;
         if ((resolve.clearColor || resolve.clearDepth) && clearsLogged++ < 6)
             Log("[gpu] copy with clear: control %08X regs 231C..231F = %08X %08X %08X %08X\n", control, gRegisters[0x231C], gRegisters[0x231D], gRegisters[0x231E], gRegisters[0x231F]);
-        if (!resolve.copyColor)
+        if (!resolve.copyColor && !resolve.copyDepth)
         {
             if (resolve.clearColor || resolve.clearDepth) gFrameCommands.emplace_back(std::move(resolve));
             return;
@@ -481,7 +521,7 @@ namespace
         resolve.destBase = gRegisters[0x2319] & 0x1FFFFFFF;
         resolve.width = gRegisters[0x231A] & 0x3FFF;
         resolve.height = (gRegisters[0x231A] >> 16) & 0x3FFF;
-        resolve.swapRedBlue = (gRegisters[0x231B] >> 24) & 1;
+        resolve.swapRedBlue = resolve.copyColor && ((gRegisters[0x231B] >> 24) & 1);
 
         // The copy is issued as a rect list whose corners give the copied rectangle in screen space.
         // Reading the EDRAM side subtracts the window offset; the destination uses screen space.
@@ -512,7 +552,7 @@ namespace
         if ((offsetX || offsetY) && copiesLogged++ < 4)
             Log("[gpu] tiled copy: window offset %d,%d rect %d,%d %ux%u -> 0x%08X\n", offsetX, offsetY, resolve.destX, resolve.destY, resolve.copyWidth, resolve.copyHeight, resolve.destBase);
         gResolvedBases.insert(resolve.destBase);
-        gScanoutBase = resolve.destBase;
+        if (resolve.copyColor) gScanoutBase = resolve.destBase;
         gResolves++;
         gFrameCommands.emplace_back(std::move(resolve));
     }

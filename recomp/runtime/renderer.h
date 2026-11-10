@@ -21,7 +21,7 @@ struct GuestShader
     bool pixel = false;
 };
 
-enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8 };
+enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8, RGBA16F };
 
 struct DecodedTexture
 {
@@ -76,6 +76,8 @@ struct RendererResolve
 {
     RenderTargetKey source;
     bool copyColor = true;
+    bool copyDepth = false;                         // copies the depth buffer (`depth`) instead
+    uint32_t scale = 1;                             // samples per pixel along each axis (2 for 4x MSAA)
     uint32_t destBase = 0, width = 0, height = 0;   // destination surface size
     int sourceX = 0, sourceY = 0;                   // copied rectangle, in the render target
     int destX = 0, destY = 0;                       // where it lands in the destination
