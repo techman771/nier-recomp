@@ -53,6 +53,16 @@ float4 Fetch16(uint a, uint n, bool isSigned, bool isInt)
     }
     return v;
 }
+float PackedField(uint w, uint offset, uint bits, bool isSigned, bool isInt)
+{
+    uint u = (w >> offset) & ((1u << bits) - 1u);
+    int s = int(u << (32 - bits)) >> (32 - bits);
+    float scale = float((1u << (bits - (isSigned ? 1u : 0u))) - 1u);
+    return isSigned ? (isInt ? float(s) : max(float(s) / scale, -1.0)) : (isInt ? float(u) : float(u) / scale);
+}
+float4 Fetch2101010(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 10, s, i), PackedField(w, 10, 10, s, i), PackedField(w, 20, 10, s, i), PackedField(w, 30, 2, s, i)); }
+float4 Fetch101111(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 10, s, i), PackedField(w, 10, 11, s, i), PackedField(w, 21, 11, s, i), 1.0); }
+float4 Fetch111110(uint a, bool s, bool i) { uint w = vb.Load(a); return float4(PackedField(w, 0, 11, s, i), PackedField(w, 11, 11, s, i), PackedField(w, 22, 10, s, i), 1.0); }
 float4 Fetch16F(uint a, uint n)
 {
     float4 v = float4(0, 0, 0, 1);
@@ -62,6 +72,25 @@ float4 Fetch16F(uint a, uint n)
         v[i] = f16tof32((w >> ((i & 1) ? 0 : 16)) & 65535);
     }
     return v;
+}
+// CUBE takes the direction as source 0 swizzled .zzxy and returns (T, S, 2 * major axis, face).
+float4 CubeVector(float4 s)
+{
+    float x = s.z, y = s.w, z = s.x;
+    if (abs(z) >= abs(x) && abs(z) >= abs(y)) return float4(-y, z < 0.0 ? -x : x, 2.0 * z, z < 0.0 ? 5.0 : 4.0);
+    if (abs(y) >= abs(x)) return float4(y < 0.0 ? -z : z, x, 2.0 * y, y < 0.0 ? 3.0 : 2.0);
+    return float4(-y, x < 0.0 ? z : -z, 2.0 * x, x < 0.0 ? 1.0 : 0.0);
+}
+// Cube fetches take (S, T, face) with S and T in 1..2; this undoes CUBE back into a direction.
+float3 CubeDirection(float3 c)
+{
+    float2 st = c.xy * 2.0 - 3.0;
+    uint face = min(uint(max(c.z, 0.0)), 5u);
+    bool negative = (face & 1u) != 0;
+    float major = negative ? -1.0 : 1.0;
+    if ((face >> 1) == 0) return float3(major, -st.y, negative ? st.x : -st.x);
+    if ((face >> 1) == 1) return float3(st.x, major, negative ? -st.y : st.y);
+    return float3(negative ? -st.x : st.x, -st.y, major);
 }
 )";
 
@@ -76,6 +105,8 @@ float4 Fetch16F(uint a, uint n)
         int maxRegister = 1;
         uint32_t lastStride = 0;
         bool failed = false;
+        std::string scalarAfter;   // statement run after the scalar result exists (predicate updates, kills)
+        bool exportsDepth = false;
 
         void Fail(const std::string& reason)
         {
@@ -114,14 +145,18 @@ float4 Fetch16F(uint a, uint n)
             std::string out;
             if (isRegister)
             {
-                if (reg & 0x40) Fail("relative register addressing");
                 out = Register(reg & 0x3F);
                 if (reg & 0x80) out = "abs(" + out + ")";
             }
             else
             {
-                if ((w[1] >> 29) & 7) Fail("relative constant addressing");
-                out = Format("c[%d]", pixel ? reg + 256 : reg);
+                // The slot is this operand's position among the instruction's constant operands,
+                // taken from the select bits so it doesn't depend on the order sources are emitted.
+                int slot = 0;
+                for (int j = 1; j < index; j++) if (!((w[2] >> kSelect[j]) & 1)) slot++;
+                const bool addressed = slot == 0 ? ((w[1] >> 31) & 1) : ((w[1] >> 30) & 1);
+                if (addressed && ((w[1] >> 29) & 1)) out = Format("c[%d + a0]", pixel ? reg + 256 : reg);
+                else out = Format("c[%d]", pixel ? reg + 256 : reg);
             }
             out += Swizzle((w[1] >> kSwizzleShift[index]) & 0xFF);
             return ((w[1] >> kNegate[index]) & 1) ? "(-" + out + ")" : out;
@@ -132,6 +167,7 @@ float4 Fetch16F(uint a, uint n)
             if (!isExport) return Register(reg);
             if (pixel)
             {
+                if (reg == 61) { exportsDepth = true; return "oDepth"; }
                 if (reg > 3) { Fail(Format("pixel export %d", reg)); return "oC[0]"; }
                 return Format("oC[%d]", reg);
             }
@@ -170,6 +206,7 @@ float4 Fetch16F(uint a, uint n)
             case 15: return "dot(" + a + ", " + b + ").xxxx";
             case 16: return "dot((" + a + ").xyz, (" + b + ").xyz).xxxx";
             case 17: return "(dot((" + a + ").xy, (" + b + ").xy) + (" + c + ").x).xxxx";
+            case 18: return "CubeVector(" + a + ")";
             case 19: { const std::string v = "(" + a + ")"; return "max(max(" + v + ".x, " + v + ".y), max(" + v + ".z, " + v + ".w)).xxxx"; }
             default:
                 Fail(Format("vector opcode %d", int(op)));
@@ -201,6 +238,8 @@ float4 Fetch16F(uint a, uint n)
             case 15: case 16: return "log2(" + x + ")";
             case 17: case 18: case 19: return "(1.0 / " + x + ")";
             case 20: case 21: case 22: return "(1.0 / sqrt(" + x + "))";
+            case 23: scalarAfter = "a0 = clamp(int(floor(" + x + " + 0.5)), -256, 255);"; return "max(" + x + ", " + y + ")";
+            case 24: scalarAfter = "a0 = clamp(int(floor(" + x + ")), -256, 255);"; return "max(" + x + ", " + y + ")";
             case 25: return x + " - " + y;
             case 26: return x + " - ps";
             case 40: return "sqrt(" + x + ")";
@@ -216,6 +255,21 @@ float4 Fetch16F(uint a, uint n)
                 const char* symbol = (op == 42 || op == 43) ? " * " : (op == 44 || op == 45) ? " + " : " - ";
                 return x + symbol + other;
             }
+            case 27: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " == 0.0 ? 0.0 : 1.0)";
+            case 28: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " != 0.0 ? 0.0 : 1.0)";
+            case 29: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " > 0.0 ? 0.0 : 1.0)";
+            case 30: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " >= 0.0 ? 0.0 : 1.0)";
+            case 31: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " == 1.0 ? 0.0 : (" + x + " == 0.0 ? 1.0 : " + x + "))";
+            case 32: scalarAfter = "p0 = s_ == 0.0;"; return "(" + x + " - 1.0 <= 0.0 ? 0.0 : " + x + " - 1.0)";
+            case 33: scalarAfter = "p0 = false;"; return "3.402823466e+38";
+            case 34: scalarAfter = "p0 = s_ == 0.0;"; return x;
+            case 35: case 36: case 37: case 38: case 39:
+            {
+                if (!pixel) { Fail("kill in a vertex shader"); return "0.0"; }
+                static const char* kTests[] = { " == 0.0", " > 0.0", " >= 0.0", " != 0.0", " == 1.0" };
+                scalarAfter = "if (s_ != 0.0) discard;";
+                return "float(" + x + kTests[op - 35] + ")";
+            }
             case 50: return "ps";
             default:
                 Fail(Format("scalar opcode %d", int(op)));
@@ -230,16 +284,63 @@ float4 Fetch16F(uint a, uint n)
             const uint32_t vectorMask = (w[0] >> 16) & 0xF, scalarMask = (w[0] >> 20) & 0xF;
             const bool vectorClamp = (w[0] >> 24) & 1, scalarClamp = (w[0] >> 25) & 1;
             const uint32_t scalarOp = (w[0] >> 26) & 0x3F, vectorOp = (w[2] >> 24) & 0x1F;
-            if ((w[1] >> 28) & 1) Fail("predicated ALU instruction");
-
-            body += "    {\n";
-            body += "        float4 v_ = " + VectorExpression(vectorOp, Source(1, w), Source(2, w), Source(3, w)) + ";\n";
+            body += OpenPredicate(w[1] >> 28, w[1] >> 27);
+            if (vectorOp == 29)
+            {
+                body += "        float4 a_ = " + Source(1, w) + ";\n";
+                body += "        float4 v_ = max(a_, " + Source(2, w) + ");\n        a0 = clamp(int(floor(a_.w + 0.5)), -256, 255);\n";
+            }
+            else if (vectorOp >= 20 && vectorOp <= 23)
+            {
+                // Predicate push: true when a.w passes the test and b.w is zero; otherwise counts up a.x.
+                static const char* kTests[] = { " == 0.0", " != 0.0", " > 0.0", " >= 0.0" };
+                body += "        float4 a_ = " + Source(1, w) + "; float4 b_ = " + Source(2, w) + ";\n";
+                body += std::string("        bool c_ = a_.w") + kTests[vectorOp - 20] + " && b_.w == 0.0;\n";
+                body += "        float4 v_ = c_ ? (float4)0 : (a_.x + 1.0).xxxx;\n        p0 = c_;\n";
+            }
+            else if (vectorOp >= 24 && vectorOp <= 27)
+            {
+                if (!pixel) Fail("kill in a vertex shader");
+                static const char* kTests[] = { " == ", " > ", " >= ", " != " };
+                body += "        bool4 k_ = " + Source(1, w) + kTests[vectorOp - 24] + Source(2, w) + ";\n";
+                body += "        if (any(k_)) discard;\n        float4 v_ = float4(k_);\n";
+            }
+            else
+            {
+                body += "        float4 v_ = " + VectorExpression(vectorOp, Source(1, w), Source(2, w), Source(3, w)) + ";\n";
+            }
+            scalarAfter.clear();
             body += "        float s_ = " + ScalarExpression(scalarOp, w) + ";\n";
+            if (!scalarAfter.empty()) body += "        " + scalarAfter + "\n";
             if (vectorClamp) body += "        v_ = saturate(v_);\n";
             if (scalarClamp) body += "        s_ = saturate(s_);\n";
-            if (vectorMask) body += "        " + Destination(vectorDest, isExport) + Mask(vectorMask) + " = v_" + Mask(vectorMask) + ";\n";
-            if (scalarMask) body += "        " + Destination(scalarDest, isExport) + Mask(scalarMask) + " = s_;\n";
+            if (isExport)
+            {
+                // Exports send both results to the vector destination. Components in both masks get
+                // 1.0, and with the scalar-relative bit set, components in neither mask get 0.0 (Xenia's
+                // GetConstant0WriteMask / GetConstant1WriteMask).
+                const std::string target = Destination(vectorDest, true);
+                const uint32_t vectorOnly = vectorMask & ~scalarMask, scalarOnly = scalarMask & ~vectorMask;
+                const uint32_t ones = vectorMask & scalarMask;
+                const uint32_t zeros = ((w[0] >> 14) & 1) ? (0xF & ~(vectorMask | scalarMask)) : 0;
+                if (vectorOnly) body += "        " + target + Mask(vectorOnly) + " = v_" + Mask(vectorOnly) + ";\n";
+                if (scalarOnly) body += "        " + target + Mask(scalarOnly) + " = s_;\n";
+                if (ones) body += "        " + target + Mask(ones) + " = 1.0;\n";
+                if (zeros) body += "        " + target + Mask(zeros) + " = 0.0;\n";
+            }
+            else
+            {
+                if (vectorMask) body += "        " + Register(vectorDest) + Mask(vectorMask) + " = v_" + Mask(vectorMask) + ";\n";
+                if (scalarMask) body += "        " + Register(scalarDest) + Mask(scalarMask) + " = s_;\n";
+            }
             body += "        pv = v_; ps = s_;\n    }\n";
+        }
+
+        // Predicated instructions run only when p0 matches their condition bit.
+        static std::string OpenPredicate(uint32_t predicated, uint32_t condition)
+        {
+            if (!(predicated & 1)) return "    {\n";
+            return std::string("    if (p0 == ") + ((condition & 1) ? "true" : "false") + ") {\n";
         }
 
         void WriteFetched(int reg, uint32_t destSwizzle)
@@ -268,7 +369,7 @@ float4 Fetch16F(uint a, uint n)
             const uint32_t format = (w[1] >> 16) & 0x3F;
             uint32_t stride = w[2] & 0xFF;
             const uint32_t offset = (w[2] >> 8) & 0x7FFFFF;
-            const bool mini = (w[2] >> 30) & 1;
+            const bool mini = (w[1] >> 30) & 1;
             if (mini || stride == 0) stride = lastStride; else lastStride = stride;
             result.vertexSlots.insert(slot);
 
@@ -279,6 +380,9 @@ float4 Fetch16F(uint a, uint n)
             switch (format)
             {
             case 6: fetch = "Fetch8888(a_, " + flags + ")"; break;
+            case 7: fetch = "Fetch2101010(a_, " + flags + ")"; break;
+            case 16: fetch = "Fetch101111(a_, " + flags + ")"; break;
+            case 17: fetch = "Fetch111110(a_, " + flags + ")"; break;
             case 25: fetch = "Fetch16(a_, 2, " + flags + ")"; break;
             case 26: fetch = "Fetch16(a_, 4, " + flags + ")"; break;
             case 31: fetch = "Fetch16F(a_, 2)"; break;
@@ -292,7 +396,8 @@ float4 Fetch16F(uint a, uint n)
                 fetch = "float4(0, 0, 0, 1)";
                 break;
             }
-            body += std::string("    {\n        uint a_ = ") + address + ";\n        float4 f_ = " + fetch + ";\n";
+            body += OpenPredicate(w[1] >> 31, w[2] >> 31);
+            body += std::string("        uint a_ = ") + address + ";\n        float4 f_ = " + fetch + ";\n";
             WriteFetched(dest, destSwizzle);
             body += "    }\n";
         }
@@ -300,19 +405,30 @@ float4 Fetch16F(uint a, uint n)
         void EmitTextureFetch(const uint32_t* w)
         {
             const uint32_t opcode = w[0] & 0x1F;
+            if (opcode == 24) return;   // set texture LOD: only base levels are bound so far
             if (opcode != 1) { Fail(Format("texture opcode %d", int(opcode))); return; }
             if (!pixel) { Fail("texture fetch in a vertex shader"); return; }
             const int source = (w[0] >> 5) & 0x3F, dest = (w[0] >> 12) & 0x3F;
             const uint32_t slot = (w[0] >> 20) & 0x1F;
             if (slot >= 16) { Fail("texture slot above 15"); return; }
+            const uint32_t dimension = (w[2] >> 14) & 3;   // 1D, 2D, 3D or stacked, cube
+            if (dimension == 2) { Fail("3D texture fetch"); return; }
+            const bool cube = dimension == 3;
+            if (result.textureSlots.count(slot) && result.cubeSlots.count(slot) != (cube ? 1u : 0u)) { Fail("texture slot used as both 2D and cube"); return; }
             result.textureSlots.insert(slot);
+            if (cube) result.cubeSlots.insert(slot);
             // Fetch source swizzles are absolute channel numbers, unlike ALU sources.
             std::string coordinates = Register(source) + ".";
-            for (int i = 0; i < 2; i++) coordinates += "xyzw"[(w[0] >> (26 + i * 2)) & 3];
+            for (int i = 0; i < (cube ? 3 : 2); i++) coordinates += "xyzw"[(w[0] >> (26 + i * 2)) & 3];
             char sample[320];
-            snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u.Sample(pointSampler, %s * texScale[%u].xy) : t%u.Sample(linearSampler, %s * texScale[%u].xy))",
-                slot / 4, slot % 4, slot, coordinates.c_str(), slot, slot, coordinates.c_str(), slot);
-            body += std::string("    {\n        float4 f_ = ") + sample + ";\n";
+            if (cube)
+                snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u.Sample(pointSampler, CubeDirection(%s)) : t%u.Sample(linearSampler, CubeDirection(%s)))",
+                    slot / 4, slot % 4, slot, coordinates.c_str(), slot, coordinates.c_str());
+            else
+                snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u.Sample(pointSampler, %s * texScale[%u].xy) : t%u.Sample(linearSampler, %s * texScale[%u].xy))",
+                    slot / 4, slot % 4, slot, coordinates.c_str(), slot, slot, coordinates.c_str(), slot);
+            body += OpenPredicate(w[1] >> 31, w[2] >> 31);
+            body += std::string("        float4 f_ = ") + sample + ";\n";
             WriteFetched(dest, w[1] & 0xFFF);
             body += "    }\n";
         }
@@ -343,14 +459,21 @@ float4 Fetch16F(uint a, uint n)
             case CF_EXEC: case CF_EXEC_END:
                 EmitExec(d0 & 0xFFF, (d0 >> 12) & 7, (d0 >> 16) & 0xFFF);
                 return opcode == CF_EXEC_END;
-            case CF_COND_EXEC: case CF_COND_EXEC_END:
+            case 5: case 6:
+            {
+                body += std::string("    if (p0 == ") + (((d1 >> 10) & 1) ? "true" : "false") + ") {\n";
+                EmitExec(d0 & 0xFFF, (d0 >> 12) & 7, (d0 >> 16) & 0xFFF);
+                body += "    }\n";
+                return opcode == 6;
+            }
+            case CF_COND_EXEC: case CF_COND_EXEC_END: case 13: case 14:
             {
                 const uint32_t boolIndex = (d1 >> 2) & 0xFF;
                 const bool condition = (d1 >> 10) & 1;
                 body += "    if (BoolConstant(" + std::to_string(boolIndex) + ") == " + (condition ? "true" : "false") + ") {\n";
                 EmitExec(d0 & 0xFFF, (d0 >> 12) & 7, (d0 >> 16) & 0xFFF);
                 body += "    }\n";
-                return opcode == CF_COND_EXEC_END;
+                return opcode == CF_COND_EXEC_END || opcode == 14;
             }
             default:
                 Fail(Format("control flow opcode %d", int(opcode)));
@@ -369,22 +492,26 @@ float4 Fetch16F(uint a, uint n)
                 for (const auto& cf : pair)
                 {
                     const uint32_t opcode = cf[1] >> 12;
-                    if (opcode >= CF_EXEC && opcode <= CF_COND_EXEC_END) limit = std::min<size_t>(limit, cf[0] & 0xFFF);
+                    if ((opcode >= CF_EXEC && opcode <= 6) || opcode == 13 || opcode == 14) limit = std::min<size_t>(limit, cf[0] & 0xFFF);
                     if (ProcessControlFlow(cf[0], cf[1])) { finished = true; break; }
                 }
             }
 
             std::string hlsl = kCommon;
-            for (uint32_t slot : result.textureSlots) hlsl += Format("Texture2D<float4> t%d : register(t%d);\n", int(slot), int(slot));
-            hlsl += pixel ? "float4 main(Interpolated input) : SV_Target0\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 };\n"
+            for (uint32_t slot : result.textureSlots)
+                hlsl += std::string(result.cubeSlots.count(slot) ? "TextureCube" : "Texture2D") + Format("<float4> t%d : register(t%d);\n", int(slot), int(slot));
+            if (pixel && exportsDepth) hlsl += "struct PixelOutput { float4 color : SV_Target0; float depth : SV_Depth; };\n";
+            hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input)" + (exportsDepth ? "" : " : SV_Target0") +
+                                "\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 }; float4 oDepth = (float4)0;\n"
                           : "Interpolated main(uint vertexId : SV_VertexID)\n{\n    float4 oPos = float4(0, 0, 0, 1); float4 oPointSize = (float4)0;\n    float4 oT[16];\n    for (int i_ = 0; i_ < 16; i_++) oT[i_] = (float4)0;\n";
-            hlsl += Format("    float4 r[%d];\n    for (int i_ = 0; i_ < %d; i_++) r[i_] = (float4)0;\n    float4 pv = (float4)0; float ps = 0.0;\n", maxRegister, maxRegister);
+            hlsl += Format("    float4 r[%d];\n    for (int i_ = 0; i_ < %d; i_++) r[i_] = (float4)0;\n    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0;\n", maxRegister, maxRegister);
             if (pixel) hlsl += Format("    for (int i_ = 0; i_ < %d; i_++) r[i_] = input.t[i_];\n", std::min(maxRegister, 16));
             else hlsl += "    r[0].x = float(vertexId);\n";
             hlsl += body;
             if (pixel)
             {
-                hlsl += "    return oC[0];\n}\n";
+                hlsl += exportsDepth ? "    PixelOutput output_;\n    output_.color = oC[0];\n    output_.depth = oDepth.x;\n    return output_;\n}\n"
+                                     : "    return oC[0];\n}\n";
             }
             else
             {

@@ -196,6 +196,42 @@ one sampler address mode (clamp) exist; only base mip levels are decoded; the tr
 loops, jumps, predicates and relative addressing. It logs a reason whenever it declines a shader.
 Rect lists use a geometry shader, which MoltenVK won't have. Decoded textures are never evicted.
 
+### Gameplay rendering (stage 3, in progress)
+
+New Game now reaches the prologue (`C_TOKYO_FIELD_01`) and renders 3D: indexed draws with primitive
+restart, depth/stencil targets, depth-only passes, predicates and kills in the translator, packed vertex
+formats, the address register, pixel depth export, and cube maps (the `CUBE` instruction, cube
+fetches, six-face textures as `TextureCube`; used by reflective building materials). Shaders still
+skipped: vertex texture fetch (8) and a "vertex format 0" fetch in shaders whose control flow looks
+wrong (6).
+
+ALU exports follow Xenia's rules (`ucode.h`, `GetConstant0WriteMask` / `GetConstant1WriteMask`): both
+the vector and scalar results go to the vector destination, components in both write masks receive
+1.0, and with the scalar-relative bit set, components in neither receive 0.0. Getting this wrong left
+full-screen quads with position w = y, which clipped the top half of every post-processing pass, so
+the prologue showed nothing above the horizon. Fetch source swizzles are absolute (the disassembler
+used to print them relative).
+
+Register meanings were checked against Xenia's `register_table.inc` and `registers.h`; every bit field
+used here matches. `SQ_PS_CONST` reads 0x000FF100, so pixel constants do start at 256. Not yet
+handled: alpha test (`RB_COLORCONTROL` at 0x2202), culling, depth resolves (copy source 4; shadow
+maps and the scene depth at `072E2000` / `14D55000` are sampled as a white stand-in), and EDRAM
+addresses wrapping every 2048 tiles. Lighting looks harsh and blocky, likely from those depth
+textures.
+
+Render targets are keyed by EDRAM address and width, with height covering the rest of EDRAM, because
+the same address is reused at several sizes in one frame; replaced resolve textures are retired only
+after the frame's GPU work completes.
+
+Debugging switches: `NIER_SHOW_SURFACE=<hex>` shows a resolved surface instead of the scanout;
+`<hex>@n` picks the n-th copy to that address in a frame, and a comma-separated list shows one entry
+per frame in turn (save consecutive frames to capture each pass; the log says which frame shows
+which). `NIER_SHOW_ALPHA=1` shows the alpha channel. `NIER_SKIP_SHADER=<hash>,...` drops draws using
+those shaders. `NIER_NO_DEPTH=1` disables depth and stencil, `NIER_D3D_DEBUG=1` routes D3D12 debug-layer messages into
+the log, `-LogDrawsAt <frame>` logs every draw's state. Crashes print a symbolized host stack from
+`nier.pdb`. Scripted path from boot to the prologue (about frame 9200):
+`-AutoPress 1300:10,2300:10,3000:1000,4400:1000,5000:1000,5550:4,5650:1000,6900:1000,7700:1000,8700:4,8800:1000`.
+
 ### System services and saves (`xam.cpp`, `io.cpp`)
 
 Asynchronous requests complete immediately through the XOVERLAPPED. One profile is signed in as

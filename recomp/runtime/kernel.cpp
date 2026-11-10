@@ -46,6 +46,31 @@ GUEST_IMPORT(RtlNtStatusToDosError)
     ctx.r3.u64 = status == 0 ? 0 : status == X_STATUS_OBJECT_NAME_NOT_FOUND ? 2 : status == X_STATUS_ACCESS_DENIED ? 5 : status == X_STATUS_END_OF_FILE ? 38 : 317;
 }
 
+// TIME_FIELDS is eight 16-bit values: year, month, day, hour, minute, second, milliseconds, weekday.
+GUEST_IMPORT(RtlTimeToTimeFields)
+{
+    const uint64_t time = R64(ctx.r3.u32);
+    const uint32_t fields = ctx.r4.u32;
+    FILETIME ft{ DWORD(time), DWORD(time >> 32) };
+    SYSTEMTIME st{};
+    FileTimeToSystemTime(&ft, &st);
+    const uint16_t values[8] = { st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, st.wDayOfWeek };
+    for (int i = 0; i < 8; i++) W16(fields + i * 2, values[i]);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(RtlTimeFieldsToTime)
+{
+    const uint32_t fields = ctx.r3.u32, timeOut = ctx.r4.u32;
+    SYSTEMTIME st{};
+    st.wYear = R16(fields); st.wMonth = R16(fields + 2); st.wDay = R16(fields + 4); st.wHour = R16(fields + 6);
+    st.wMinute = R16(fields + 8); st.wSecond = R16(fields + 10); st.wMilliseconds = R16(fields + 12);
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) { ctx.r3.u64 = 0; return; }
+    W64(timeOut, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+    ctx.r3.u64 = 1;
+}
+
 GUEST_IMPORT(KeQuerySystemTime)
 {
     FILETIME ft;

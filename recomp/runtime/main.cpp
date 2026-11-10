@@ -1,6 +1,7 @@
 // Process startup, logging and crash reporting.
 #include <windows.h>
 #include <timeapi.h>
+#include <dbghelp.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -63,6 +64,39 @@ namespace
         }
     }
 
+    // Names every frame, runtime and recompiled alike, from nier.pdb.
+    void PrintHostStack(CONTEXT context)
+    {
+        HANDLE process = GetCurrentProcess();
+        Log("  host call stack (innermost first):\n");
+        for (int i = 0; i < 24 && context.Rip; i++)
+        {
+            alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 256];
+            auto* symbol = reinterpret_cast<SYMBOL_INFO*>(storage);
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = 255;
+            DWORD64 displacement = 0;
+            IMAGEHLP_LINE64 line{};
+            line.SizeOfStruct = sizeof(line);
+            DWORD lineDisplacement = 0;
+            if (SymFromAddr(process, context.Rip, &displacement, symbol))
+            {
+                if (SymGetLineFromAddr64(process, context.Rip, &lineDisplacement, &line))
+                    Log("    %s+0x%llX  %s:%lu\n", symbol->Name, displacement, line.FileName, line.LineNumber);
+                else
+                    Log("    %s+0x%llX\n", symbol->Name, displacement);
+            }
+            else Log("    %p\n", (void*)context.Rip);
+
+            DWORD64 imageBase = 0;
+            auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+            if (!entry) break;
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
+        }
+    }
+
     LONG WINAPI CrashHandler(EXCEPTION_POINTERS* info)
     {
         DWORD code = info->ExceptionRecord->ExceptionCode;
@@ -74,6 +108,7 @@ namespace
         Log("\n*** CRASH code %08lX in guest function sub_%08X\n", code, GuestFunctionFor(info->ContextRecord->Rip));
         if (isGuest) Log("  guest address 0x%08llX (%s)\n", (unsigned long long)(faultAddress - uintptr_t(g_base)), info->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
         else Log("  host address %p\n", (void*)faultAddress);
+        PrintHostStack(*info->ContextRecord);
         PrintGuestState(CurrentContext());
         fflush(stdout);
         TerminateProcess(GetCurrentProcess(), 3);
@@ -212,6 +247,8 @@ int main(int argc, char** argv)
     gTraceImports = trace != nullptr;
 
     timeBeginPeriod(1);  // the audio and vblank schedules need Sleep(1) to be close to 1ms
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
     InstallCrashHandler();
     MemoryInit();
     ThreadsInit();

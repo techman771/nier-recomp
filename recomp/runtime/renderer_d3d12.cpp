@@ -276,7 +276,16 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     uint8_t* gArenaCpu = nullptr;
     UINT64 gArenaOffset = 0;
     UINT gDrawSrvUsed = 0, gSrvStep = 0, gTargetRtvStep = 0, gTargetsCreated = 0;
-    std::unordered_map<uint32_t, TargetResource> gTargets;
+    // EDRAM addresses are reused at different sizes within one frame, so a target is keyed by
+    // address and size, and nothing is destroyed while the frame's commands may still use it.
+    std::unordered_map<uint64_t, TargetResource> gTargets;
+    std::vector<ComPtr<ID3D12Resource>> gRetired;
+
+    struct DepthResource { ComPtr<ID3D12Resource> texture; UINT dsvIndex = 0; };
+    constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    std::unordered_map<uint64_t, DepthResource> gDepths;
+    ComPtr<ID3D12DescriptorHeap> gDepthDsvHeap;
+    UINT gDepthDsvStep = 0, gDepthsCreated = 0;
     std::unordered_map<uint32_t, ResolvedResource> gResolved;
     std::unordered_map<uint64_t, ComPtr<ID3D12Resource>> gDecoded;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
@@ -332,6 +341,11 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         rtvHeap.NumDescriptors = kTargetSlots;
         if (!Check(gDevice->CreateDescriptorHeap(&rtvHeap, IID_PPV_ARGS(&gTargetRtvHeap)), "target RTV heap")) return false;
         gTargetRtvStep = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHeap{};
+        dsvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dsvHeap.NumDescriptors = kTargetSlots;
+        if (!Check(gDevice->CreateDescriptorHeap(&dsvHeap, IID_PPV_ARGS(&gDepthDsvHeap)), "depth heap")) return false;
+        gDepthDsvStep = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
         gArena = MakeBuffer(kArenaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         gArena->Map(0, nullptr, (void**)&gArenaCpu);
@@ -395,6 +409,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         uint64_t key = draw.vs->hash * 31 + draw.ps->hash;
         key = (key ^ draw.blendControl) * 1099511628211ull;
         key = (key ^ (uint64_t(draw.writeMask) << 1) ^ (draw.rectList ? 1 : 0)) * 1099511628211ull;
+        key = (key ^ draw.depthControl ^ (uint64_t(draw.stencilRefMask & 0xFFFF00) << 32) ^ (uint64_t(draw.hasColor) << 60) ^ (uint64_t(draw.depthBound) << 61)) * 1099511628211ull;
         auto found = gPipelines.find(key);
         if (found != gPipelines.end()) return found->second.Get();
 
@@ -422,8 +437,32 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
             desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
             desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-            desc.NumRenderTargets = 1;
-            desc.RTVFormats[0] = kTargetFormat;
+            desc.NumRenderTargets = draw.hasColor ? 1 : 0;
+            desc.RTVFormats[0] = draw.hasColor ? kTargetFormat : DXGI_FORMAT_UNKNOWN;
+            if (draw.depthBound)
+            {
+                // RB_DEPTHCONTROL: stencil 0, z 1, z write 2, z func 4-6, back-face stencil 7,
+                // front stencil func/fail/pass/zfail 8-19, back-face 20-31. Xenos enums are D3D12's minus one.
+                const uint32_t d = draw.depthControl;
+                auto& ds = desc.DepthStencilState;
+                desc.DSVFormat = kDepthFormat;
+                ds.DepthEnable = (d >> 1) & 1;
+                ds.DepthWriteMask = (((d >> 1) & 1) && ((d >> 2) & 1)) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+                ds.DepthFunc = D3D12_COMPARISON_FUNC(((d >> 4) & 7) + 1);
+                ds.StencilEnable = d & 1;
+                ds.StencilReadMask = UINT8(draw.stencilRefMask >> 8);
+                ds.StencilWriteMask = UINT8(draw.stencilRefMask >> 16);
+                auto face = [](uint32_t func, uint32_t fail, uint32_t pass, uint32_t depthFail) {
+                    D3D12_DEPTH_STENCILOP_DESC op;
+                    op.StencilFunc = D3D12_COMPARISON_FUNC(func + 1);
+                    op.StencilFailOp = D3D12_STENCIL_OP(fail + 1);
+                    op.StencilPassOp = D3D12_STENCIL_OP(pass + 1);
+                    op.StencilDepthFailOp = D3D12_STENCIL_OP(depthFail + 1);
+                    return op;
+                };
+                ds.FrontFace = face((d >> 8) & 7, (d >> 11) & 7, (d >> 14) & 7, (d >> 17) & 7);
+                ds.BackFace = ((d >> 7) & 1) ? face((d >> 20) & 7, (d >> 23) & 7, (d >> 26) & 7, (d >> 29) & 7) : ds.FrontFace;
+            }
             desc.SampleDesc.Count = 1;
             Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "guest pipeline");
         }
@@ -434,11 +473,12 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     TargetResource* GetTarget(const RenderTargetKey& key)
     {
         if (!key.width || !key.height) return nullptr;
-        auto found = gTargets.find(key.edramBase);
-        if (found != gTargets.end() && found->second.width == key.width && found->second.height == key.height) return &found->second;
+        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40);
+        auto found = gTargets.find(mapKey);
+        if (found != gTargets.end()) return &found->second;
 
         TargetResource created;
-        created.rtvIndex = found != gTargets.end() ? found->second.rtvIndex : gTargetsCreated++;
+        created.rtvIndex = gTargetsCreated++;
         if (created.rtvIndex >= kTargetSlots) return nullptr;
         created.width = key.width;
         created.height = key.height;
@@ -460,7 +500,47 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         rtv.ptr += SIZE_T(created.rtvIndex) * gTargetRtvStep;
         gDevice->CreateRenderTargetView(created.texture.Get(), nullptr, rtv);
         Log("[d3d12] render target at EDRAM 0x%X: %ux%u\n", key.edramBase, key.width, key.height);
-        return &(gTargets[key.edramBase] = std::move(created));
+        return &(gTargets[mapKey] = std::move(created));
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE DepthView(const DepthResource& depth)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = gDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += SIZE_T(depth.dsvIndex) * gDepthDsvStep;
+        return dsv;
+    }
+
+    // Depth targets follow the same address-and-size keying as color targets.
+    DepthResource* GetDepth(const RenderTargetKey& key)
+    {
+        if (!key.width || !key.height) return nullptr;
+        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40);
+        auto found = gDepths.find(mapKey);
+        if (found != gDepths.end()) return &found->second;
+        if (gDepthsCreated >= kTargetSlots) return nullptr;
+
+        DepthResource created;
+        created.dsvIndex = gDepthsCreated++;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = key.width;
+        desc.Height = key.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = kDepthFormat;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = kDepthFormat;
+        clear.DepthStencil.Depth = 1.0f;
+        if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&created.texture)), "depth target")) return nullptr;
+        DepthResource& stored = gDepths[mapKey] = std::move(created);
+        gDevice->CreateDepthStencilView(stored.texture.Get(), nullptr, DepthView(stored));
+        gList->ClearDepthStencilView(DepthView(stored), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+        Log("[d3d12] depth target at EDRAM 0x%X: %ux%u\n", key.edramBase, key.width, key.height);
+        return &stored;
     }
 
     void SetTargetState(TargetResource& target, D3D12_RESOURCE_STATES state)
@@ -494,28 +574,35 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = decoded.width;
         desc.Height = decoded.height;
-        desc.DepthOrArraySize = 1;
+        desc.DepthOrArraySize = UINT16(decoded.faces);
         desc.MipLevels = 1;
         desc.Format = DecodedFormat(decoded.format);
         desc.SampleDesc.Count = 1;
         ComPtr<ID3D12Resource> texture;
         if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)), "guest texture")) return nullptr;
 
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-        UINT rows = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6];
+        UINT rows[6] = {};
         UINT64 total = 0;
-        gDevice->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, nullptr, &total);
+        const UINT faces = std::min(decoded.faces, 6u);
+        gDevice->GetCopyableFootprints(&desc, 0, faces, 0, footprints, rows, nullptr, &total);
         ArenaBlock block = ArenaAlloc(total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        for (UINT row = 0; row < rows; row++)
-            memcpy(block.cpu + UINT64(row) * footprint.Footprint.RowPitch, decoded.data.data() + size_t(row) * decoded.rowPitch, decoded.rowPitch);
-        footprint.Offset = block.offset;
-        D3D12_TEXTURE_COPY_LOCATION destination{}, source{};
-        destination.pResource = texture.Get();
-        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        source.pResource = gArena.Get();
-        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        source.PlacedFootprint = footprint;
-        gList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        const size_t faceBytes = decoded.data.size() / faces;
+        for (UINT face = 0; face < faces; face++)
+        {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = footprints[face];
+            for (UINT row = 0; row < rows[face]; row++)
+                memcpy(block.cpu + footprint.Offset + UINT64(row) * footprint.Footprint.RowPitch, decoded.data.data() + faceBytes * face + size_t(row) * decoded.rowPitch, decoded.rowPitch);
+            footprint.Offset += block.offset;
+            D3D12_TEXTURE_COPY_LOCATION destination{}, source{};
+            destination.pResource = texture.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = face;
+            source.pResource = gArena.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = footprint;
+            gList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
         auto barrier = Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gList->ResourceBarrier(1, &barrier);
         gDecoded[decoded.key] = texture;
@@ -541,10 +628,21 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
                 swap = found->second.swapRedBlue;
             }
         }
+        // The view must match how the shader declares the slot; a texture of the other kind binds nothing.
+        const bool isCube = binding.valid && binding.decoded && binding.decoded->faces == 6;
+        if (resource && isCube != binding.cube) resource = nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = format;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        view.Texture2D.MipLevels = 1;
+        if (binding.cube)
+        {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            view.TextureCube.MipLevels = 1;
+        }
+        else
+        {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D.MipLevels = 1;
+        }
         // A resolve that swapped red and blue changes which channel each guest component reads.
         auto channel = [&](int i) { uint32_t c = binding.swizzle[i]; return (swap && (c == 0 || c == 2)) ? 2 - c : c; };
         view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(channel(0), channel(1), channel(2), channel(3));
@@ -554,9 +652,10 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     void ExecuteDraw(const RendererDraw& draw)
     {
         ID3D12PipelineState* pipeline = PipelineFor(draw);
-        TargetResource* target = GetTarget(draw.target);
-        if (!pipeline || !target || !draw.vertexCount) { gDrawsFailed++; return; }
-        SetTargetState(*target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        TargetResource* target = draw.hasColor ? GetTarget(draw.target) : nullptr;
+        DepthResource* depth = draw.depthBound ? GetDepth(draw.depth) : nullptr;
+        if (!pipeline || (draw.hasColor && !target) || (draw.depthBound && !depth) || !draw.vertexCount) { gDrawsFailed++; return; }
+        if (target) SetTargetState(*target, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         ArenaBlock constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
         memcpy(constants.cpu, draw.constants.data(), draw.constants.size() * 4);
@@ -591,9 +690,15 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             cpu.ptr += gSrvStep;
         }
 
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = gTargetRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(target->rtvIndex) * gTargetRtvStep;
-        gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
+        if (target)
+        {
+            rtv = gTargetRtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += SIZE_T(target->rtvIndex) * gTargetRtvStep;
+        }
+        if (depth) dsv = DepthView(*depth);
+        gList->OMSetRenderTargets(target ? 1 : 0, target ? &rtv : nullptr, FALSE, depth ? &dsv : nullptr);
+        if (depth) gList->OMSetStencilRef(draw.stencilRefMask & 0xFF);
         D3D12_VIEWPORT viewport{ draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], 0.0f, 1.0f };
         D3D12_RECT scissor{ draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3] };
         gList->RSSetViewports(1, &viewport);
@@ -620,11 +725,36 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         gDrawsExecuted++;
     }
 
+    // Clears requested alongside a copy happen after it. RB_COLOR_CLEAR is read as 0xAARRGGBB and
+    // RB_DEPTH_CLEAR as 24-bit depth over 8-bit stencil.
+    void ApplyResolveClears(const RendererResolve& resolve)
+    {
+        if (resolve.clearColor)
+        {
+            if (TargetResource* target = GetTarget(resolve.source))
+            {
+                SetTargetState(*target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                D3D12_CPU_DESCRIPTOR_HANDLE rtv = gTargetRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                rtv.ptr += SIZE_T(target->rtvIndex) * gTargetRtvStep;
+                const uint32_t c = resolve.colorClear;
+                const FLOAT color[4] = { ((c >> 16) & 255) / 255.0f, ((c >> 8) & 255) / 255.0f, (c & 255) / 255.0f, (c >> 24) / 255.0f };
+                gList->ClearRenderTargetView(rtv, color, 0, nullptr);
+            }
+        }
+        if (resolve.clearDepth)
+        {
+            if (DepthResource* depth = GetDepth(resolve.depth))
+                gList->ClearDepthStencilView(DepthView(*depth), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                    float(resolve.depthClear >> 8) / 16777215.0f, UINT8(resolve.depthClear & 0xFF), 0, nullptr);
+        }
+    }
+
     void ExecuteResolve(const RendererResolve& resolve)
     {
+        if (!resolve.copyColor) { ApplyResolveClears(resolve); return; }
         TargetResource* source = GetTarget(resolve.source);
         if (!source) return;
-        const uint32_t width = std::min(resolve.width, source->width), height = std::min(resolve.height, source->height);
+        const uint32_t width = resolve.width, height = resolve.height;
         if (!width || !height) return;
 
         ResolvedResource& destination = gResolved[resolve.destBase];
@@ -641,7 +771,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
             desc.MipLevels = 1;
             desc.Format = kTargetFormat;
             desc.SampleDesc.Count = 1;
-            destination.texture.Reset();
+            if (destination.texture) gRetired.push_back(std::move(destination.texture));
             if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination.texture)), "resolve texture")) return;
             destination.width = width;
             destination.height = height;
@@ -660,14 +790,52 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from.pResource = source->texture.Get();
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        D3D12_BOX box{ 0, 0, 0, width, height, 1 };
-        gList->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        // Clip the rectangle to both surfaces; tiles of one frame land at different destination rows.
+        int sourceX = resolve.sourceX, sourceY = resolve.sourceY, destX = resolve.destX, destY = resolve.destY;
+        int copyWidth = int(resolve.copyWidth), copyHeight = int(resolve.copyHeight);
+        if (sourceX < 0) { destX -= sourceX; copyWidth += sourceX; sourceX = 0; }
+        if (sourceY < 0) { destY -= sourceY; copyHeight += sourceY; sourceY = 0; }
+        copyWidth = std::min({ copyWidth, int(source->width) - sourceX, int(width) - destX });
+        copyHeight = std::min({ copyHeight, int(source->height) - sourceY, int(height) - destY });
+        if (copyWidth > 0 && copyHeight > 0)
+        {
+            D3D12_BOX box{ UINT(sourceX), UINT(sourceY), 0, UINT(sourceX + copyWidth), UINT(sourceY + copyHeight), 1 };
+            gList->CopyTextureRegion(&to, UINT(destX), UINT(destY), 0, &from, &box);
+        }
         auto toRead = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gList->ResourceBarrier(1, &toRead);
+        ApplyResolveClears(resolve);
+    }
+
+    // NIER_SHOW_SURFACE=<hex guest address>[@n] displays that resolved surface instead of the scanout;
+    // with @n, the n-th copy to it in each frame. A comma-separated list shows one entry per frame in
+    // turn, so consecutive saved frames capture each one (debugging).
+    constexpr uint32_t kSnapshotBase = 0xFFFFF000;
+    struct ShownSurface { uint32_t base = 0, occurrence = 0; };
+    uint64_t gExecutingFrame = 0;
+    ShownSurface Shown()
+    {
+        static const std::vector<ShownSurface> list = [] {
+            std::vector<ShownSurface> entries;
+            char value[512];
+            if (GetEnvironmentVariableA("NIER_SHOW_SURFACE", value, sizeof(value)))
+                for (char* item = strtok(value, ","); item; item = strtok(nullptr, ","))
+                {
+                    ShownSurface s;
+                    char* end = nullptr;
+                    s.base = uint32_t(strtoul(item, &end, 16));
+                    if (end && *end == '@') s.occurrence = uint32_t(strtoul(end + 1, nullptr, 10));
+                    entries.push_back(s);
+                }
+            return entries;
+        }();
+        return list.empty() ? ShownSurface{} : list[gExecutingFrame % list.size()];
     }
 
     void ExecuteGuestCommands(const RendererFrame& frame)
     {
+        uint32_t shownCopies = 0;
+        gExecutingFrame = frame.frame;
         gArenaOffset = 0;
         gDrawSrvUsed = 0;
         ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get() };
@@ -675,7 +843,18 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         for (const auto& command : frame.commands)
         {
             if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
-            else ExecuteResolve(std::get<RendererResolve>(command));
+            else
+            {
+                const RendererResolve& resolve = std::get<RendererResolve>(command);
+                if (Shown().occurrence && resolve.copyColor && resolve.destBase == Shown().base && ++shownCopies == Shown().occurrence)
+                {
+                    RendererResolve snapshot = resolve;
+                    snapshot.destBase = kSnapshotBase;
+                    snapshot.clearColor = snapshot.clearDepth = false;
+                    ExecuteResolve(snapshot);
+                }
+                ExecuteResolve(resolve);
+            }
         }
     }
 
@@ -693,7 +872,9 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = kTargetFormat;
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        // NIER_SHOW_ALPHA=1 shows the alpha channel as grey (debugging).
+        static const bool showAlpha = GetEnvironmentVariableA("NIER_SHOW_ALPHA", nullptr, 0) > 0;
+        view.Shader4ComponentMapping = showAlpha ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3, 5) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Texture2D.MipLevels = 1;
         gDevice->CreateShaderResourceView(found->second.texture.Get(), &view, cpu);
 
@@ -710,6 +891,12 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         gList->SetGraphicsRootDescriptorTable(3, gpu);
         gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         gList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    void CALLBACK DebugMessage(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR description, void*)
+    {
+        static std::atomic<int> logged{ 0 };
+        if (severity <= D3D12_MESSAGE_SEVERITY_WARNING && logged.fetch_add(1) < 40) Log("[d3d12 debug] #%d %s\n", int(id), description);
     }
 
     bool CreateDeviceObjects()
@@ -729,6 +916,15 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         adapter->GetDesc1(&adapterDesc);
         Log("[d3d12] adapter: %ls\n", adapterDesc.Description);
         if (!Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&gDevice)), "device")) return false;
+        if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
+        {
+            ComPtr<ID3D12InfoQueue1> queue;
+            DWORD cookie = 0;
+            if (SUCCEEDED(gDevice.As(&queue)) && SUCCEEDED(queue->RegisterMessageCallback(DebugMessage, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie)))
+                Log("[d3d12] debug layer messages go to this log\n");
+            else
+                Log("[d3d12] debug layer requested but its messages are unavailable (Graphics Tools may not be installed)\n");
+        }
 
         D3D12_COMMAND_QUEUE_DESC queueDesc{};
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -929,7 +1125,8 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         const FLOAT black[4] = { 0, 0, 0, 1 };
         gList->ClearRenderTargetView(rtv, black, 0, nullptr);
         gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        if (guest && guest->scanoutBase) BlitScanout(guest->scanoutBase);
+        const uint32_t shownSurface = Shown().occurrence ? kSnapshotBase : Shown().base;
+        if (guest && (shownSurface || guest->scanoutBase)) BlitScanout(shownSurface && gResolved.count(shownSurface) ? shownSurface : guest->scanoutBase);
 
         if (movie)
         {
@@ -999,7 +1196,12 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         gPresented++;
         if (movie) RecordImageTiming(planes[0]);
         WaitForGpu();
-        if (saving) WriteSavedFrame(saveLabel, saveFootprint);
+        gRetired.clear();   // the frame's GPU work is complete
+        if (saving)
+        {
+            WriteSavedFrame(saveLabel, saveFootprint);
+            if (Shown().base) Log("[d3d12] saved frame %llu (guest frame %llu) shows %08X@%u\n", saveLabel, gExecutingFrame, Shown().base, Shown().occurrence);
+        }
     }
 
     void Resize(uint32_t width, uint32_t height)

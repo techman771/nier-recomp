@@ -1,5 +1,6 @@
 # Runs nier.exe with a time limit, writing output to recomp/boot.log. Usage: run_boot.ps1 [seconds] [-Trace]
 param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound)
+if (-not $env:NIER_PLAYER_NAME) { $env:NIER_PLAYER_NAME = 'Nier' }   # skips the name window
 if ($Sound) { Remove-Item Env:NIER_MUTE -ErrorAction SilentlyContinue } else { $env:NIER_MUTE = '1' }   # test runs stay silent
 if ($LogDrawsAt -gt 0) { $env:NIER_LOG_DRAWS_AT = "$LogDrawsAt" } else { Remove-Item Env:NIER_LOG_DRAWS_AT -ErrorAction SilentlyContinue }
 if ($AutoPress) { $env:NIER_AUTO_PRESS = $AutoPress } else { Remove-Item Env:NIER_AUTO_PRESS -ErrorAction SilentlyContinue }

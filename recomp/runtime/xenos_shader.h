@@ -14,6 +14,7 @@ struct TranslatedShader
     bool pixel = false;
     std::set<uint32_t> vertexSlots;   // vertex fetch constant slots the shader reads
     std::set<uint32_t> textureSlots;
+    std::set<uint32_t> cubeSlots;     // texture slots sampled as cube maps (a subset of textureSlots)
 };
 
 TranslatedShader TranslateShader(const std::vector<uint32_t>& words, bool pixel, uint64_t hash);

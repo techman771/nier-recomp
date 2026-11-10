@@ -101,6 +101,11 @@ namespace
     void WriteRegister(uint32_t index, uint32_t value)
     {
         if (index >= REG_COUNT) return;
+        if ((index == 0x2307 || index == 0x2308) && gRegisters[index] != value)
+        {
+            static int changes = 0;   // SQ_VS_CONST / SQ_PS_CONST: where each stage's constants start
+            if (changes++ < 16) Log("[gpu] %s = %08X\n", index == 0x2307 ? "SQ_VS_CONST" : "SQ_PS_CONST", value);
+        }
         gRegisters[index] = value;
         if (index >= REG_SCRATCH_REG0 && index < REG_SCRATCH_REG0 + 8)
         {
@@ -139,6 +144,7 @@ namespace
     {
         uint32_t base, format, width, height, pitch, endian;
         bool tiled, packedMips;
+        uint32_t dimension;   // 0 1D, 1 2D or stacked, 2 3D, 3 cube
     };
 
     // Texture fetch constants are 6 dwords per slot; type 2 marks a texture.
@@ -155,6 +161,7 @@ namespace
         out.pitch = ((c[0] >> 22) & 0x1FF) << 5;
         out.tiled = (c[0] >> 31) & 1;
         out.packedMips = (c[5] >> 11) & 1;
+        out.dimension = (c[5] >> 9) & 3;
         return true;
     }
 
@@ -332,6 +339,25 @@ namespace
         else if (endian == 3) for (uint32_t i = 0; i + 4 <= bytes; i += 4) { std::swap(out[i], out[i + 2]); std::swap(out[i + 1], out[i + 3]); }
     }
 
+    std::map<uint32_t, uint64_t> gSubstitutedFormats;
+
+    // Stands in for formats not decoded yet (mostly depth textures used for shadows): opaque white,
+    // which reads as "lit" to a shadow lookup, rather than skipping the whole draw.
+    std::shared_ptr<DecodedTexture> SubstituteTexture(uint32_t format)
+    {
+        static const std::shared_ptr<DecodedTexture> white = [] {
+            auto texture = std::make_shared<DecodedTexture>();
+            texture->key = 0xFFFFFFFFFFFF0001ull;
+            texture->width = texture->height = 4;
+            texture->rowPitch = 16;
+            texture->data.assign(64, 255);
+            return texture;
+        }();
+        std::lock_guard lock(gStatsMutex);
+        gSubstitutedFormats[format]++;
+        return white;
+    }
+
     std::shared_ptr<DecodedTexture> DecodeTexture(const TextureDescriptor& t, TextureBinding& binding)
     {
         GuestTextureFormat format;
@@ -344,17 +370,20 @@ namespace
         case 19: format = GuestTextureFormat::BC2; blockSize = 4; blockBytes = 16; logBytes = 4; break;
         case 20: format = GuestTextureFormat::BC3; blockSize = 4; blockBytes = 16; logBytes = 4; break;
         default:
-            SkipDraw("texture format " + std::to_string(t.format));
-            return nullptr;
+            return SubstituteTexture(t.format);
         }
         const uint32_t widthBlocks = (t.width + blockSize - 1) / blockSize, heightBlocks = (t.height + blockSize - 1) / blockSize;
         const uint32_t pitchBlocks = std::max(t.pitch / blockSize, widthBlocks);
         const uint32_t guest = PhysicalToGuest(t.base);
         const uint32_t tiledHeight = (heightBlocks + 31) & ~31u;
-        const uint64_t bytes = uint64_t(pitchBlocks) * (t.tiled ? tiledHeight : heightBlocks) * blockBytes;
-        if (bytes == 0 || uint64_t(guest) + bytes > 0x100000000ull) return nullptr;
+        const uint64_t faceBytes = uint64_t(pitchBlocks) * (t.tiled ? tiledHeight : heightBlocks) * blockBytes;
+        // Cube faces follow each other, each padded to 32-block-aligned rows and a 4 KB boundary.
+        const uint32_t faces = t.dimension == 3 ? 6 : 1;
+        const uint64_t faceStride = faces > 1 ? ((uint64_t(((pitchBlocks + 31) & ~31u)) * tiledHeight * blockBytes + 4095) & ~4095ull) : faceBytes;
+        const uint64_t bytes = faceStride * (faces - 1) + faceBytes;
+        if (faceBytes == 0 || uint64_t(guest) + bytes > 0x100000000ull) return nullptr;
 
-        uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0);
+        uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1);
         const uint8_t* source = g_base + guest;
         for (uint64_t i = 0; i < bytes; i += 16) key = (key ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
 
@@ -369,7 +398,9 @@ namespace
         decoded->width = widthBlocks * blockSize;
         decoded->height = heightBlocks * blockSize;
         decoded->rowPitch = widthBlocks * blockBytes;
-        decoded->data.resize(size_t(decoded->rowPitch) * heightBlocks);
+        decoded->faces = faces;
+        const size_t decodedFaceBytes = size_t(decoded->rowPitch) * heightBlocks;
+        decoded->data.resize(decodedFaceBytes * faces);
 
         // A surface with a dimension of 16 or less lives inside a shared 32x32 tile, offset along
         // its short axis: textures wider than tall start 16 down, the rest start 16 across.
@@ -381,59 +412,218 @@ namespace
             else packedX = 16 / blockSize;
         }
 
-        for (uint32_t y = 0; y < heightBlocks; y++)
+        for (uint32_t face = 0; face < faces; face++)
         {
-            uint8_t* row = decoded->data.data() + size_t(y) * decoded->rowPitch;
-            for (uint32_t x = 0; x < widthBlocks; x++)
+            const uint8_t* faceSource = source + faceStride * face;
+            for (uint32_t y = 0; y < heightBlocks; y++)
             {
-                const uint32_t index = t.tiled ? TiledOffset(x + packedX, y + packedY, pitchBlocks, logBytes) : y * pitchBlocks + x;
-                CopySwapped(row + size_t(x) * blockBytes, source + uint64_t(index) * blockBytes, blockBytes, t.endian);
+                uint8_t* row = decoded->data.data() + decodedFaceBytes * face + size_t(y) * decoded->rowPitch;
+                for (uint32_t x = 0; x < widthBlocks; x++)
+                {
+                    const uint32_t index = t.tiled ? TiledOffset(x + packedX, y + packedY, pitchBlocks, logBytes) : y * pitchBlocks + x;
+                    CopySwapped(row + size_t(x) * blockBytes, faceSource + uint64_t(index) * blockBytes, blockBytes, t.endian);
+                }
             }
         }
         gDecodedTextures[key] = decoded;
         return decoded;
     }
 
+    // EDRAM records no surface height, so a surface extends over all the tiles (80x16 samples each,
+    // 2048 in total) after its base. Every draw to the same base and width then shares one surface.
+    RenderTargetKey TargetFor(uint32_t base, uint32_t widthSamples)
+    {
+        RenderTargetKey key;
+        key.edramBase = base;
+        key.width = widthSamples;
+        const uint32_t tilesPerRow = std::max(1u, widthSamples / 80);
+        const uint32_t freeTiles = base < 2048 ? 2048 - base : 1;
+        key.height = std::clamp(freeTiles / tilesPerRow * 16, 16u, 4096u);
+        return key;
+    }
+
     RenderTargetKey CurrentTarget(uint32_t& scale)
     {
         const uint32_t surface = gRegisters[0x2000], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
         scale = msaa == 2 ? 2 : 1;
-        RenderTargetKey key;
-        key.edramBase = gRegisters[0x2001] & 0xFFF;
-        key.width = pitch * scale;
-        key.height = key.width * 9 / 16;  // EDRAM doesn't record heights; menus are all 16:9
-        return key;
+        return TargetFor(gRegisters[0x2001] & 0xFFF, pitch * scale);
+    }
+
+    // PA_SC_WINDOW_OFFSET: two signed 15-bit values. Predicated tiling renders the screen in strips,
+    // shifting each strip into EDRAM with this offset.
+    void WindowOffset(int& x, int& y)
+    {
+        const uint32_t value = gRegisters[0x2080];
+        x = int32_t(value << 17) >> 17;
+        y = int32_t((value >> 16) << 17) >> 17;
     }
 
     void BuildResolve()
     {
         const uint32_t control = gRegisters[0x2318];
-        if ((control & 7) != 0) return;      // depth copies aren't needed until 3D
         uint32_t scale;
         RendererResolve resolve;
         resolve.source = CurrentTarget(scale);
+        resolve.copyColor = (control & 7) == 0;     // depth copies (source 4) aren't supported yet
+        resolve.clearColor = (control >> 8) & 1;
+        resolve.clearDepth = (control >> 9) & 1;
+        resolve.colorClear = gRegisters[0x231E];
+        resolve.depthClear = gRegisters[0x231D];
+        resolve.depth = TargetFor(gRegisters[0x2002] & 0xFFF, resolve.source.width);
+        static int clearsLogged = 0;
+        if ((resolve.clearColor || resolve.clearDepth) && clearsLogged++ < 6)
+            Log("[gpu] copy with clear: control %08X regs 231C..231F = %08X %08X %08X %08X\n", control, gRegisters[0x231C], gRegisters[0x231D], gRegisters[0x231E], gRegisters[0x231F]);
+        if (!resolve.copyColor)
+        {
+            if (resolve.clearColor || resolve.clearDepth) gFrameCommands.emplace_back(std::move(resolve));
+            return;
+        }
         resolve.destBase = gRegisters[0x2319] & 0x1FFFFFFF;
         resolve.width = gRegisters[0x231A] & 0x3FFF;
         resolve.height = (gRegisters[0x231A] >> 16) & 0x3FFF;
         resolve.swapRedBlue = (gRegisters[0x231B] >> 24) & 1;
+
+        // The copy is issued as a rect list whose corners give the copied rectangle in screen space.
+        // Reading the EDRAM side subtracts the window offset; the destination uses screen space.
+        float minX = 0, minY = 0, maxX = float(resolve.width), maxY = float(resolve.height);
+        const uint32_t fetch0 = gRegisters[REG_FETCH_CONSTANTS], fetch1 = gRegisters[REG_FETCH_CONSTANTS + 1];
+        if ((fetch0 & 3) == 3 && ((fetch1 >> 2) & 0xFFFFFF) >= 6)
+        {
+            const uint32_t vertices = PhysicalToGuest(fetch0 & ~3u);
+            minX = minY = 1e30f;
+            maxX = maxY = -1e30f;
+            for (int i = 0; i < 3; i++)
+            {
+                const uint32_t xBits = R32(vertices + i * 8), yBits = R32(vertices + i * 8 + 4);
+                const float x = reinterpret_cast<const float&>(xBits), y = reinterpret_cast<const float&>(yBits);
+                minX = std::min(minX, x); maxX = std::max(maxX, x);
+                minY = std::min(minY, y); maxY = std::max(maxY, y);
+            }
+        }
+        int offsetX, offsetY;
+        WindowOffset(offsetX, offsetY);
+        resolve.destX = std::max(0, int(minX));
+        resolve.destY = std::max(0, int(minY));
+        resolve.copyWidth = uint32_t(std::max(0, int(maxX) - resolve.destX));
+        resolve.copyHeight = uint32_t(std::max(0, int(maxY) - resolve.destY));
+        resolve.sourceX = (resolve.destX + offsetX) * int(scale);
+        resolve.sourceY = (resolve.destY + offsetY) * int(scale);
+        static int copiesLogged = 0;
+        if ((offsetX || offsetY) && copiesLogged++ < 4)
+            Log("[gpu] tiled copy: window offset %d,%d rect %d,%d %ux%u -> 0x%08X\n", offsetX, offsetY, resolve.destX, resolve.destY, resolve.copyWidth, resolve.copyHeight, resolve.destBase);
         gResolvedBases.insert(resolve.destBase);
         gScanoutBase = resolve.destBase;
         gResolves++;
         gFrameCommands.emplace_back(std::move(resolve));
     }
 
-    void BuildDraw(uint32_t initiator)
+    struct IndexSource { uint32_t base = 0, size = 0; std::vector<uint32_t> immediate; };
+    constexpr uint32_t kRestart = 0xFFFFFFFF;
+
+    // The vertex indices a draw consumes, before primitive assembly: generated for auto-indexed
+    // draws, otherwise read from the guest and byte-swapped. Restart markers become kRestart.
+    bool ReadIndices(uint32_t initiator, const IndexSource& source, std::vector<uint32_t>& out)
+    {
+        const uint32_t* r = gRegisters;
+        const uint32_t select = (initiator >> 6) & 3, count = initiator >> 16;
+        const bool is32 = (initiator >> 11) & 1;
+        const bool restartEnabled = (r[0x2205] >> 21) & 1;
+        const uint32_t restartValue = r[0x2103], offset = r[0x2102];
+        out.resize(count);
+        if (select == 2)
+        {
+            for (uint32_t i = 0; i < count; i++) out[i] = i + offset;
+            return true;
+        }
+        std::vector<uint8_t> raw;
+        if (select == 0)
+        {
+            const uint32_t bytes = count * (is32 ? 4 : 2);
+            if (!source.base || bytes > 0x4000000) return false;
+            raw.resize(bytes + 4);
+            CopySwapped(raw.data(), g_base + PhysicalToGuest(source.base), bytes, source.size >> 30);
+        }
+        else if (select == 1)
+        {
+            raw.resize(source.immediate.size() * 4 + 4);
+            memcpy(raw.data(), source.immediate.data(), source.immediate.size() * 4);
+            if (raw.size() < size_t(count) * (is32 ? 4 : 2)) return false;
+        }
+        else return false;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t value = is32 ? *(const uint32_t*)(raw.data() + i * 4) : *(const uint16_t*)(raw.data() + i * 2);
+            const uint32_t restart = restartValue & (is32 ? 0xFFFFFFFFu : 0xFFFFu);
+            out[i] = (restartEnabled && value == restart) ? kRestart : value + offset;
+        }
+        return true;
+    }
+
+    // Converts the guest primitive type to a triangle list (rect lists stay as triples for the GS).
+    bool AssemblePrimitives(uint32_t primitive, const std::vector<uint32_t>& in, RendererDraw& draw)
+    {
+        auto& out = draw.indices;
+        auto forEachSegment = [&](auto&& emit) {
+            size_t segmentStart = 0;
+            for (size_t i = 0; i <= in.size(); i++)
+            {
+                if (i == in.size() || in[i] == kRestart)
+                {
+                    if (i > segmentStart) emit(segmentStart, i);
+                    segmentStart = i + 1;
+                }
+            }
+        };
+        switch (primitive)
+        {
+        case 4: case 8:
+            for (size_t i = 0; i + 3 <= in.size(); i += 3)
+                if (in[i] != kRestart && in[i + 1] != kRestart && in[i + 2] != kRestart) out.insert(out.end(), { in[i], in[i + 1], in[i + 2] });
+            draw.rectList = primitive == 8;
+            return true;
+        case 5:
+            forEachSegment([&](size_t begin, size_t end) {
+                for (size_t i = begin + 2; i < end; i++) out.insert(out.end(), { in[begin], in[i - 1], in[i] });
+            });
+            return true;
+        case 6:
+            forEachSegment([&](size_t begin, size_t end) {
+                for (size_t i = begin + 2; i < end; i++)
+                {
+                    const bool odd = (i - begin) & 1;
+                    out.insert(out.end(), { in[odd ? i - 1 : i - 2], in[odd ? i - 2 : i - 1], in[i] });
+                }
+            });
+            return true;
+        case 13:
+            for (size_t i = 0; i + 4 <= in.size(); i += 4) out.insert(out.end(), { in[i], in[i + 1], in[i + 2], in[i], in[i + 2], in[i + 3] });
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void BuildDraw(uint32_t initiator, const IndexSource& source)
     {
         const uint32_t* r = gRegisters;
         const uint32_t mode = r[0x2208] & 7;
         if (mode == 6) { BuildResolve(); return; }
-        if (mode != 4) { SkipDraw("depth-only pass"); return; }
-        if ((r[0x2001] >> 16) & 0xF) { SkipDraw("render target format"); return; }
-        if (((initiator >> 6) & 3) != 2) { SkipDraw("indexed draw"); return; }
+        if (mode != 4 && mode != 5) { SkipDraw("EDRAM mode " + std::to_string(mode)); return; }
+        const bool hasColor = mode == 4;
+        if (hasColor && ((r[0x2001] >> 16) & 0xF)) { SkipDraw("render target format " + std::to_string((r[0x2001] >> 16) & 0xF)); return; }
 
         CachedShader* vs = ShaderFor(0), * ps = ShaderFor(1);
         if (!vs || !ps) { SkipDraw("no shader loaded"); return; }
         if (!vs->info.ok || !ps->info.ok) { SkipDraw("untranslated shader"); return; }
+        // NIER_SKIP_SHADER=<hash>[,<hash>...] drops draws using those shaders (debugging).
+        static const std::set<uint64_t> skipShaders = [] {
+            std::set<uint64_t> hashes;
+            char value[512];
+            if (GetEnvironmentVariableA("NIER_SKIP_SHADER", value, sizeof(value)))
+                for (char* item = strtok(value, ","); item; item = strtok(nullptr, ",")) hashes.insert(strtoull(item, nullptr, 16));
+            return hashes;
+        }();
+        if (!skipShaders.empty() && (skipShaders.count(vs->shader->hash) || skipShaders.count(ps->shader->hash))) return;
 
         RendererDraw draw;
         uint32_t scale;
@@ -443,17 +633,23 @@ namespace
         draw.blendControl = r[0x2201];
         draw.writeMask = r[0x2104] & 0xF;
 
-        const uint32_t primitive = initiator & 0x3F, count = initiator >> 16;
-        draw.vertexCount = count;
-        switch (primitive)
+        draw.hasColor = hasColor;
+        draw.depthControl = r[0x2200];
+        draw.stencilRefMask = r[0x210D];
+        static const bool depthDisabled = GetEnvironmentVariableA("NIER_NO_DEPTH", nullptr, 0) > 0;  // debugging
+        if ((draw.depthControl & 3) && !depthDisabled)   // stencil or depth test enabled
         {
-        case 4: break;
-        case 8: draw.rectList = true; break;
-        case 5: for (uint32_t i = 2; i < count; i++) draw.indices.insert(draw.indices.end(), { 0, i - 1, i }); break;
-        case 6: for (uint32_t i = 2; i < count; i++) draw.indices.insert(draw.indices.end(), { i - 2 + (i & 1), i - 1 - (i & 1), i }); break;
-        case 13: for (uint32_t i = 0; i + 4 <= count; i += 4) draw.indices.insert(draw.indices.end(), { i, i + 1, i + 2, i, i + 2, i + 3 }); break;
-        default: SkipDraw("primitive type " + std::to_string(primitive)); return;
+            draw.depthBound = true;
+            draw.depth = TargetFor(r[0x2002] & 0xFFF, draw.target.width);
         }
+        if (!hasColor && !draw.depthBound) { SkipDraw("depth pass with depth disabled"); return; }
+
+        const uint32_t primitive = initiator & 0x3F;
+        std::vector<uint32_t> sequence;
+        if (!ReadIndices(initiator, source, sequence)) { SkipDraw("unreadable index buffer"); return; }
+        if (!AssemblePrimitives(primitive, sequence, draw)) { SkipDraw("primitive type " + std::to_string(primitive)); return; }
+        if (draw.indices.empty()) return;
+        draw.vertexCount = uint32_t(draw.indices.size());
 
         for (uint32_t slot : vs->info.vertexSlots)
         {
@@ -472,13 +668,19 @@ namespace
 
         for (uint32_t slot : ps->info.textureSlots)
         {
+            TextureBinding& binding = draw.textures[slot];
+            binding.cube = ps->info.cubeSlots.count(slot) != 0;   // set even when unbound, so the empty view matches
             TextureDescriptor t;
             if (!ReadTextureSlot(slot, t)) continue;
             const uint32_t* c = &r[REG_FETCH_CONSTANTS + slot * 6];
-            TextureBinding& binding = draw.textures[slot];
             const uint32_t swizzle = (c[3] >> 1) & 0xFFF;
             for (int i = 0; i < 4; i++) binding.swizzle[i] = (swizzle >> (i * 3)) & 7;
             binding.point = ((c[3] >> 19) & 3) == 0;
+            if (binding.cube != (t.dimension == 3))
+            {
+                static int mismatches = 0;
+                if (mismatches++ < 8) Log("[gpu] texture slot %u: shader samples %s, fetch constant dimension %u\n", slot, binding.cube ? "a cube" : "2D", t.dimension);
+            }
             if (gResolvedBases.count(t.base)) binding.resolvedBase = t.base;
             else
             {
@@ -511,32 +713,65 @@ namespace
             draw.viewport[2] = std::fabs(xScale) * 2.0f * scale;
             draw.viewport[3] = std::fabs(yScale) * 2.0f * scale;
         }
+        int offsetX, offsetY;
+        WindowOffset(offsetX, offsetY);
+        if ((r[0x2205] >> 16) & 1)   // PA_SU_SC_MODE_CNTL: window offset applies to vertices
+        {
+            draw.viewport[0] += float(offsetX * int(scale));
+            draw.viewport[1] += float(offsetY * int(scale));
+        }
         const uint32_t topLeft = r[0x2081], bottomRight = r[0x2082];
-        draw.scissor[0] = int((topLeft & 0x3FFF) * scale);
-        draw.scissor[1] = int(((topLeft >> 16) & 0x3FFF) * scale);
-        draw.scissor[2] = int(std::min((bottomRight & 0x3FFF) * scale, draw.target.width));
-        draw.scissor[3] = int(std::min(((bottomRight >> 16) & 0x3FFF) * scale, draw.target.height));
+        const int scissorShiftX = (topLeft >> 31) ? 0 : offsetX, scissorShiftY = (topLeft >> 31) ? 0 : offsetY;
+        auto clampTo = [](int value, uint32_t limit) { return std::clamp(value, 0, int(limit)); };
+        draw.scissor[0] = clampTo((int(topLeft & 0x3FFF) + scissorShiftX) * int(scale), draw.target.width);
+        draw.scissor[1] = clampTo((int((topLeft >> 16) & 0x3FFF) + scissorShiftY) * int(scale), draw.target.height);
+        draw.scissor[2] = clampTo((int(bottomRight & 0x3FFF) + scissorShiftX) * int(scale), draw.target.width);
+        draw.scissor[3] = clampTo((int((bottomRight >> 16) & 0x3FFF) + scissorShiftY) * int(scale), draw.target.height);
 
         gSubmittedDraws++;
+        // Debugging: vertex data and state of depth-only and rect draws in the logged frame.
+        if (gFrames.load() == gLogDrawsAt)
+        {
+            static std::set<std::string> seen;
+            char state[320];
+            snprintf(state, sizeof(state), "[draw f%llu state] color %d prim %u idx %zu target %X %ux%u vp %.0f,%.0f %.0fx%.0f sc %d,%d-%d,%d win %08X mode %08X tl %08X br %08X clip %08X",
+                gFrames.load(), hasColor, primitive, draw.indices.size(), draw.target.edramBase, draw.target.width, draw.target.height,
+                draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3],
+                r[0x2080], r[0x2205], r[0x2081], r[0x2082], r[0x2204]);
+            std::string key(state);
+            key = key.substr(key.find(" target"));
+            if (seen.insert(key).second && seen.size() < 60) Log("%s\n", state);
+        }
+        if (gFrames.load() == gLogDrawsAt && (!hasColor || draw.rectList))
+        {
+            const float* v = reinterpret_cast<const float*>(draw.vertexData.data());
+            const size_t floats = std::min<size_t>(draw.vertexData.size() / 4, 24);
+            std::string values;
+            char item[32];
+            for (size_t i = 0; i < floats; i++) { snprintf(item, sizeof(item), " %.3f", v[i]); values += item; }
+            Log("[draw f%llu detail] color %d rect %d depthctl %08X zscale %08X zoff %08X target %ux%u depth base %X vp %.0f,%.0f %.0fx%.0f verts:%s\n",
+                gFrames.load(), hasColor, draw.rectList, draw.depthControl, r[0x2113], r[0x2114], draw.target.width, draw.target.height, draw.depth.edramBase,
+                draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], values.c_str());
+        }
         gFrameCommands.emplace_back(std::move(draw));
     }
 
-    void OnDraw(uint32_t initiator)
+    void OnDraw(uint32_t initiator, const IndexSource& source)
     {
         CaptureMovieSource(initiator);
-        BuildDraw(initiator);
+        BuildDraw(initiator, source);
         uint64_t frame = gFrames.load();
         if (frame != gLogDrawsAt) return;
-        if (gFrameDrawsLogged++ > 60) return;
+        if (gFrameDrawsLogged++ > 600) return;
         const uint32_t* r = gRegisters;
-        char line[768];
+        char line[2048];
         int used = snprintf(line, sizeof(line), "[draw f%llu] prim %u src %u count %u mode %u surf %08X col %08X dep %08X blend %08X cctl %08X dctl %08X vte %08X vp %08X/%08X %08X/%08X sciss %08X-%08X prog %08X vs %016llX ps %016llX vf0 %08X %08X copy %08X->%08X p%08X info %08X:",
             frame, initiator & 0x3F, (initiator >> 6) & 3, initiator >> 16, r[0x2208] & 7, r[0x2000], r[0x2001], r[0x2002], r[0x2201], r[0x2204], r[0x2200], r[0x2206],
             r[0x210F], r[0x2110], r[0x2111], r[0x2112], r[0x2081], r[0x2082], r[0x2180], gShaders[0].hash, gShaders[1].hash, r[0x4800], r[0x4801], r[0x2318], r[0x2319], r[0x231A], r[0x231B]);
         for (uint32_t slot = 0; slot < 32; slot++)
         {
             TextureDescriptor t;
-            if (ReadTextureSlot(slot, t) && used < 440)
+            if (ReadTextureSlot(slot, t) && used < 1900)
                 used += snprintf(line + used, sizeof(line) - used, " [%u fmt %u %ux%u %s base %08X p%u e%u]", slot, t.format, t.width, t.height, t.tiled ? "tiled" : "linear", t.base, t.pitch, t.endian);
         }
         Log("%s\n", line);
@@ -687,8 +922,20 @@ namespace
         case PM4_DRAW_INDX:
         case PM4_DRAW_INDX_2:
         {
-            uint32_t initiator = opcode == PM4_DRAW_INDX ? (s.Next(), s.Next()) : s.Next();
-            OnDraw(initiator);
+            uint32_t initiator;
+            IndexSource source;
+            if (opcode == PM4_DRAW_INDX)
+            {
+                s.Next();   // visibility query control
+                initiator = s.Next();
+                if (((initiator >> 6) & 3) == 0 && count >= 4) { source.base = s.Next(); source.size = s.Next(); }
+            }
+            else
+            {
+                initiator = s.Next();
+                for (uint32_t i = 1; i < count; i++) source.immediate.push_back(s.Next());
+            }
+            OnDraw(initiator, source);
             gDraws++;
             break;
         }
@@ -821,6 +1068,7 @@ void GpuDumpStats()
     Log("[gpu] %llu draws submitted, %llu resolves, %llu draws skipped\n", gSubmittedDraws.load(), gResolves.load(), gSkippedDraws.load());
     std::lock_guard lock(gStatsMutex);
     for (const auto& [reason, count] : gSkipReasons) Log("[gpu] skipped: %s x%llu\n", reason.c_str(), count);
+    for (const auto& [format, count] : gSubstitutedFormats) Log("[gpu] texture format %u substituted x%llu\n", format, count);
     for (const auto& [opcode, count] : gUnknownOpcodes) Log("[gpu] unhandled opcode 0x%02X seen %llu times\n", opcode, count);
 }
 

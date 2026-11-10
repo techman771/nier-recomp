@@ -46,6 +46,15 @@ def alu(words):
     sop, vop = (d0 >> 26) & 0x3F, (d2 >> 24) & 0x1F
     prefix = "e" if export else "r"
     out = []
+    if export:
+        # Both results go to the vector destination; components in both masks get 1.0, and with
+        # the scalar-relative bit, components in neither get 0.0.
+        ones, zeros = vmask & smask, (0xF & ~(vmask | smask)) if (d0 >> 14) & 1 else 0
+        vmask, smask, sca_dest = vmask & ~smask, smask & ~vmask, vec_dest
+        if ones:
+            out.append("%s%d.%s = 1.0" % (prefix, vec_dest, mask(ones)))
+        if zeros:
+            out.append("%s%d.%s = 0.0" % (prefix, vec_dest, mask(zeros)))
     if vmask or not smask:
         name = VEC[vop] if vop < len(VEC) else "?%d" % vop
         out.append("%s%d.%s = %s(%s, %s, %s)" % (prefix, vec_dest, mask(vmask), name, src(1, words), src(2, words), src(3, words)))
@@ -67,7 +76,7 @@ def fetch(words):
         return "r%d.%s = vfetch(r%d.%s, slot %d) fmt %d stride %d offset %d signed %d norm %d" % (
             dst_reg, dst_swiz, src_reg, "xyzw"[(d0 >> 30) & 3], const * 3 + sel, fmt, d2 & 0xFF, (d2 >> 8) & 0x7FFFFF, (d1 >> 12) & 1, (d1 >> 13) & 1)
     const = (d0 >> 20) & 0x1F
-    src_swiz = "".join("xyzw"[(((d0 >> (26 + i * 2)) & 3) + i) & 3] for i in range(3))
+    src_swiz = "".join("xyzw"[(d0 >> (26 + i * 2)) & 3] for i in range(3))   # absolute, unlike ALU swizzles
     return "r%d.%s = tfetch%d(r%d.%s, t%d)" % (dst_reg, dst_swiz, opcode, src_reg, src_swiz, const)
 
 

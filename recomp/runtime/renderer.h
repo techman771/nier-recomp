@@ -27,6 +27,7 @@ struct DecodedTexture
 {
     uint64_t key = 0;
     uint32_t width = 0, height = 0, rowPitch = 0;
+    uint32_t faces = 1;                         // 6 for a cube map, faces stored one after another
     GuestTextureFormat format = GuestTextureFormat::RGBA8;
     std::vector<uint8_t> data;
 };
@@ -38,6 +39,7 @@ struct TextureBinding
     uint32_t resolvedBase = 0;
     uint8_t swizzle[4] = { 0, 1, 2, 3 };       // 0-3 channel, 4 zero, 5 one
     bool point = false;
+    bool cube = false;                         // the shader samples this slot as a cube map
     float scale[2] = { 1.0f, 1.0f };
 };
 
@@ -50,6 +52,10 @@ struct RendererDraw
 {
     std::shared_ptr<GuestShader> vs, ps;
     RenderTargetKey target;
+    bool hasColor = true;
+    bool depthBound = false;                   // a depth/stencil target is attached
+    RenderTargetKey depth;
+    uint32_t depthControl = 0, stencilRefMask = 0;
     uint32_t blendControl = 0, writeMask = 0xF;
     bool rectList = false;
     uint32_t vertexCount = 0;
@@ -65,11 +71,19 @@ struct RendererDraw
     int scissor[4] = { 0, 0, 1, 1 };
 };
 
+// A copy from EDRAM to memory, optionally followed by clearing the color and depth targets.
 struct RendererResolve
 {
     RenderTargetKey source;
-    uint32_t destBase = 0, width = 0, height = 0;
+    bool copyColor = true;
+    uint32_t destBase = 0, width = 0, height = 0;   // destination surface size
+    int sourceX = 0, sourceY = 0;                   // copied rectangle, in the render target
+    int destX = 0, destY = 0;                       // where it lands in the destination
+    uint32_t copyWidth = 0, copyHeight = 0;
     bool swapRedBlue = false;
+    bool clearColor = false, clearDepth = false;
+    uint32_t colorClear = 0, depthClear = 0;
+    RenderTargetKey depth;
 };
 
 using RendererCommand = std::variant<RendererDraw, RendererResolve>;
