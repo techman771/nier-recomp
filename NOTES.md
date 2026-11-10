@@ -217,17 +217,22 @@ Textures are made readable for every shader stage (`kShaderRead` in `renderer_d3
 pixel shaders: the bone texture is read by vertex shaders, and with the pixel-shader state alone a
 vertex shader may read it before the upload into it has finished.
 
-Open: in the Grimoire scene (frame ~11650 on the scripted path), Nier's skeleton has 94 bones but
-bones 92 and 93 (probably the attachments, e.g. the pipe he holds) arrive in the bone texture in
-local space, and bones 94+ are unwritten. Vertices weighted to bone 93 land near the world origin,
-which draws a black beam from Nier's hand across the screen, and the pipe's lower half is
-detached. CPU skinning of the dumped data reproduces it, so the bone data itself is wrong, not the
-shader. The chain found so far: the bone texture (`07693000`) is filled by `sub_825AC5C0` (transposes
-4x4 matrices) from a source array (`415BBDB0` at frame 11641), which is filled by `memcpy`
-(`sub_825D3010`) of 0x1730 bytes (92 bones and three rows) called from `sub_8258DDE8`. Next: find
-why bones 92-93 are left out (copy length, or a later step that should finish them), i.e. a likely
-CPU recompilation bug in that path. The store floor also still lacks the stone-tile pattern seen in
-the reference video.
+Fixed: `memset` (`sub_825D3D90`) was cut short by XenonRecomp. Its byte tail is
+`stb; bdzlr; stb r4,1(r6); bdzlr; stb r4,2(r6); blr`, and the recompiler ended the function at the
+first `bdzlr`, splitting the rest into unreachable fragments, so sets leaving two or three tail bytes
+stopped one or two bytes short. Nier's skeleton update (`sub_8218BF70`) fills a 95-byte "needs
+parent" mask with `memset(mask, 1, 95)`; the last two entries stayed unset, so bones 92 and 93 skipped
+the hierarchy pass (`sub_821898F0` / `sub_82189840`: world = parent x local, parents resolved
+recursively) and stayed in local space. Vertices weighted to them landed near the world origin: a
+black beam from Nier's chest across the screen in the Grimoire scene, and a split pipe. The true
+bounds are now in `recomp/config/nier_functions.manual.toml` (merged by `make_config.ps1`), and
+`tools/find_fallthrough.py recomp/out` lists recompiled functions whose last instruction can fall
+through (now only calls to functions that never return, and one data word).
+How it was found: dumped draw data (`NIER_DUMP_DRAW`) skinned on the CPU reproduced the beam, so
+the bone matrices were wrong; write watches (`NIER_WATCH_WRITE`) and a memory scan (`NIER_SCAN`)
+followed the matrices back through the copies to the hierarchy pass, and a hardware breakpoint
+(`NIER_BREAK`) on `sub_821898F0` showed the mask's last two bytes unset.
+The store floor still lacks the stone-tile pattern seen in the reference video.
 
 Mipmaps follow Xenia's `GetGuestTextureLayout`: levels 1 and up start at the fetch constant's mip
 address (dword 5); each level's pitch and height come from the power-of-two base size shifted down
@@ -337,7 +342,15 @@ More debugging switches:
   shader to `recomp/captures/` (byte-swapped vertex data, indices, constants, the slot 16 texture).
 - `NIER_WATCH_WRITE=<guest address>,<bytes>` (and `NIER_WATCH_FROM=<frame>`): write-protects that
   page (in both physical windows for 0xA/0xC addresses) and logs the guest call chain and registers
-  of each writer.
+  of each writer (registers are as last stored to the context, so they can be stale).
+- `NIER_BREAK=<guest function>,<frame>` (`NIER_BREAK_MIN_R3`, `NIER_BREAK_DUMP=r5:192,r6:96`): a
+  hardware breakpoint on the function's recompiled code logs the guest registers (exact, at entry)
+  and memory at given registers. Overriding a recompiled function by defining `sub_X` in the runtime
+  does not work for callers in the same generated file (they call `__imp__sub_X` directly).
+- `NIER_SCAN=<f1>,<f2>,<f3>[;...]` with `NIER_PROFILE=...,exit`: logs guest addresses holding those
+  big-endian floats (within 0.01); `NIER_PROFILE` exits also dump every guest thread's stack.
+- `NIER_FIXED_TIME=1`: the kernel time stamp bundle and the game's QueryPerformanceCounter advance
+  1/60 s per submitted frame (experiment; did not affect the skeleton problem).
 
 `NIER_PS_DEBUG=<hash>=<HLSL float4 expression>[;...]` replaces a pixel shader's colour with any
 expression over its registers (`r[n]`), inputs and textures; splitting by `input.position.x` shows

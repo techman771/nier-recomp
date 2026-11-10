@@ -1,0 +1,8 @@
+# Hand-checked function bounds, merged into the generated `functions` list by tools/make_config.ps1.
+# Use for functions XenonRecomp ends too early (tools/find_fallthrough.py lists functions whose last
+# recompiled instruction can fall through).
+
+# memset: its byte tail is `stb; bdzlr; stb r4,1(r6); bdzlr; stb r4,2(r6); blr`. XenonRecomp ended the
+# function at the first bdzlr, so sets whose length left 2 or 3 tail bytes stopped short (a 95-byte
+# bone mask came out 93 bytes long, leaving two of Nier's bones out of the skeleton hierarchy).
+    { address = 0x825D3D90, size = 0xA0 },

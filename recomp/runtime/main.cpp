@@ -233,7 +233,7 @@ namespace
                 DWORD64 establisher = 0;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
             }
-            if (gWatchSeen[chain]++ < 3)
+            if (gWatchSeen[chain + " @" + std::to_string((offset - start) / 64)]++ < 3)   // per writer and 64-byte block
             {
                 Log("[watch] write to %08X (+%u) by%s (frame %llu)\n", guest, offset - start, chain.c_str(), GpuFrameCount());
                 if (PPCContext* ctx = CurrentContext())
@@ -339,6 +339,104 @@ namespace
     }
 }
 
+void DumpGuestThreads() { DumpAllThreads(); }
+
+// NIER_BREAK=<guest function>,<from frame> (debugging): from that frame on, a hardware breakpoint on
+// the function's recompiled code in every guest thread logs the guest registers of its first few
+// calls. NIER_BREAK_DUMP=r5:192,r6:96 also dumps memory at those registers.
+namespace
+{
+    uintptr_t gBreakHost = 0;
+    uint32_t gBreakGuest = 0;
+    std::atomic<int> gBreakHits{ 0 };
+
+    LONG WINAPI BreakHandler(EXCEPTION_POINTERS* info)
+    {
+        if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !gBreakHost || info->ContextRecord->Rip != gBreakHost)
+            return EXCEPTION_CONTINUE_SEARCH;
+        info->ContextRecord->EFlags |= 0x10000;   // resume flag: run the instruction without re-breaking
+        static const uint32_t minR3 = [] { char v[16]; return GetEnvironmentVariableA("NIER_BREAK_MIN_R3", v, sizeof(v)) ? uint32_t(strtoul(v, nullptr, 0)) : 0u; }();
+        if (reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx)->r3.u32 < minR3) return EXCEPTION_CONTINUE_EXECUTION;   // NIER_BREAK_MIN_R3: only calls with r3 >= that
+        if (gBreakHits++ >= 3) return EXCEPTION_CONTINUE_EXECUTION;
+        const PPCContext* ctx = reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx);
+        Log("[break] sub_%08X frame %llu: r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X lr=%08llX\n", gBreakGuest, GpuFrameCount(),
+            ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->lr);
+        char spec[128];
+        if (GetEnvironmentVariableA("NIER_BREAK_DUMP", spec, sizeof(spec)))
+            for (char* item = strtok(spec, ","); item; item = strtok(nullptr, ","))
+            {
+                const int reg = atoi(item + 1);
+                const char* colon = strchr(item, ':');
+                const uint32_t bytes = colon ? strtoul(colon + 1, nullptr, 0) : 64;
+                // PPCContext doesn't store r0-r31 in order (r3 comes first), so look them up by name.
+                const PPCRegister* registers[] = { &ctx->r3, &ctx->r4, &ctx->r5, &ctx->r6, &ctx->r7, &ctx->r8, &ctx->r9, &ctx->r10, &ctx->r11, &ctx->r31 };
+                const int numbers[] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 31 };
+                uint32_t address = 0;
+                for (int k = 0; k < 10; k++) if (numbers[k] == reg) address = registers[k]->u32;
+                MEMORY_BASIC_INFORMATION memory{};
+                if (!address || !VirtualQuery(g_base + address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT)
+                {
+                    Log("[break]   r%d=%08X not readable\n", reg, address);
+                    continue;
+                }
+                std::string line;
+                for (uint32_t i = 0; i < bytes; i++)
+                {
+                    char text[4];
+                    snprintf(text, sizeof(text), "%02X", R8(address + i));
+                    line += text;
+                    if (i % 32 == 31 || i + 1 == bytes) { Log("[break]   r%d+%03X %s\n", reg, i & ~31u, line.c_str()); line.clear(); }
+                    else if (i % 4 == 3) line += ' ';
+                }
+            }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void ArmBreakpoint()
+    {
+        std::vector<ThreadRecord> copy;
+        {
+            std::lock_guard lock(gThreadsMutex);
+            copy = gThreads;
+        }
+        for (const ThreadRecord& record : copy)
+        {
+            if (SuspendThread(record.thread) == DWORD(-1)) continue;
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(record.thread, &context))
+            {
+                context.Dr0 = gBreakHost;
+                context.Dr7 = (context.Dr7 & ~0xF0003ull) | 1;   // local enable, execute, 1 byte
+                SetThreadContext(record.thread, &context);
+            }
+            ResumeThread(record.thread);
+        }
+        Log("[break] armed on sub_%08X (host %p) in %zu threads\n", gBreakGuest, (void*)gBreakHost, copy.size());
+    }
+}
+
+void BreakInit()
+{
+    char value[64];
+    if (!GetEnvironmentVariableA("NIER_BREAK", value, sizeof(value))) return;
+    gBreakGuest = strtoul(value, nullptr, 16);
+    const char* comma = strchr(value, ',');
+    const uint64_t frame = comma ? strtoull(comma + 1, nullptr, 10) : 0;
+    for (auto* m = PPCFuncMappings; m->host; ++m)
+        if (m->guest == gBreakGuest) gBreakHost = reinterpret_cast<uintptr_t>(m->host);
+    if (!gBreakHost) { Log("[break] no function at %08X\n", gBreakGuest); return; }
+    // The mapping may point at a jump thunk; follow a leading jmp rel32.
+    if (*reinterpret_cast<const uint8_t*>(gBreakHost) == 0xE9)
+        gBreakHost += 5 + *reinterpret_cast<const int32_t*>(gBreakHost + 1);
+    AddVectoredExceptionHandler(1, BreakHandler);
+    std::thread([frame] {
+        while (GpuFrameCount() < frame) Sleep(20);
+        ArmBreakpoint();
+    }).detach();
+}
+
+
 void RegisterGuestThread(PPCContext* ctx)
 {
     HANDLE thread;
@@ -366,6 +464,7 @@ int main(int argc, char** argv)
     uint32_t entry = LoadGame(gameDir);
     ProfilerInit();
     WatchInit();
+    BreakInit();
 
     std::thread([] {
         while (true)

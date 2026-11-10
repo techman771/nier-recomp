@@ -1,5 +1,7 @@
 // Small kernel and runtime-library imports.
 #include <windows.h>
+#include <intrin.h>
+#include <atomic>
 #include <cstring>
 #include "guest.h"
 
@@ -80,7 +82,7 @@ GUEST_IMPORT(KeQuerySystemTime)
 }
 
 // The recompiler implements mftb with the host TSC, so the guest must see the TSC's rate.
-GUEST_IMPORT(KeQueryPerformanceFrequency)
+static uint64_t TscRate()
 {
     static const uint64_t rate = [] {
         LARGE_INTEGER frequency, begin, end;
@@ -91,7 +93,56 @@ GUEST_IMPORT(KeQueryPerformanceFrequency)
         uint64_t tscEnd = __rdtsc();
         return (tscEnd - tscBegin) * frequency.QuadPart / (end.QuadPart - begin.QuadPart);
     }();
-    ctx.r3.u64 = rate;
+    return rate;
+}
+
+GUEST_IMPORT(KeQueryPerformanceFrequency) { ctx.r3.u64 = TscRate(); }
+
+// NIER_FIXED_TIME=1 (experiment): the game's QueryPerformanceCounter (sub_825611A0, which reads
+// mftb) advances 1/60 s per frame the game submits, plus the real time since that frame, never
+// going backwards. A game running below real time then measures 60 fps frame steps.
+namespace
+{
+    std::atomic<uint64_t> gGuestSwaps{ 0 }, gTscAtSwap{ 0 }, gFixedLast{ 0 };
+}
+
+void NoteGuestSwap()
+{
+    gTscAtSwap = __rdtsc();
+    gGuestSwaps++;
+}
+
+// Fixed-step elapsed time for the kernel time stamp bundle: 1/60 s per submitted frame plus the
+// real time since that frame, never going backwards.
+uint64_t FixedElapsed100ns()
+{
+    static std::atomic<uint64_t> last{ 0 };
+    const uint64_t swapTsc = gTscAtSwap.load(), now = __rdtsc();
+    const uint64_t since = (swapTsc && now > swapTsc) ? (now - swapTsc) * 10000000ull / TscRate() : 0;
+    uint64_t value = gGuestSwaps.load() * 166667ull + since;
+    uint64_t previous = last.load();
+    while (value > previous && !last.compare_exchange_weak(previous, value)) {}
+    return value > previous ? value : previous;
+}
+
+extern "C" PPC_FUNC(__imp__sub_825611A0);
+extern "C" PPC_FUNC(sub_825611A0)
+{
+    static const bool fixed = GetEnvironmentVariableA("NIER_FIXED_TIME", nullptr, 0) > 0;
+    if (!fixed)
+    {
+        __imp__sub_825611A0(ctx, base);
+        return;
+    }
+    static const uint64_t start = [] { Log("[time] fixed 60 fps time steps for QueryPerformanceCounter\n"); return __rdtsc(); }();
+    const uint64_t swapTsc = gTscAtSwap.load(), now = __rdtsc();
+    const uint64_t since = (swapTsc && now > swapTsc) ? now - swapTsc : 0;
+    uint64_t value = start + gGuestSwaps.load() * (TscRate() / 60) + since;
+    uint64_t last = gFixedLast.load();
+    while (value > last && !gFixedLast.compare_exchange_weak(last, value)) {}
+    if (value < last) value = last;
+    W64(ctx.r3.u32, value);
+    ctx.r3.u64 = 1;
 }
 
 GUEST_IMPORT(DbgPrint)

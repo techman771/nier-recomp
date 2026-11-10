@@ -7,6 +7,7 @@
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -248,8 +249,42 @@ namespace
         const double elapsed = double(now.QuadPart - begin.QuadPart) / frequency.QuadPart;
         Report(samples, elapsed, GpuFrameCount() - startFrame);
         for (auto& [id, handle] : handles) CloseHandle(handle);
+        // NIER_SCAN=<f1>,<f2>,<f3>: logs guest addresses holding those three big-endian floats in a row
+        // (within 0.01), e.g. to find every copy of a matrix (debugging).
+        char scan[128];
+        char* cursor = GetEnvironmentVariableA("NIER_SCAN", scan, sizeof(scan)) ? scan : nullptr;
+        while (cursor && *cursor)   // several searches separated by ';'
+        {
+            float wanted[3] = {};
+            for (float& value : wanted) { value = strtof(cursor, &cursor); if (*cursor == ',') cursor++; }
+            if (*cursor == ';') cursor++;
+            int found = 0;
+            MEMORY_BASIC_INFORMATION info{};
+            for (uint64_t address = 0; address < 0x100000000ull && found < 40;)
+            {
+                if (!VirtualQuery(g_base + address, &info, sizeof(info)) || !info.RegionSize) break;
+                const uint64_t start = uint64_t(static_cast<uint8_t*>(info.BaseAddress) - g_base);
+                address = start + info.RegionSize;
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
+                if (info.State != MEM_COMMIT || !(info.Protect & readable) || (info.Protect & PAGE_GUARD)) continue;
+                for (uint64_t at = start; at + 12 <= start + info.RegionSize && at + 12 <= 0x100000000ull && found < 40; at += 4)
+                {
+                    bool match = true;
+                    for (int i = 0; i < 3 && match; i++)
+                    {
+                        const uint32_t bits = R32(uint32_t(at + i * 4));
+                        float value;
+                        memcpy(&value, &bits, 4);
+                        match = fabsf(value - wanted[i]) < 0.01f;
+                    }
+                    if (match) { Log("[scan] %08llX\n", (unsigned long long)at); found++; }
+                }
+            }
+            Log("[scan] %d matches for %f %f %f\n", found, wanted[0], wanted[1], wanted[2]);
+        }
         if (exitAfter)
         {
+            DumpGuestThreads();
             fflush(stdout);
             TerminateProcess(GetCurrentProcess(), 0);
         }

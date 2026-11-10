@@ -66,9 +66,13 @@ void UpdateTimeBundle()
     GetSystemTimeAsFileTime(&ft);
     uint64_t system = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     static const uint64_t start = system;
-    W64(gTimeBundle, system - start);
-    W64(gTimeBundle + 8, system);
-    W32(gTimeBundle + 0x10, uint32_t((system - start) / 10000));
+    uint64_t elapsed = system - start;   // 100 ns units
+    // NIER_FIXED_TIME=1 (experiment): elapsed time advances 1/60 s per frame the game submits.
+    static const bool fixed = GetEnvironmentVariableA("NIER_FIXED_TIME", nullptr, 0) > 0;
+    if (fixed) elapsed = FixedElapsed100ns();
+    W64(gTimeBundle, elapsed);
+    W64(gTimeBundle + 8, start + elapsed);
+    W32(gTimeBundle + 0x10, uint32_t(elapsed / 10000));
 }
 
 uint32_t LoadGame(const std::string& gameDir)
