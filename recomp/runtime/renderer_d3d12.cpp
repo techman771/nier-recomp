@@ -208,7 +208,8 @@ float4 PSMain(Interpolated input) : SV_Target
 
     // ---- Guest draw execution ----
     constexpr UINT64 kArenaBytes = 256ull * 1024 * 1024;
-    constexpr UINT kDrawDescriptors = 65536, kTargetSlots = 256;
+    constexpr UINT kDrawDescriptors = 262144, kTargetSlots = 256;
+    constexpr UINT kTextureSlots = 32;   // descriptors per draw: one per fetch constant
     constexpr DXGI_FORMAT kTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     const char kRectGeometry[] = R"(
@@ -231,7 +232,7 @@ void main(triangle Interpolated v[3], inout TriangleStream<Interpolated> stream)
 )";
 
     const char kBlitShader[] = R"(
-Texture2D<float4> source : register(t0);
+Texture2D<float4> source : register(t0, space1);
 SamplerState linearClamp : register(s0);
 struct Interpolated { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 Interpolated VSMain(uint id : SV_VertexID)
@@ -263,9 +264,10 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         float ndcScale[2], ndcOffset[2];
         uint32_t bypassViewport, padding[3];
         uint32_t vertexBase[96];
-        uint32_t samplerPoint[16];
-        float texScale[16][4];
+        uint32_t samplerPoint[32];
+        float texScale[32][4];
         uint32_t boolConstants[8];
+        uint32_t texSign[32];
     };
     struct ArenaBlock { uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu; UINT64 offset; };
 
@@ -289,7 +291,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
 
     // Depth resolves: draw a triangle over the copied rectangle that loads the depth buffer.
     const char kDepthCopyShader[] = R"(
-Texture2D<float> depthSource : register(t0);
+Texture2D<float> depthSource : register(t0, space1);
 cbuffer Copy : register(b0) { int2 destOrigin; int2 sourceOrigin; int scale; int3 padding; };
 float4 VSMain(uint id : SV_VertexID) : SV_Position
 {
@@ -308,7 +310,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ComPtr<ID3D12DescriptorHeap> gDepthDsvHeap;
     UINT gDepthDsvStep = 0, gDepthsCreated = 0;
     std::unordered_map<uint32_t, ResolvedResource> gResolved;
-    std::unordered_map<uint64_t, ComPtr<ID3D12Resource>> gDecoded;
+    struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
+    std::unordered_map<uint64_t, DecodedResource> gDecoded;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> gPipelines;
     std::atomic<uint64_t> gDrawsExecuted{ 0 }, gDrawsFailed{ 0 };
@@ -325,7 +328,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
     {
         D3D12_DESCRIPTOR_RANGE range{};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 16;
+        range.NumDescriptors = kTextureSlots;
+        range.RegisterSpace = 1;   // space 0 t16 is the vertex buffer
         D3D12_ROOT_PARAMETER parameters[4]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -600,17 +604,16 @@ float PSMain(float4 position : SV_Position) : SV_Target
         case GuestTextureFormat::BC3: return DXGI_FORMAT_BC3_UNORM;
         case GuestTextureFormat::R8: return DXGI_FORMAT_R8_UNORM;
         case GuestTextureFormat::RGBA16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case GuestTextureFormat::RG16F: return DXGI_FORMAT_R16G16_FLOAT;
+        case GuestTextureFormat::R32F: return DXGI_FORMAT_R32_FLOAT;
+        case GuestTextureFormat::RG32F: return DXGI_FORMAT_R32G32_FLOAT;
+        case GuestTextureFormat::RGBA32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         default: return DXGI_FORMAT_R8G8B8A8_UNORM;
         }
     }
 
     ID3D12Resource* GetDecoded(const DecodedTexture& decoded)
     {
-        auto found = gDecoded.find(decoded.key);
-        if (found != gDecoded.end()) return found->second.Get();
-
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = decoded.width;
@@ -619,8 +622,29 @@ float PSMain(float4 position : SV_Position) : SV_Target
         desc.MipLevels = 1;
         desc.Format = DecodedFormat(decoded.format);
         desc.SampleDesc.Count = 1;
+
+        // One host texture per guest texture; new contents are uploaded into it, in command order,
+        // so earlier draws in the frame still see the old contents.
         ComPtr<ID3D12Resource> texture;
-        if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)), "guest texture")) return nullptr;
+        auto found = gDecoded.find(decoded.key);
+        if (found != gDecoded.end())
+        {
+            if (found->second.contentHash == decoded.contentHash) return found->second.texture.Get();
+            const D3D12_RESOURCE_DESC existing = found->second.texture->GetDesc();
+            if (existing.Width == desc.Width && existing.Height == desc.Height && existing.DepthOrArraySize == desc.DepthOrArraySize && existing.Format == desc.Format)
+            {
+                texture = found->second.texture;
+                auto toCopy = Transition(texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                gList->ResourceBarrier(1, &toCopy);
+            }
+            else gRetired.push_back(std::move(found->second.texture));
+        }
+        if (!texture)
+        {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)), "guest texture")) return nullptr;
+        }
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6];
         UINT rows[6] = {};
@@ -646,7 +670,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
         auto barrier = Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gList->ResourceBarrier(1, &barrier);
-        gDecoded[decoded.key] = texture;
+        gDecoded[decoded.key] = { texture, decoded.contentHash };
         return texture.Get();
     }
 
@@ -722,18 +746,19 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (!draw.vertexData.empty()) memcpy(vertices.cpu, draw.vertexData.data(), draw.vertexData.size());
 
         const UINT firstDescriptor = gDrawSrvUsed;
-        gDrawSrvUsed += 16;
-        if (gDrawSrvUsed > kDrawDescriptors) { gDrawSrvUsed = 16; gDrawsFailed++; return; }
+        gDrawSrvUsed += kTextureSlots;
+        if (gDrawSrvUsed > kDrawDescriptors) { gDrawSrvUsed = kTextureSlots; gDrawsFailed++; return; }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(firstDescriptor) * gSrvStep;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
         gpu.ptr += UINT64(firstDescriptor) * gSrvStep;
-        for (int i = 0; i < 16; i++)
+        for (UINT i = 0; i < kTextureSlots; i++)
         {
             const TextureBinding& binding = draw.textures[i];
             s->samplerPoint[i] = binding.point ? 1 : 0;
             s->texScale[i][0] = binding.scale[0];
             s->texScale[i][1] = binding.scale[1];
+            s->texSign[i] = binding.valid ? binding.sign : 0;
             WriteTextureDescriptor(cpu, binding);
             cpu.ptr += gSrvStep;
         }
@@ -854,7 +879,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (copyWidth > 0 && copyHeight > 0)
         {
             const UINT slot = gDrawSrvUsed;
-            gDrawSrvUsed += 16;
+            gDrawSrvUsed += kTextureSlots;
             if (gDrawSrvUsed <= kDrawDescriptors)
             {
                 D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -1008,7 +1033,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         auto found = gResolved.find(base);
         if (found == gResolved.end()) return;
         const UINT slot = gDrawSrvUsed;
-        gDrawSrvUsed += 16;
+        gDrawSrvUsed += kTextureSlots;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(slot) * gSrvStep;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();

@@ -2,6 +2,7 @@
 // else fails with a reason rather than guessing, so the unsupported list drives what to add next.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include "xenos_shader.h"
 
 namespace
@@ -13,9 +14,10 @@ cbuffer System : register(b1)
     float2 ndcScale; float2 ndcOffset;
     uint bypassViewport; uint3 systemPadding;
     uint4 vbBase[24];
-    uint4 samplerPoint[4];
-    float4 texScale[16];
+    uint4 samplerPoint[8];
+    float4 texScale[32];
     uint4 boolConstants[2];
+    uint4 texSign[8];
 };
 ByteAddressBuffer vb : register(t16);
 SamplerState linearSampler : register(s0);
@@ -70,6 +72,30 @@ float4 Fetch16F(uint a, uint n)
     {
         uint w = vb.Load(a + (i / 2) * 4);
         v[i] = f16tof32((w >> ((i & 1) ? 0 : 16)) & 65535);
+    }
+    return v;
+}
+// Xenos gamma textures use a piecewise-linear curve; this is its inverse (Xenia's PWL gamma).
+float Degamma(float g)
+{
+    float x = saturate(g) * 1023.0;
+    float l = x < 256.0 ? x * 0.25 : x < 384.0 ? 64.0 + (x - 256.0) * 0.5 : x < 768.0 ? 128.0 + (x - 384.0) : 512.0 + (x - 768.0) * 2.0;
+    return l / 1023.0;
+}
+// Texture sign modes per component: 1 two's complement (8-bit data), 2 biased (2x-1), 3 gamma.
+float4 ApplySign(float4 v, uint modes)
+{
+    if (modes == 0) return v;
+    [unroll] for (uint i = 0; i < 4; i++)
+    {
+        uint mode = (modes >> (i * 2)) & 3;
+        if (mode == 1 && (modes & 256))
+        {
+            float s = round(v[i] * 255.0);
+            v[i] = max((s >= 128.0 ? s - 256.0 : s) / 127.0, -1.0);
+        }
+        else if (mode == 2) v[i] = v[i] * 2.0 - 1.0;
+        else if (mode == 3) v[i] = Degamma(v[i]);
     }
     return v;
 }
@@ -215,11 +241,13 @@ float3 CubeDirection(float3 c)
             }
         }
 
-        // Scalar opcodes read two channels of source 3. The constant variants pair a constant with a register.
+        // Scalar opcodes read source 3: one-operand ops take swizzle component 3, two-operand ops take
+        // component 3 then component 0 (Xenia's ParseAluInstructionOperand). The constant variants pair
+        // a constant with a register.
         std::string ScalarExpression(uint32_t op, const uint32_t* w)
         {
             const std::string t = "(" + Source(3, w) + ")";
-            const std::string x = t + ".x", y = t + ".y";
+            const std::string x = t + ".w", y = t + ".x";
             switch (op)
             {
             case 0: return x + " + " + y;
@@ -415,28 +443,27 @@ float3 CubeDirection(float3 c)
             const uint32_t opcode = w[0] & 0x1F;
             if (opcode == 24) return;   // set texture LOD: only base levels are bound so far
             if (opcode != 1) { Fail(Format("texture opcode %d", int(opcode))); return; }
-            if (!pixel) { Fail("texture fetch in a vertex shader"); return; }
             const int source = (w[0] >> 5) & 0x3F, dest = (w[0] >> 12) & 0x3F;
             const uint32_t slot = (w[0] >> 20) & 0x1F;
-            if (slot >= 16) { Fail("texture slot above 15"); return; }
             const uint32_t dimension = (w[2] >> 14) & 3;   // 1D, 2D, 3D or stacked, cube
             if (dimension == 2) { Fail("3D texture fetch"); return; }
-            const bool cube = dimension == 3;
+            const bool cube = dimension == 3, oneD = dimension == 0;
             if (result.textureSlots.count(slot) && result.cubeSlots.count(slot) != (cube ? 1u : 0u)) { Fail("texture slot used as both 2D and cube"); return; }
             result.textureSlots.insert(slot);
             if (cube) result.cubeSlots.insert(slot);
             // Fetch source swizzles are absolute channel numbers, unlike ALU sources.
             std::string coordinates = Register(source) + ".";
-            for (int i = 0; i < (cube ? 3 : 2); i++) coordinates += "xyzw"[(w[0] >> (26 + i * 2)) & 3];
-            char sample[320];
-            if (cube)
-                snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u.Sample(pointSampler, CubeDirection(%s)) : t%u.Sample(linearSampler, CubeDirection(%s)))",
-                    slot / 4, slot % 4, slot, coordinates.c_str(), slot, coordinates.c_str());
-            else
-                snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u.Sample(pointSampler, %s * texScale[%u].xy) : t%u.Sample(linearSampler, %s * texScale[%u].xy))",
-                    slot / 4, slot % 4, slot, coordinates.c_str(), slot, slot, coordinates.c_str(), slot);
+            for (int i = 0; i < (cube ? 3 : oneD ? 1 : 2); i++) coordinates += "xyzw"[(w[0] >> (26 + i * 2)) & 3];
+            // 1D textures are bound as one-row 2D textures.
+            if (oneD) coordinates = "float2(" + coordinates + ", 0.5)";
+            const std::string where = cube ? "CubeDirection(" + coordinates + ")" : coordinates + Format(" * texScale[%d].xy", int(slot));
+            // Vertex shaders have no derivatives, so they sample the base level explicitly.
+            const std::string call = pixel ? ".Sample(" : ".SampleLevel(", level = pixel ? ")" : ", 0)";
+            char sample[384];
+            snprintf(sample, sizeof(sample), "(samplerPoint[%u][%u] ? t%u%spointSampler, %s%s : t%u%slinearSampler, %s%s)",
+                slot / 4, slot % 4, slot, call.c_str(), where.c_str(), level.c_str(), slot, call.c_str(), where.c_str(), level.c_str());
             body += OpenPredicate(w[1] >> 31, w[2] >> 31);
-            body += std::string("        float4 f_ = ") + sample + ";\n";
+            body += std::string("        float4 f_ = ApplySign(") + sample + Format(", texSign[%d][%d]);\n", int(slot / 4), int(slot % 4));
             WriteFetched(dest, w[1] & 0xFFF);
             body += "    }\n";
         }
@@ -507,7 +534,7 @@ float3 CubeDirection(float3 c)
 
             std::string hlsl = kCommon;
             for (uint32_t slot : result.textureSlots)
-                hlsl += std::string(result.cubeSlots.count(slot) ? "TextureCube" : "Texture2D") + Format("<float4> t%d : register(t%d);\n", int(slot), int(slot));
+                hlsl += std::string(result.cubeSlots.count(slot) ? "TextureCube" : "Texture2D") + Format("<float4> t%d : register(t%d, space1);\n", int(slot), int(slot));
             if (pixel && exportsDepth) hlsl += "struct PixelOutput { float4 color : SV_Target0; float depth : SV_Depth; };\n";
             hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input)" + (exportsDepth ? "" : " : SV_Target0") +
                                 "\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 }; float4 oDepth = (float4)0;\n"
@@ -518,6 +545,23 @@ float3 CubeDirection(float3 c)
             hlsl += body;
             if (pixel)
             {
+                // NIER_PS_DEBUG=<hash>=<HLSL float4 expression>[;<hash>=<expression>...] replaces those
+                // pixel shaders' colour with the expression (debugging), e.g.
+                // "D461B8752A20D67B=float4(r[7].xyz, 1)".
+                static const std::string debug = [] {
+                    const char* value = std::getenv("NIER_PS_DEBUG");
+                    return value ? std::string(value) : std::string();
+                }();
+                for (size_t start = 0; start < debug.size();)
+                {
+                    size_t end = debug.find(';', start);
+                    if (end == std::string::npos) end = debug.size();
+                    const std::string entry = debug.substr(start, end - start);
+                    const size_t split = entry.find('=');
+                    if (split != std::string::npos && strtoull(entry.substr(0, split).c_str(), nullptr, 16) == result.hash)
+                        hlsl += "    oC[0] = " + entry.substr(split + 1) + ";\n";
+                    start = end + 1;
+                }
                 hlsl += exportsDepth ? "    PixelOutput output_;\n    output_.color = oC[0];\n    output_.depth = oDepth.x;\n    return output_;\n}\n"
                                      : "    return oC[0];\n}\n";
             }

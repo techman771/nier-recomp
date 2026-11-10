@@ -201,16 +201,32 @@ Rect lists use a geometry shader, which MoltenVK won't have. Decoded textures ar
 New Game now reaches the prologue (`C_TOKYO_FIELD_01`) and renders 3D: indexed draws with primitive
 restart, depth/stencil targets, depth-only passes, predicates and kills in the translator, packed vertex
 formats, the address register, pixel depth export, and cube maps (the `CUBE` instruction, cube
-fetches, six-face textures as `TextureCube`; used by reflective building materials). The opening
+fetches, six-face textures as `TextureCube`; used by the character materials). The opening
 credits, the snow-sky shot and the Grimoire scene ("Take it and save your daughter...") play through.
-A 4-minute run executes about 237,000 draws with none failing and about 850 skipped (8 shaders with
-vertex texture fetch, and 24 draws of primitive type 1). The scene now looks like the game: textured
-ruined buildings, fences, snow, fog and light shafts. Remaining visible faults: the cinematic
-letterbox bars are translucent grey instead of solid, and only base mip levels are bound.
+Only 24 draws a run are skipped (primitive type 1). The scene looks like the game: textured ruined
+buildings, fences, snow, fog and light shafts. Characters render with plausible
+materials. Remaining visible faults: a few over-bright patches on character reflections (the cube
+map is sampled at its sharpest level because mipmaps and the set-LOD fetch, opcode 24, aren't
+supported), the cinematic letterbox bars are translucent grey instead of solid, and only base mip
+levels are bound.
+
+Scalar ALU ops read source 3 with Xenia's component rule: one-operand ops use swizzle component 3,
+two-operand ops use component 3 then component 0. The translator used components 0 and 1, which only
+works for replicated swizzles; it broke the character lighting (dark bodies with chrome-like edges)
+and shifted the city's colours. The game runs slower than real time in the character scenes (about 40 fps).
+
+Characters are skinned in the vertex shader from a bone texture (fetch constant 16, format 38,
+1024x1, 1D). Vertex shaders sample with `SampleLevel` at level 0; 1D textures are bound as one-row
+2D textures. Texture bindings cover all 32 fetch constants, in register space 1 (space 0 `t16` is
+the vertex buffer).
 
 Texture formats decoded: 2 (R8), 6 (RGBA8), 18-20 (BC1-3), 29 (`k_16_16_16_16_EXPAND`, uploaded as
-half floats like Xenia), 60 (`k_CTX1`, decoded on the CPU to (x, y, y, y) following Xenia's
-`texture_load_ctx1`), and 22 when it is a depth resolve.
+half floats like Xenia), 31/32 (16-bit float), 36-38 (32-bit float), 60 (`k_CTX1`, decoded on the
+CPU to (x, y, y, y) following Xenia's `texture_load_ctx1`), and 22 when it is a depth resolve.
+Texture sign modes (fetch constant dword 0 bits 2-9) are applied after sampling: two's complement
+for 8-bit data, biased (2x-1), and gamma (Xenia's piecewise-linear curve). The game's colour maps
+(formats 18 and 20) use gamma. Host textures are keyed by address and shape and re-uploaded when the
+contents change; keying by contents created a new texture every frame for the bone matrices.
 
 Scalar "constant" ops (opcodes 42-47: MULsc/ADDsc/SUBsc with a constant and a register) take the
 constant from source 3's register with swizzle component 3, and a temporary whose index is
@@ -248,6 +264,13 @@ addresses wrapping every 2048 tiles.
 Render targets are keyed by EDRAM address and width, with height covering the rest of EDRAM, because
 the same address is reused at several sizes in one frame; replaced resolve textures are retired only
 after the frame's GPU work completes.
+
+Test runs open the window on the secondary monitor (`NIER_MONITOR=secondary`, set by `run_boot.ps1`;
+a number picks a monitor by enumeration order).
+
+`NIER_PS_DEBUG=<hash>=<HLSL float4 expression>[;...]` replaces a pixel shader's colour with any
+expression over its registers (`r[n]`), inputs and textures; splitting by `input.position.x` shows
+several intermediate terms side by side, which is how the scalar operand bug was found.
 
 Debugging switches: `NIER_SHOW_SURFACE=<hex>` shows a resolved surface instead of the scanout;
 `<hex>@n` picks the n-th copy to that address in a frame, and a comma-separated list shows each entry

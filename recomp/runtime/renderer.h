@@ -21,11 +21,12 @@ struct GuestShader
     bool pixel = false;
 };
 
-enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8, RGBA16F };
+enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8, RGBA16F, RG16F, R32F, RG32F, RGBA32F };
 
 struct DecodedTexture
 {
-    uint64_t key = 0;
+    uint64_t key = 0;           // identity: address, format and shape
+    uint64_t contentHash = 0;   // changes when the guest rewrites the texture
     uint32_t width = 0, height = 0, rowPitch = 0;
     uint32_t faces = 1;                         // 6 for a cube map, faces stored one after another
     GuestTextureFormat format = GuestTextureFormat::RGBA8;
@@ -41,6 +42,7 @@ struct TextureBinding
     bool point = false;
     bool cube = false;                         // the shader samples this slot as a cube map
     float scale[2] = { 1.0f, 1.0f };
+    uint32_t sign = 0;   // 2-bit sign mode per output component, bit 8: 8-bit host data (two's complement applies)
 };
 
 struct RenderTargetKey
@@ -64,7 +66,7 @@ struct RendererDraw
     std::array<uint32_t, 96> vertexBase{};
     std::array<float, 2048> constants{};
     std::array<uint32_t, 8> boolConstants{};
-    std::array<TextureBinding, 16> textures;
+    std::array<TextureBinding, 32> textures;   // one per fetch constant
     bool bypassViewport = false;
     float ndcScale[2] = { 1, 1 }, ndcOffset[2] = { 0, 0 };
     float viewport[4] = { 0, 0, 1, 1 };

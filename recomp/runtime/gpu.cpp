@@ -156,12 +156,20 @@ namespace
         if (!out.base) return false;
         out.format = c[1] & 0x3F;
         out.endian = (c[1] >> 6) & 3;
-        out.width = (c[2] & 0x1FFF) + 1;
-        out.height = ((c[2] >> 13) & 0x1FFF) + 1;
+        out.dimension = (c[5] >> 9) & 3;
+        if (out.dimension == 0)
+        {
+            out.width = (c[2] & 0xFFFFFF) + 1;   // 1D: a 24-bit width and no height
+            out.height = 1;
+        }
+        else
+        {
+            out.width = (c[2] & 0x1FFF) + 1;
+            out.height = ((c[2] >> 13) & 0x1FFF) + 1;
+        }
         out.pitch = ((c[0] >> 22) & 0x1FF) << 5;
         out.tiled = (c[0] >> 31) & 1;
         out.packedMips = (c[5] >> 11) & 1;
-        out.dimension = (c[5] >> 9) & 3;
         return true;
     }
 
@@ -401,6 +409,11 @@ namespace
         case 20: format = GuestTextureFormat::BC3; blockSize = 4; blockBytes = 16; logBytes = 4; break;
         case 29: format = GuestTextureFormat::RGBA16F; blockBytes = 8; logBytes = 3; break;   // k_16_16_16_16_EXPAND
         case 60: format = GuestTextureFormat::RGBA8; blockSize = 4; blockBytes = 8; logBytes = 3; ctx1 = true; break;   // k_CTX1
+        case 31: format = GuestTextureFormat::RG16F; break;                                    // k_16_16_FLOAT
+        case 32: format = GuestTextureFormat::RGBA16F; blockBytes = 8; logBytes = 3; break;   // k_16_16_16_16_FLOAT
+        case 36: format = GuestTextureFormat::R32F; break;                                     // k_32_FLOAT
+        case 37: format = GuestTextureFormat::RG32F; blockBytes = 8; logBytes = 3; break;     // k_32_32_FLOAT
+        case 38: format = GuestTextureFormat::RGBA32F; blockBytes = 16; logBytes = 4; break;  // k_32_32_32_32_FLOAT
         default:
             return SubstituteTexture(t.format);
         }
@@ -415,17 +428,22 @@ namespace
         const uint64_t bytes = faceStride * (faces - 1) + faceBytes;
         if (faceBytes == 0 || uint64_t(guest) + bytes > 0x100000000ull) return nullptr;
 
-        uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1);
+        // A texture is identified by where it lives and its shape; its contents can change (bone
+        // matrices are rewritten every frame), so they're tracked by a separate hash and re-uploaded
+        // into the same host texture rather than creating a new one each time.
+        const uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1);
         const uint8_t* source = g_base + guest;
-        for (uint64_t i = 0; i < bytes; i += 16) key = (key ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
+        uint64_t content = 1469598103934665603ull;
+        for (uint64_t i = 0; i < bytes; i += 16) content = (content ^ *(const uint32_t*)(source + (i & ~3ull))) * 1099511628211ull;
 
         binding.scale[0] = float(t.width) / float(widthBlocks * blockSize);
         binding.scale[1] = float(t.height) / float(heightBlocks * blockSize);
         auto found = gDecodedTextures.find(key);
-        if (found != gDecodedTextures.end()) return found->second;
+        if (found != gDecodedTextures.end() && found->second->contentHash == content) return found->second;
 
         auto decoded = std::make_shared<DecodedTexture>();
         decoded->key = key;
+        decoded->contentHash = content;
         decoded->format = format;
         decoded->width = widthBlocks * blockSize;
         decoded->height = heightBlocks * blockSize;
@@ -706,16 +724,32 @@ namespace
         memcpy(draw.constants.data(), &r[0x4000], draw.constants.size() * 4);
         memcpy(draw.boolConstants.data(), &r[0x4900], draw.boolConstants.size() * 4);
 
-        for (uint32_t slot : ps->info.textureSlots)
+        std::set<uint32_t> textureSlots = ps->info.textureSlots, cubeSlots = ps->info.cubeSlots;
+        textureSlots.insert(vs->info.textureSlots.begin(), vs->info.textureSlots.end());
+        cubeSlots.insert(vs->info.cubeSlots.begin(), vs->info.cubeSlots.end());
+        for (uint32_t slot : textureSlots)
         {
             TextureBinding& binding = draw.textures[slot];
-            binding.cube = ps->info.cubeSlots.count(slot) != 0;   // set even when unbound, so the empty view matches
+            binding.cube = cubeSlots.count(slot) != 0;   // set even when unbound, so the empty view matches
             TextureDescriptor t;
             if (!ReadTextureSlot(slot, t)) continue;
             const uint32_t* c = &r[REG_FETCH_CONSTANTS + slot * 6];
             const uint32_t swizzle = (c[3] >> 1) & 0xFFF;
             for (int i = 0; i < 4; i++) binding.swizzle[i] = (swizzle >> (i * 3)) & 7;
             binding.point = ((c[3] >> 19) & 3) == 0;
+            // Sign modes belong to the texture's components; the view's swizzle has already moved them.
+            const uint32_t signs = (c[0] >> 2) & 0xFF;
+            binding.sign = 0;
+            for (int i = 0; i < 4; i++)
+                if (binding.swizzle[i] < 4) binding.sign |= ((signs >> (binding.swizzle[i] * 2)) & 3) << (i * 2);
+            const bool eightBit = t.format == 2 || t.format == 6 || (t.format >= 18 && t.format <= 20) || t.format == 60;
+            if (binding.sign && eightBit) binding.sign |= 256;
+            if (signs)
+            {
+                static std::set<uint32_t> seen;
+                if (seen.size() < 16 && seen.insert(t.format << 8 | signs).second)
+                    Log("[gpu] texture format %u uses sign modes x%u y%u z%u w%u\n", t.format, signs & 3, (signs >> 2) & 3, (signs >> 4) & 3, (signs >> 6) & 3);
+            }
             if (binding.cube != (t.dimension == 3))
             {
                 static int mismatches = 0;
