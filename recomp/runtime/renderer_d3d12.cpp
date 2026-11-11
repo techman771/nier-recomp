@@ -16,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <string>
 #include <thread>
@@ -79,7 +80,7 @@ float4 PSMain(Interpolated input) : SV_Target
 
     HWND gWindow = nullptr;
     uint32_t gWidth = 1280, gHeight = 720;
-    bool gReady = false;
+    std::atomic<bool> gReady{ false };   // also read by the GPU emulation thread (RendererPreparePipeline)
 
     ComPtr<ID3D12Device> gDevice;
     ComPtr<ID3D12CommandQueue> gQueue;
@@ -472,7 +473,13 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ComPtr<ID3DBlob> CompileGuestShader(const GuestShader& shader)
     {
         const char* profile = shader.pixel ? "ps_5_1" : "vs_5_1";
-        const uint64_t key = XXH3_64bits_withSeed(shader.hlsl.data(), shader.hlsl.size(), shader.pixel ? 1 : 2);
+        // Unoptimized: FXC's optimization passes made compiles ~2.5x slower, and the driver optimizes the
+        // shader again when it builds the pipeline. The flags are part of the cache key.
+        // NIER_SHADER_SALT=1 (testing) adds IEEE strictness: different bytecode, so neither this cache nor
+        // the driver's has seen it, i.e. a first-run experience.
+        static const UINT kFlags = (GetEnvironmentVariableA("NIER_SHADER_OPTIMIZE", nullptr, 0) > 0 ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_SKIP_OPTIMIZATION) |
+                                   (GetEnvironmentVariableA("NIER_SHADER_SALT", nullptr, 0) > 0 ? D3DCOMPILE_IEEE_STRICTNESS : 0);
+        const uint64_t key = XXH3_64bits_withSeed(shader.hlsl.data(), shader.hlsl.size(), (shader.pixel ? 1 : 2) + uint64_t(kFlags) * 16);
         char path[128];
         snprintf(path, sizeof(path), "..\\shadercache\\%s_%016llX_%016llX.dxbc", shader.pixel ? "ps" : "vs", (unsigned long long)shader.hash, (unsigned long long)key);
         ComPtr<ID3DBlob> blob;
@@ -490,7 +497,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             blob.Reset();
         }
         ComPtr<ID3DBlob> errors;
-        HRESULT result = D3DCompile(shader.hlsl.data(), shader.hlsl.size(), "guest", nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &blob, &errors);
+        HRESULT result = D3DCompile(shader.hlsl.data(), shader.hlsl.size(), "guest", nullptr, nullptr, "main", profile, kFlags, 0, &blob, &errors);
         if (FAILED(result))
         {
             Log("[shader] %s %016llX failed to compile: %s\n", shader.pixel ? "pixel" : "vertex", shader.hash, errors ? (const char*)errors->GetBufferPointer() : "unknown");
@@ -554,11 +561,24 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return future;
     }
 
+    // Render-thread time spent waiting for shader compiles and creating pipelines (RendererDumpStats).
+    std::atomic<double> gShaderWaitMs{ 0 }, gShaderWaitWorstMs{ 0 }, gPipelineMs{ 0 }, gPipelineWorstMs{ 0 };
+    std::atomic<uint64_t> gShaderWaits{ 0 }, gPipelineSlow{ 0 };
+
     ID3DBlob* ShaderBlob(const std::shared_ptr<GuestShader>& shader)
     {
         auto found = gShaderBlobs.find(shader->hash);
         if (found != gShaderBlobs.end()) return found->second.Get();
-        ComPtr<ID3DBlob> blob = QueueShader(shader).get();   // usually ready by now
+        std::shared_future<ComPtr<ID3DBlob>> future = QueueShader(shader);
+        LARGE_INTEGER before, after, frequency;
+        QueryPerformanceCounter(&before);
+        ComPtr<ID3DBlob> blob = future.get();   // usually ready by now
+        QueryPerformanceCounter(&after);
+        QueryPerformanceFrequency(&frequency);
+        const double waited = double(after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
+        gShaderWaitMs += waited;
+        gShaderWaitWorstMs = std::max(gShaderWaitWorstMs.load(), waited);
+        if (waited > 1.0) gShaderWaits++;
         gShaderBlobs[shader->hash] = blob;
         return blob.Get();
     }
@@ -577,16 +597,108 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return value <= 4 ? kOps[value] : D3D12_BLEND_OP_ADD;
     }
 
+    // What a pipeline is built from: the shaders and the draw's fixed-function state.
+    struct PipelineState
+    {
+        std::shared_ptr<GuestShader> vs, ps;
+        uint32_t blendControl = 0, writeMask = 0, depthControl = 0, stencilRefMask = 0;
+        bool rectList = false, hasColor = false, depthBound = false;
+    };
+
+    PipelineState PipelineStateOf(const RendererDraw& draw)
+    {
+        return { draw.vs, draw.ps, draw.blendControl, draw.writeMask, draw.depthControl, draw.stencilRefMask, draw.rectList, draw.hasColor, draw.depthBound };
+    }
+
+    uint64_t PipelineKey(const PipelineState& s)
+    {
+        uint64_t key = s.vs->hash * 31 + s.ps->hash;
+        key = (key ^ s.blendControl) * 1099511628211ull;
+        key = (key ^ (uint64_t(s.writeMask) << 1) ^ (s.rectList ? 1 : 0)) * 1099511628211ull;
+        key = (key ^ s.depthControl ^ (uint64_t(s.stencilRefMask & 0xFFFF00) << 32) ^ (uint64_t(s.hasColor) << 60) ^ (uint64_t(s.depthBound) << 61)) * 1099511628211ull;
+        return key;
+    }
+
+    ComPtr<ID3D12PipelineState> CreatePipeline(const PipelineState& draw);
+
+    // Pipelines are created on their own worker threads (they wait for shader compiles, so sharing the
+    // shader workers could deadlock), started by the GPU emulation when it first sees a combination
+    // (RendererPreparePipeline), a frame or more before the render thread needs it. Creating them on
+    // the render thread at first use made the driver's first compile of a new shader a visible hitch.
+    struct PipelineJobs
+    {
+        std::mutex mutex;
+        std::condition_variable work;
+        std::deque<std::pair<uint64_t, PipelineState>> queue;
+        std::unordered_map<uint64_t, std::shared_future<ComPtr<ID3D12PipelineState>>> results;
+        std::unordered_map<uint64_t, std::shared_ptr<std::promise<ComPtr<ID3D12PipelineState>>>> promises;
+        bool started = false;
+    } gPipelineJobs;
+    std::atomic<double> gPipelineWaitMs{ 0 };
+    std::atomic<uint64_t> gPipelineWaits{ 0 };
+
+    void PipelineWorker()
+    {
+        while (true)
+        {
+            std::pair<uint64_t, PipelineState> job;
+            std::shared_ptr<std::promise<ComPtr<ID3D12PipelineState>>> promise;
+            {
+                std::unique_lock lock(gPipelineJobs.mutex);
+                gPipelineJobs.work.wait(lock, [] { return !gPipelineJobs.queue.empty(); });
+                job = std::move(gPipelineJobs.queue.front());
+                gPipelineJobs.queue.pop_front();
+                promise = gPipelineJobs.promises[job.first];
+                gPipelineJobs.promises.erase(job.first);
+            }
+            promise->set_value(CreatePipeline(job.second));
+        }
+    }
+
+    std::shared_future<ComPtr<ID3D12PipelineState>> QueuePipeline(const PipelineState& state, uint64_t key)
+    {
+        std::lock_guard lock(gPipelineJobs.mutex);
+        if (!gPipelineJobs.started)
+        {
+            gPipelineJobs.started = true;
+            const unsigned workers = std::clamp(std::thread::hardware_concurrency() / 6, 2u, 4u);
+            for (unsigned i = 0; i < workers; i++) std::thread(PipelineWorker).detach();
+        }
+        auto found = gPipelineJobs.results.find(key);
+        if (found != gPipelineJobs.results.end()) return found->second;
+        auto promise = std::make_shared<std::promise<ComPtr<ID3D12PipelineState>>>();
+        std::shared_future<ComPtr<ID3D12PipelineState>> future = promise->get_future().share();
+        gPipelineJobs.results[key] = future;
+        gPipelineJobs.promises[key] = promise;
+        gPipelineJobs.queue.emplace_back(key, state);
+        gPipelineJobs.work.notify_one();
+        return future;
+    }
+
     ID3D12PipelineState* PipelineFor(const RendererDraw& draw)
     {
-        uint64_t key = draw.vs->hash * 31 + draw.ps->hash;
-        key = (key ^ draw.blendControl) * 1099511628211ull;
-        key = (key ^ (uint64_t(draw.writeMask) << 1) ^ (draw.rectList ? 1 : 0)) * 1099511628211ull;
-        key = (key ^ draw.depthControl ^ (uint64_t(draw.stencilRefMask & 0xFFFF00) << 32) ^ (uint64_t(draw.hasColor) << 60) ^ (uint64_t(draw.depthBound) << 61)) * 1099511628211ull;
+        const PipelineState state = PipelineStateOf(draw);
+        const uint64_t key = PipelineKey(state);
         auto found = gPipelines.find(key);
         if (found != gPipelines.end()) return found->second.Get();
+        std::shared_future<ComPtr<ID3D12PipelineState>> future = QueuePipeline(state, key);
+        LARGE_INTEGER before, after, frequency;
+        QueryPerformanceCounter(&before);
+        ComPtr<ID3D12PipelineState> pipeline = future.get();   // usually created in the background already
+        QueryPerformanceCounter(&after);
+        QueryPerformanceFrequency(&frequency);
+        const double waited = double(after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
+        gPipelineWaitMs += waited;
+        if (waited > 1.0) gPipelineWaits++;
+        gPipelines[key] = pipeline;
+        return pipeline.Get();
+    }
 
-        ID3DBlob* vs = ShaderBlob(draw.vs), * ps = ShaderBlob(draw.ps);
+    // Creates a pipeline (on a worker thread): waits for its shaders' compiles, then lets the driver build it.
+    ComPtr<ID3D12PipelineState> CreatePipeline(const PipelineState& draw)
+    {
+        ComPtr<ID3DBlob> vsBlob = QueueShader(draw.vs).get(), psBlob = QueueShader(draw.ps).get();
+        ID3DBlob* vs = vsBlob.Get(), * ps = psBlob.Get();
         ComPtr<ID3D12PipelineState> pipeline;
         if (vs && ps)
         {
@@ -637,10 +749,17 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 ds.BackFace = ((d >> 7) & 1) ? face((d >> 20) & 7, (d >> 23) & 7, (d >> 26) & 7, (d >> 29) & 7) : ds.FrontFace;
             }
             desc.SampleDesc.Count = 1;
+            LARGE_INTEGER before, after, frequency;
+            QueryPerformanceCounter(&before);
             Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "guest pipeline");
+            QueryPerformanceCounter(&after);
+            QueryPerformanceFrequency(&frequency);
+            const double ms = double(after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
+            gPipelineMs += ms;
+            gPipelineWorstMs = std::max(gPipelineWorstMs.load(), ms);
+            if (ms > 5.0) gPipelineSlow++;
         }
-        gPipelines[key] = pipeline;
-        return pipeline.Get();
+        return pipeline;
     }
 
     TargetResource* GetTarget(const RenderTargetKey& key)
@@ -1765,6 +1884,9 @@ void RendererDumpStats()
 {
     Log("[present] %llu frames submitted, %llu presented\n", gSubmitted.load(), gPresented.load());
     Log("[d3d12] %llu draws executed, %llu failed, %zu pipelines, %zu textures, %zu render targets, %zu resolve surfaces\n", gDrawsExecuted.load(), gDrawsFailed.load(), gPipelines.size(), gDecoded.size(), gTargets.size(), gResolved.size());
+    Log("[d3d12] waited for shader compiles: %.0f ms in total, %llu waits over 1 ms, worst %.1f ms\n", gShaderWaitMs.load(), gShaderWaits.load(), gShaderWaitWorstMs.load());
+    Log("[d3d12] creating %zu pipelines took %.0f ms, %llu over 5 ms, worst %.1f ms\n", gPipelines.size(), gPipelineMs.load(), gPipelineSlow.load(), gPipelineWorstMs.load());
+    Log("[d3d12] render thread waited for pipelines: %.0f ms in total, %llu waits over 1 ms\n", gPipelineWaitMs.load(), gPipelineWaits.load());
     if (gMovieImages.load())
     {
         Log("[present] %llu new images on screen: worst gap %.1fms, %llu gaps over 60ms\n", gMovieImages.load(), gWorstGap, gLateImages.load());
@@ -1774,3 +1896,13 @@ void RendererDumpStats()
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader) { QueueShader(shader); }
+
+// Starts creating the pipeline a draw needs, if this combination is new (GPU emulation thread).
+void RendererPreparePipeline(const RendererDraw& draw)
+{
+    if (!draw.vs || !draw.ps || !gReady) return;   // device and draw objects exist once ready
+    static thread_local std::unordered_set<uint64_t> seen;   // cheap check before the shared map
+    const PipelineState state = PipelineStateOf(draw);
+    const uint64_t key = PipelineKey(state);
+    if (seen.insert(key).second) QueuePipeline(state, key);
+}

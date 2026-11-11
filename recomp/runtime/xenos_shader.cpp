@@ -570,9 +570,13 @@ float3 CubeDirection(float3 c)
             hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input)" + (exportsDepth ? "" : " : SV_Target0") +
                                 "\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 }; float4 oDepth = (float4)0;\n"
                           : "Interpolated main(uint vertexId : SV_VertexID)\n{\n    float4 oPos = float4(0, 0, 0, 1); float4 oPointSize = (float4)0;\n    float4 oT[16];\n    for (int i_ = 0; i_ < 16; i_++) oT[i_] = (float4)0;\n";
-            hlsl += Format("    float4 r[%d];\n    for (int i_ = 0; i_ < %d; i_++) r[i_] = (float4)0;\n    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0; float lod_ = 0.0;\n", maxRegister, maxRegister);
-            if (pixel) hlsl += Format("    for (int i_ = 0; i_ < %d; i_++) r[i_] = input.t[i_];\n", std::min(maxRegister, 16));
-            else hlsl += "    r[0].x = float(vertexId);\n";
+            // Registers are written as r[N] while translating and become separate variables (rN) at the
+            // end (registers are only ever indexed by constants): FXC compiles an array of registers
+            // much more slowly, and a shader's first use waits for that compile.
+            for (int i = 0; i < maxRegister; i++)
+                hlsl += Format(pixel && i < 16 ? "    float4 r%d = input.t[%d];\n" : "    float4 r%d = (float4)0;\n", i, i);
+            hlsl += "    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0; float lod_ = 0.0;\n";
+            if (!pixel) hlsl += "    r[0].x = float(vertexId);\n";
             hlsl += body;
             if (pixel)
             {
@@ -632,6 +636,27 @@ float3 CubeDirection(float3 c)
                 }
                 start = end + 2;
             }
+            // r[N] -> rN (see the declarations above); debug expressions and patches may use r[N] too.
+            std::string flat;
+            flat.reserve(hlsl.size());
+            for (size_t i = 0; i < hlsl.size(); i++)
+            {
+                const bool identifierBefore = i > 0 && (isalnum(uint8_t(hlsl[i - 1])) || hlsl[i - 1] == '_');
+                if (hlsl[i] == 'r' && !identifierBefore && i + 2 < hlsl.size() && hlsl[i + 1] == '[' && isdigit(uint8_t(hlsl[i + 2])))
+                {
+                    size_t j = i + 2;
+                    while (j < hlsl.size() && isdigit(uint8_t(hlsl[j]))) j++;
+                    if (j < hlsl.size() && hlsl[j] == ']')
+                    {
+                        flat += 'r';
+                        flat.append(hlsl, i + 2, j - i - 2);
+                        i = j;
+                        continue;
+                    }
+                }
+                flat += hlsl[i];
+            }
+            hlsl = std::move(flat);
             result.hlsl = hlsl;
             result.ok = !failed;
             result.directVertexIndex = !pixel && !indexedOtherwise;   // see EmitVertexFetch

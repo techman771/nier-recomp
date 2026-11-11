@@ -283,6 +283,68 @@ namespace
             }
             Log("[scan] %d matches for %f %f %f\n", found, wanted[0], wanted[1], wanted[2]);
         }
+        // NIER_SCAN_IMLOAD=1 (experiment): finds IM_LOAD packets (type 3, opcode 0x27) in physical memory,
+        // e.g. in command buffers recorded at load time, and logs the shaders they reference (hash as in
+        // gpu.cpp StoreShader).
+        if (GetEnvironmentVariableA("NIER_SCAN_IMLOAD", nullptr, 0) > 0)
+        {
+            std::map<uint64_t, std::pair<uint32_t, uint32_t>> shaders;   // hash -> stage, address
+            uint64_t packets = 0;
+            for (uint32_t at = 0xA0000000; at < 0xBFFFFFF0; at += 4)
+            {
+                if (R32(at) != 0xC0012700) continue;
+                const uint32_t addressType = R32(at + 4), startSize = R32(at + 8);
+                const uint32_t stage = addressType & 3, dwords = startSize & 0xFFFF;
+                const uint32_t physical = addressType & ~3u;
+                if (stage > 1 || dwords < 6 || dwords > 4096 || physical >= 0x20000000 || (startSize >> 16) != 0) continue;
+                packets++;
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t i = 0; i < dwords; i++) hash = (hash ^ R32(0xA0000000 + physical + i * 4)) * 1099511628211ull;
+                shaders.emplace(hash, std::make_pair(stage, physical));
+            }
+            Log("[imload] %llu IM_LOAD packets in physical memory, %zu distinct shaders\n", (unsigned long long)packets, shaders.size());
+            for (const auto& [hash, info] : shaders) Log("[imload] %s %016llX at %08X\n", info.first ? "pixel" : "vertex", (unsigned long long)hash, info.second);
+        }
+        // NIER_DUMP_RANGE=<guest address>,<bytes>: writes that memory to captures/range_<address>.bin.
+        char range[64];
+        if (GetEnvironmentVariableA("NIER_DUMP_RANGE", range, sizeof(range)))
+        {
+            const uint32_t address = strtoul(range, nullptr, 16);
+            const char* comma = strchr(range, ',');
+            const uint32_t bytes = comma ? strtoul(comma + 1, nullptr, 0) : 4096;
+            CreateDirectoryA("..\\captures", nullptr);
+            char path[96];
+            snprintf(path, sizeof(path), "..\\captures\\range_%08X.bin", address);
+            if (FILE* file = fopen(path, "wb"))
+            {
+                fwrite(g_base + address, 1, bytes, file);
+                fclose(file);
+                Log("[profile] dumped %u bytes at %08X\n", bytes, address);
+            }
+        }
+        // NIER_SCAN_U32=<hex>[,<hex>...]: logs guest addresses holding those big-endian 32-bit values.
+        char words[256];
+        if (GetEnvironmentVariableA("NIER_SCAN_U32", words, sizeof(words)))
+        {
+            std::vector<uint32_t> wanted;
+            for (char* item = strtok(words, ","); item; item = strtok(nullptr, ",")) wanted.push_back(strtoul(item, nullptr, 16));
+            MEMORY_BASIC_INFORMATION info{};
+            int found = 0;
+            for (uint64_t address = 0; address < 0x100000000ull && found < 60;)
+            {
+                if (!VirtualQuery(g_base + address, &info, sizeof(info)) || !info.RegionSize) break;
+                const uint64_t start = uint64_t(static_cast<uint8_t*>(info.BaseAddress) - g_base);
+                address = start + info.RegionSize;
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
+                if (info.State != MEM_COMMIT || !(info.Protect & readable) || (info.Protect & PAGE_GUARD)) continue;
+                for (uint64_t at = start; at + 4 <= start + info.RegionSize && found < 60; at += 4)
+                {
+                    const uint32_t value = R32(uint32_t(at));
+                    for (uint32_t w : wanted)
+                        if (value == w) { Log("[scan] %08X holds %08X\n", uint32_t(at), w); found++; }
+                }
+            }
+        }
         if (exitAfter)
         {
             DumpGuestThreads();

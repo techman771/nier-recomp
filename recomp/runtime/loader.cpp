@@ -103,6 +103,17 @@ uint32_t LoadGame(const std::string& gameDir)
     }
     memcpy(g_base + image.base, image.data.get(), std::min<size_t>(backed, image.size));
     Log("image: 0x%X bytes, 0x%zX backed by the file\n", image.size, backed);
+    // NIER_DUMP_IMAGE=1 writes the decompressed image to captures/image.bin (debugging; game-derived).
+    if (GetEnvironmentVariableA("NIER_DUMP_IMAGE", nullptr, 0) > 0)
+    {
+        CreateDirectoryA("..\\captures", nullptr);
+        if (FILE* file = fopen("..\\captures\\image.bin", "wb"))
+        {
+            fwrite(g_base + image.base, 1, image.size, file);
+            fclose(file);
+            Log("image dumped to captures/image.bin\n");
+        }
+    }
 
     size_t mapped = 0;
     for (auto* m = PPCFuncMappings; m->host; ++m, ++mapped)

@@ -355,6 +355,47 @@ thread caused 100-500 ms hitches. Result: 59.8 fps in the fight with a warm cach
 command thread ~40% busy and waiting on the flip gate the rest. The stats dump (profiler exit) now
 lists frame times in vblanks, on-time and late frames split into waiting / idle / working time, and
 each `WAIT_REG_MEM` location's count and total wait.
+Where the shaders live (for ahead-of-time compilation): of 97 captured shaders long enough to search
+(`tools/find_shaders.py`), 45 are stored byte-for-byte in the CPK archives, uncompressed, packed back
+to back (each model/package carries its own copies, so most appear dozens of times), and 36 in the
+executable image (`NIER_DUMP_IMAGE=1` writes it to `recomp/captures/image.bin`): D3D's utility shaders,
+post-processing and UI. Pixel shaders match exactly; vertex shaders differ only in their vertex fetch
+instructions, which D3D patches at runtime (`tools/shader_context.py` compares a capture with its stored
+copy). The archives also hold 1,175 CRILAYLA-compressed blocks (530 MB unpacked, `tools/crilayla.cpp`);
+no further shaders are in them. 16 shaders, mostly the main scene and character material shaders
+(`8263A851`, Nier's head `D461B875` and hair `8330682F`), are not stored as-is anywhere searched: their
+closest stored relatives differ like separate compiles (instructions shifted, registers renumbered),
+and the executable contains the Xbox 360 HLSL compiler's intrinsic tables and messages, though no HLSL
+source was found in the archives. So these are probably generated at runtime; how is not known yet.
+
+Load-time shader compilation (investigated, not done): the game copies blocks of shaders into
+physical memory while loading (`memcpy` from `sub_8255C260`, called from the game's loader around
+`sub_8211D2D0`; e.g. 0x1B00 bytes to `AB933400` at frame 1669, the store scene). In the block each
+shader's microcode follows a 64-byte table of float literals, with padding after; sizes are not
+stored next to them. No D3D shader object holds the microcode address: the encoded address (physical
+| stage, e.g. `0B933421`) appears only in `IM_LOAD` packets in the live ring buffer, a frame before
+use, so command buffers aren't recorded ahead of time and can't be scanned for upcoming shaders
+(`NIER_SCAN_IMLOAD=1` at a profiler exit lists the `IM_LOAD` packets in physical memory).
+Discovering shaders at load time therefore needs the game's package format (the loader knows the
+sizes). Compile cost per shader, measured on 111 captured shaders: FXC as used now 54 ms average /
+210 ms worst; with registers as separate variables instead of the `r[]` array and
+`D3DCOMPILE_SKIP_OPTIMIZATION` 21 / 75 ms; DXC (`-O0`, SM 6.0) 14.5 / 64 ms (the SDK's DXC lacks SPIR-V
+output). Debug switches added: `NIER_SCAN_U32=<hex>,...` (find 32-bit values in guest memory),
+`NIER_DUMP_RANGE=<address>,<bytes>` (both at a profiler exit), and the log names each shader's
+microcode address the first time it is loaded.
+
+Cheaper first-use compiles (both measured over the 60 fps route, fight profiled at frame 11000):
+registers are emitted as separate variables (`r0`, `r1`, ...) instead of an `r[]` array (written as
+`r[N]` during translation and rewritten at the end, so `NIER_PS_DEBUG` / `NIER_SHADER_PATCH`
+expressions still use `r[N]`), and FXC skips optimization (the flags are part of the cache key;
+`NIER_SHADER_OPTIMIZE=1` restores level 1 for comparison). Pipelines are now also created on worker
+threads (their own pool, since they wait for shader compiles), started by the GPU emulation when it
+first sees a shader/state combination (`RendererPreparePipeline`). On a first run (nothing cached,
+forced with `NIER_SHADER_SALT=1`, which makes bytecode neither cache has seen) the driver spends about
+4.2 s building ~114 pipelines (worst ~220 ms) over the route; the render thread now waits 1.5 s of that
+in total (optimized FXC: 2.1 s), and the fight runs at 58.6 fps. Warm: no waits, 59.9 fps. The stats
+dump reports shader-compile and pipeline waits on the render thread and total pipeline creation time.
+
 Fast route to the fight: `recomp/newgame_args.txt` (Start every 60 frames skips the logos and menus;
 A at the "Overwrite previously-saved system data?" prompt keeps the default No; Left, A answers Yes
 to "Set your name as Nier?"). The opening credits can't be skipped; the fight starts around frame

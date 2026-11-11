@@ -125,3 +125,5 @@ void GpuWriteResolvedPixels(const RendererResolve& resolve, const uint8_t* rgba,
 void RendererSaveFrame(uint64_t frame);   // save that frame's image to recomp/frames (any thread)
 // Starts compiling a newly translated guest shader in the background (any thread).
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader);
+// Starts creating the pipeline a draw will need, ahead of the render thread (any thread).
+void RendererPreparePipeline(const RendererDraw& draw);

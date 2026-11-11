@@ -1170,6 +1170,7 @@ namespace
                 gFrames.load(), hasColor, draw.rectList, draw.depthControl, r[0x2113], r[0x2114], draw.target.width, draw.target.height, draw.depth.edramBase,
                 draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], values.c_str());
         }
+        RendererPreparePipeline(draw);   // start creating a new pipeline now, ahead of the render thread
         gFrameCommands.emplace_back(std::move(draw));
     }
 
@@ -1322,7 +1323,14 @@ namespace
             uint32_t guest = PhysicalToGuest(addressType & ~3u);
             std::vector<uint32_t> words(startSize & 0xFFFF);
             for (size_t i = 0; i < words.size(); i++) words[i] = R32(guest + uint32_t(i) * 4);
-            StoreShader(addressType & 3, std::move(words));
+            const uint32_t stage = addressType & 3;
+            StoreShader(stage, std::move(words));
+            if (stage <= 1)
+            {
+                static std::set<uint64_t> logged;   // where each shader's microcode lives (debugging)
+                if (logged.insert(gShaders[stage].hash).second)
+                    Log("[gpu] %s shader %016llX microcode at %08X, %u dwords (frame %llu)\n", stage ? "pixel" : "vertex", gShaders[stage].hash, guest, startSize & 0xFFFF, gFrames.load());
+            }
             break;
         }
         case 0x2B:  // IM_LOAD_IMMEDIATE: shader microcode inside the packet
