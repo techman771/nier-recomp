@@ -1,0 +1,26 @@
+
+# Mid-function hooks (appended last by tools/make_config.ps1). Each calls a runtime function
+# with the listed guest registers by reference; see NOTES.md.
+
+# Options / pause menu builder (sub_8241A188), after its record loop and before the layout calls:
+# hides "Select Device" (no storage devices on PC). Runtime: xam.cpp.
+[[midasm_hook]]
+name = "HideSelectDeviceOption"
+address = 0x8241B7DC
+registers = ["r31"]
+
+# Save list (load / save screens; sub_82427978 refreshes it): the fourth cursor stop is the
+# "Select Device" row. Its enable byte (+8367) is set right before 0x824279B4; clearing it makes
+# the cursor skip the row (sub_824274E8 skips disabled stops).
+[[midasm_hook]]
+name = "DisableSelectDeviceRow"
+address = 0x824279B4
+registers = ["r30"]
+
+# ...and its label: 0x82427B20 chooses the row's text (r27 is the text element); jumping to the
+# branch that sets a string pointer (r31, r11 = the element's vtable) with an empty string blanks it.
+[[midasm_hook]]
+name = "BlankSelectDeviceRow"
+address = 0x82427B20
+registers = ["r11", "r27", "r31"]
+jump_address_on_true = 0x82427B7C

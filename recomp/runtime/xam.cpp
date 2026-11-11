@@ -99,6 +99,21 @@ GUEST_IMPORT(XMsgStartIORequestEx)
 GUEST_IMPORT(XMsgInProcessCall)
 {
     LogMessage("XMsgInProcessCall", ctx);
+    const uint32_t app = ctx.r3.u32, message = ctx.r4.u32, buffer = ctx.r5.u32;
+    if (app == 0xFA && buffer)   // XMP, the system music player
+    {
+        if (message == 0x7001B)   // XMPGetPlaybackController {client, controller*, locked*}
+        {
+            // 0 = the title controls playback (no user soundtrack). Left unwritten, CRI read stale
+            // memory as "the user is playing music" and muted the game's music category.
+            if (uint32_t controller = R32(buffer + 4)) W32(controller, 0);
+            if (uint32_t locked = R32(buffer + 8)) W32(locked, 0);
+        }
+        else if (message == 0x70009)   // XMPGetStatus {client, state*}: idle
+        {
+            if (uint32_t state = R32(buffer + 4)) W32(state, 0);
+        }
+    }
     ctx.r3.u64 = 0;
 }
 
@@ -117,7 +132,18 @@ namespace
     std::map<uint32_t, Enumerator> gEnumerators;
     uint32_t gNextEnumerator = 0xFA000001;
 
-    std::string SaveFolder() { return g_gameDir + "\\..\\save"; }
+    // NIER_SAVE_DIR points saves elsewhere (test runs use their own folder so they can't touch the
+    // user's playthrough saves); the default is save\ beside the game folder.
+    std::string SaveFolder()
+    {
+        static const std::string folder = [] {
+            char value[MAX_PATH];
+            std::string chosen = GetEnvironmentVariableA("NIER_SAVE_DIR", value, sizeof(value)) ? std::string(value) : g_gameDir + "\\..\\save";
+            Log("[xam] saves in %s\n", chosen.c_str());
+            return chosen;
+        }();
+        return folder;
+    }
 
     // Each package's XCONTENT_DATA is kept beside its folder so enumeration can return it unchanged.
     std::string MetadataPath(const std::string& package) { return SaveFolder() + "\\" + package + ".content"; }
@@ -165,7 +191,8 @@ GUEST_IMPORT(XamContentCreateEnumerator)
     {
         std::lock_guard lock(gEnumeratorMutex);
         handle = gNextEnumerator++;
-        Log("[xam] content enumerator: type %u device %u, %zu items\n", type, device, enumerator.items.size());
+        Log("[xam] content enumerator: type %u device %u, %zu items frame %llu by %s\n", type, device, enumerator.items.size(),
+            GpuFrameCount(), GuestCallChain(10).c_str());
         gEnumerators[handle] = std::move(enumerator);
     }
     if (bufferSizeOut) W32(bufferSizeOut, bufferSize);
@@ -216,7 +243,7 @@ GUEST_IMPORT(XamContentCreateEx)
 
     char name[43]{};
     memcpy(name, g_base + content + 0x108, 42);
-    const std::string saveFolder = g_gameDir + "\\..\\save";
+    const std::string saveFolder = SaveFolder();
     const std::string directory = saveFolder + "\\" + name;
     CreateDirectoryA(saveFolder.c_str(), nullptr);
 
@@ -238,7 +265,8 @@ GUEST_IMPORT(XamContentCreateEx)
         if (dispositionOut) W32(dispositionOut, exists ? kOpened : kCreated);
         if (licenseOut) W32(licenseOut, 0);
     }
-    Log("[xam] content %s root \"%s\" package \"%s\" flags 0x%X -> %u\n", exists ? "open" : "create", root.c_str(), name, flags, result);
+    Log("[xam] content %s root \"%s\" package \"%s\" flags 0x%X -> %u frame %llu by %s\n", exists ? "open" : "create", root.c_str(), name, flags,
+        result, GpuFrameCount(), GuestCallChain(10).c_str());
     CompleteOverlapped(overlapped, result, 0);
     ctx.r3.u64 = overlapped ? X_ERROR_IO_PENDING : result;
 }
@@ -493,4 +521,80 @@ GUEST_IMPORT(XamUserGetSigninInfo)
     W32(info + 0x0C, 1);
     memcpy(g_base + info + 0x18, kGamertag, sizeof(kGamertag));
     ctx.r3.u64 = 0;
+}
+
+// Storage messages (PC port): the title screen shows "Checking system data.", "Loading system data.
+// Please don't turn off your console.", "System data loaded." and, before the save list, "Checking
+// storage device. ..." through the system message box. Each holds the screen for an open animation,
+// a minimum time (1.0-1.3 s) and a close animation while the 128-byte read takes no time. The game's
+// message call (sub_8213BE50, a virtual method reached only through the indirect call table: r4 mode,
+// r5 message, f1 minimum seconds) is wrapped to drop those three messages; the box stays idle, so
+// the save code carries straight on. NIER_STORAGE_MESSAGES=1 keeps them.
+extern "C" PPC_FUNC(__imp__sub_8213BE50);
+namespace
+{
+    PPC_FUNC(ShowSaveMessage)
+    {
+        const uint32_t mode = ctx.r4.u32, message = ctx.r5.u32;
+        // 0: checking system data / storage device, 7: loading system data (timed, mode 2);
+        // 8: system data loaded (mode 0).
+        if ((mode == 2 && (message == 0 || message == 7)) || (mode == 0 && message == 8))
+        {
+            static std::atomic<int> logged{ 0 };
+            if (logged++ < 8) Log("[xam] skipped storage message %u (mode %u)\n", message, mode);
+            return;
+        }
+        __imp__sub_8213BE50(ctx, base);
+    }
+}
+
+void XamInstallHooks()
+{
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
+    PPC_LOOKUP_FUNC(g_base, 0x8213BE50) = ShowSaveMessage;
+}
+
+// "Select Device" in the options / pause menu (PC port: there's one storage device). The menu
+// builder sub_8241A188 fills 24 item records of 56 bytes at +3916 (+0 type, 0 = unused; +40 item
+// id; +44 label text id; +48 help text id), then lays them out. The layout walks the records in
+// order, so an emptied record would still be a (blank) stop. A mid-asm hook (nier_hooks.toml)
+// between the two removes the record labelled "Select Device": the later records move up one and
+// the last becomes what the builder's clearing loop leaves (item handlers go by item id, not by
+// position). Text ids come from the loaded text table ({id, string} pairs): 11100300 and 6731600
+// are "Select Device" (6740000 is Audio Output).
+void HideSelectDeviceOption(PPCRegister& r31)
+{
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
+    constexpr uint32_t kRecords = 3916, kRecordSize = 56, kRecordCount = 24;
+    const uint32_t first = r31.u32 + kRecords;
+    for (uint32_t i = 0; i < kRecordCount; i++)
+    {
+        const uint32_t record = first + i * kRecordSize;
+        const uint32_t label = R32(record + 44);
+        if (label != 11100300 && label != 6731600) continue;
+        static std::atomic<int> logged{ 0 };
+        if (logged++ < 4) Log("[xam] menu %08X: removed Select Device (record %u, item %u, type %u)\n", r31.u32, i, R32(record + 40), R8(record));
+        memmove(g_base + record, g_base + record + kRecordSize, (kRecordCount - 1 - i) * kRecordSize);
+        const uint32_t last = first + (kRecordCount - 1) * kRecordSize;
+        memset(g_base + last, 0, kRecordSize);
+        W32(last + 40, 0xFFFFFFFF);
+        W32(last + 52, 0xFFFFFFFF);
+        W32(r31.u32 + 5264, R32(r31.u32 + 5264) - 1);   // records in use (counted just before the hook)
+        i--;   // the next record is now at this position
+    }
+}
+
+// "Select Device" row on the save list (load and save screens): see nier_hooks.toml.
+void DisableSelectDeviceRow(PPCRegister& r30)
+{
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
+    W8(r30.u32 + 8367, 0);
+}
+
+bool BlankSelectDeviceRow(PPCRegister& r11, PPCRegister& r27, PPCRegister& r31)
+{
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return false;
+    r11.u64 = R32(r27.u32);   // the text element's vtable, as the branch expects
+    r31.u64 = 0x82046121;     // the NUL after "-----" in the image: an empty string
+    return true;
 }

@@ -34,9 +34,11 @@ void GpuRequestCapture();   // F12: log every draw of the next frame and save it
 void ProfilerInit();        // NIER_PROFILE=<frame>,<seconds>: sampling profile into the log
 void GpuResetFrameTiming(); // restart the frame time statistics (the profiler does at its start)
 void GpuInstallHooks();    // replaces indirect-call table entries (NIER_60FPS)
+void XamInstallHooks();    // replaces indirect-call table entries (skips the storage messages)
 void NoteGuestSwap();      // the game submitted a frame (for NIER_FIXED_TIME)
 uint64_t FixedElapsed100ns();   // NIER_FIXED_TIME's elapsed time
-void DumpGuestThreads();   // logs every guest thread's stack and last imports
+std::string GuestCallChain(int depth);   // current thread's guest call chain (debugging)
+void DumpGuestThreads();  // logs every guest thread's stack and last imports
 void WatchInit();
 void BreakInit();           // NIER_BREAK=<guest function>,<frame>: log registers when it runs           // NIER_WATCH_WRITE=<guest address>,<bytes>: log the guest code writing there
 void LogSetCaptureFile(FILE* file);   // also copy log output to this file (null to stop)

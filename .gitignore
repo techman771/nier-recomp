@@ -30,3 +30,5 @@
 *.ppm
 /recomp/captures/
 /recomp/shadercache/
+/save_backups/
+/recomp/test_save/

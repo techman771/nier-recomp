@@ -259,9 +259,11 @@ Xenia. With the texture coordinate and address mode fixes, close-ups match the r
 `NIER_SHADER_PATCH=<hash>|<find>|<replace>[;;...]` edits a translated shader's HLSL before compiling
 (e.g. zero a term to see what it contributes); the log lists each texture format's component swizzle.
 
-An intermittent crash was seen once at startup in the game's D3D setup (`sub_825A5FE8` writing guest
-address 0x10, called from `sub_825A5858` / `sub_825A7B60`); the next boots were fine. Not yet
-investigated.
+An intermittent crash was seen once, right after New Game (the log's last line was the open of
+`STAGE_SELECT.INI`): the main thread in the game's initialisation (`sub_825A5FE8` <- `sub_825A5858` <-
+`sub_825A7B60`, linked-list updates) wrote guest address 0x10, a null pointer plus 16. It did not recur
+in 12 boots and 5 New Game runs, so it is probably a rare thread-timing race in the kernel emulation.
+Not fixed; the crash handler logs the host and guest stacks if it happens again.
 
 Mipmaps follow Xenia's `GetGuestTextureLayout`: levels 1 and up start at the fetch constant's mip
 address (dword 5); each level's pitch and height come from the power-of-two base size shifted down
@@ -524,3 +526,88 @@ read pointer writeback, memory and scratch writes, fences, `WAIT_REG_MEM`, CP in
 - XMA decoding is unimplemented and `XMACreateContext` is still a stub, so XMA-encoded music will be
   silent. The title movie's audio doesn't need it.
 - Movie smoothness: see below.
+
+### Playtest issues
+
+Saves: the user's playthrough saves live in `save/` (backup in `save_backups/`). Test runs from
+`tools/run_boot.ps1` (anything but `-Playtest`) set `NIER_SAVE_DIR=recomp/test_save`, a fresh copy
+of `save/` made every run, so they can load the playthrough (Game 1) without writing to it. Test
+routes load Game 1 by default rather than start a new game, unless the user says otherwise.
+
+From the user's playthrough (open unless marked):
+- Blocky shadows.
+- PC settings in the menu (in-game menu or our own overlay; undecided).
+- Fixed (confirmed by the user): missing colour in the 3D scene (house grey, open world
+  washed out; HUD and 2D fine). The final composite (ps A386CE74148E6F9C) converts to HSV, adjusts,
+  and converts back inside a `setp_ne_push` branch. We translated the predicate push as
+  `a.w <test> && b.w == 0`; Xenia's ucode.h has `a.w == 0 && b.w <test>` (and the result uses the x
+  components the same way). With a = 0 the branch was never taken, leaving only the value channel.
+- Fixed: the storage messages at the title screen are skipped (see "Storage messages" below).
+- Fixed: "Select Device" removed from Options / pause Game Settings and the save list (see below).
+- Change "console" to "PC" in the remaining save texts ("Saving game data. Please don't turn off
+  your console." etc.). The English message table is in guest memory (keys `INFO_SYS_MES_*_SID`,
+  `INFO_WINDOW_SAVE_LOAD_*`, around 0x85803400 in one run); `NIER_SCAN_TEXT=<text>` (at a
+  `NIER_PROFILE` exit) finds strings as bytes or UTF-16.
+- Fixed: music silent after the intro; crash at frame 42445 (switch index); fullscreen option.
+
+### Storage messages
+
+The title screen showed "Checking system data.", "Loading system data. Please don't turn off your
+console.", "System data loaded." and, before the save list, "Checking storage device. Please don't
+turn off your console." (about 4.5 s in all). They go through the system message box at 0x826920F0
+(+4 type, +8 state, 0 = idle, +12 text, +16 seconds left; animated by sub_82184090): open
+animation, a minimum time (1.0 s, 1.3 s from the constant at 0x8200EA64), close animation, and the
+save state machines (sub_8213D208 check, sub_8213D488 load) wait for the box to go idle. The
+message call sub_8213BE50 (virtual, reached only through the indirect call table; r4 mode, r5
+message, f1 seconds) is wrapped in xam.cpp to drop messages 0 and 7 (mode 2) and 8 (mode 0); the
+box stays idle and the saves load at once (save list at frame ~800 instead of ~980 on the scripted
+route). `NIER_STORAGE_MESSAGES=1` keeps them. `NIER_POKE32=<address>=<value>,...` overwrites image
+words at load (experiments).
+
+### "Select Device" removed (PC port)
+
+Mid-asm hooks now exist: `recomp/config/nier_hooks.toml` (appended last by `make_config.ps1`,
+since `[[midasm_hook]]` tables would capture keys after them), implemented in xam.cpp.
+- Options / pause Game Settings: the builder sub_8241A188 fills 24 records of 56 bytes at +3916
+  (+0 type, 0 = unused; +40 item id; +44 label text id; +48 help text id), counts the used ones into
+  +5264, then lays them out. `HideSelectDeviceOption` (at 0x8241B7DC, between the two) removes the
+  record labelled "Select Device" (text 11100300 or 6731600): later records move up, the last is
+  cleared, the count drops by one. Emptying it in place left a blank, selectable stop.
+- Save list (load and save screens; refreshed by sub_82427978): the 4th cursor stop is the device
+  row. `DisableSelectDeviceRow` clears its enable byte (+8367; sub_824274E8 skips disabled stops)
+  and `BlankSelectDeviceRow` sets its label to an empty string. The row's underline still shows.
+- Text ids: the loaded text table is {id, string} pairs (e.g. around 0x85831000); 6740000 is Audio
+  Output, not Select Device. `NIER_STORAGE_MESSAGES=1` keeps all of this original.
+- Scripted route to the save list / Game 1 on the test saves: Start every 60 frames to 600, then
+  A at 760 (Continue), 880 (Game 1), 1000 (Yes). The pause menu opens by itself in unfocused test
+  runs. Title Options: Start to 600, Down at 760, A at 800, A at 900 (Game Settings); Up wraps to
+  the last item.
+
+### Jump-table switches index with 32 bits (fixed)
+
+Playtest crash at frame 42445 in sub_821DB288: access violation at a host address 16 GB from the
+code. The function bounds-checks its switch index with `cmplwi` (32-bit), but the generated
+`switch (ctx.r11.u64)` used all 64 bits. Its argument r4 was -28 with zero upper bits, so the index
+became 0x1_0000_004A, passed the guest check, and clang's jump table (no default range check) was
+read far out of bounds. The hardware forms the target from the low 32 bits (`rlwinm`), so
+XenonRecomp now emits `switch (rN.u32)`. All 248 tables changed; `tools/xenonrecomp-nier.patch`
+is updated.
+
+### Fullscreen
+
+Borderless fullscreen on the window's monitor: Alt+Enter or F11 toggles it, `NIER_FULLSCREEN=1`
+starts in it (the cursor is hidden over the game). `tools/run_boot.ps1 -Playtest` runs for the
+user: sound, primary monitor, fullscreen.
+
+### Music silent after the intro (fixed)
+
+Sound effects and voices played, but the game's music (CRI ADX stems streamed from
+`AUDIO/NIER_BGM.CPK` inside `layer1.cpk`, e.g. `Synth/000_tokyo_choir_cmp_wav.aax`) was silent.
+The stems were read and decoded at real-time rate, and the game set the layer AISAC controls
+(`layer00`..`layer03`, through sub_824E85F8) correctly; forcing all of them to 1.0 changed nothing.
+The cause was `XMsgInProcessCall` for the XMP app (0xFA), message 0x7001B
+(`XMPGetPlaybackController {client, controller*, locked*}`): the stub returned success without
+writing the outputs, so the game read stale memory as "the user's own soundtrack is playing" and
+muted its music. It now writes 0 to both (the title controls playback, as Xenia does), and
+`XMPGetStatus` (0x70009) reports idle. `NIER_AUDIO_DUMP=<frame>,<seconds>` records the mix to
+`captures/audio.wav` for checks like this.

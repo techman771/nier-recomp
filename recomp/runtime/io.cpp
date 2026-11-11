@@ -167,11 +167,25 @@ GUEST_IMPORT(NtReadFile)
     HandleEntry entry;
     if (!FileEntry(ctx.r3.u32, entry)) { ctx.r3.u64 = X_STATUS_INVALID_HANDLE; return; }
     uint32_t event = ctx.r4.u32, iosb = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offset = ctx.r10.u32;
+    {
+        static std::atomic<int> loggedApc{ 0 };   // completion callbacks (APC routine r5, context r6) (debugging)
+        if (ctx.r5.u32 && loggedApc++ < 6)
+            Log("[io] NtReadFile with APC routine %08X context %08X event %08X on %s\n", ctx.r5.u32, ctx.r6.u32, event, entry.path.c_str());
+    }
     if (offset)
     {
         LARGE_INTEGER position;
         position.QuadPart = int64_t(R64(offset));
         if (position.QuadPart >= 0) SetFilePointerEx(entry.host, position, nullptr, FILE_BEGIN);
+    }
+    // NIER_LOG_READS=1: logs every read (file, offset, length, frame) (debugging).
+    static const bool logReads = GetEnvironmentVariableA("NIER_LOG_READS", nullptr, 0) > 0;
+    if (logReads)
+    {
+        LARGE_INTEGER zero{}, at{};
+        SetFilePointerEx(entry.host, zero, &at, FILE_CURRENT);
+        const size_t slash = entry.path.find_last_of('\\');
+        Log("[read] %s offset 0x%llX length 0x%X frame %llu by%s\n", entry.path.c_str() + (slash == std::string::npos ? 0 : slash + 1), (unsigned long long)at.QuadPart, length, GpuFrameCount(), GuestCallChain(8).c_str());
     }
     DWORD done = 0;
     BOOL ok = ReadFile(entry.host, g_base + buffer, length, &done, nullptr);

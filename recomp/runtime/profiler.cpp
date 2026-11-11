@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -343,6 +344,37 @@ namespace
                     for (uint32_t w : wanted)
                         if (value == w) { Log("[scan] %08X holds %08X\n", uint32_t(at), w); found++; }
                 }
+            }
+        }
+        // NIER_SCAN_TEXT=<ascii>: logs guest addresses holding that text as bytes, UTF-16BE or UTF-16LE,
+        // with the surrounding text.
+        char text[128];
+        if (GetEnvironmentVariableA("NIER_SCAN_TEXT", text, sizeof(text)))
+        {
+            const size_t n = strlen(text);
+            std::string patterns[3] = { std::string(text), std::string(), std::string() };
+            for (size_t i = 0; i < n; i++) { patterns[1] += '\0'; patterns[1] += text[i]; patterns[2] += text[i]; patterns[2] += '\0'; }
+            const char* names[3] = { "bytes", "utf16be", "utf16le" };
+            MEMORY_BASIC_INFORMATION info{};
+            int found = 0;
+            for (uint64_t address = 0; address < 0x100000000ull && found < 80;)
+            {
+                if (!VirtualQuery(g_base + address, &info, sizeof(info)) || !info.RegionSize) break;
+                const uint64_t start = uint64_t(static_cast<uint8_t*>(info.BaseAddress) - g_base);
+                address = start + info.RegionSize;
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
+                if (info.State != MEM_COMMIT || !(info.Protect & readable) || (info.Protect & PAGE_GUARD)) continue;
+                const std::string_view region(reinterpret_cast<const char*>(g_base + start), size_t(info.RegionSize));
+                for (int p = 0; p < 3; p++)
+                    for (size_t at = region.find(patterns[p]); at != std::string_view::npos && found < 80; at = region.find(patterns[p], at + 1))
+                    {
+                        std::string context;
+                        const size_t from = at >= 64 ? at - 64 : 0;
+                        for (size_t i = from; i < at + patterns[p].size() + 96 && i < region.size(); i++)
+                            if (region[i] >= 32 && region[i] < 127) context += region[i]; else if (region[i] == 0) continue; else context += '.';
+                        Log("[scan] %08X %s: %s\n", uint32_t(start + at), names[p], context.c_str());
+                        found++;
+                    }
             }
         }
         if (exitAfter)

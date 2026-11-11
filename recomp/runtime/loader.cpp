@@ -120,6 +120,16 @@ uint32_t LoadGame(const std::string& gameDir)
         PPC_LOOKUP_FUNC(g_base, m->guest) = m->host;
     Log("mapped %zu functions, entry 0x%08zX\n", mapped, image.entry_point);
     GpuInstallHooks();
+    XamInstallHooks();
+    // NIER_POKE32=<address>=<value>,... (experiments): overwrites 32-bit words of the loaded image.
+    if (char pokes[256]; GetEnvironmentVariableA("NIER_POKE32", pokes, sizeof(pokes)))
+        for (char* item = strtok(pokes, ","); item; item = strtok(nullptr, ","))
+            if (char* equals = strchr(item, '='))
+            {
+                const uint32_t address = strtoul(item, nullptr, 16), value = strtoul(equals + 1, nullptr, 16);
+                Log("[poke] %08X: %08X -> %08X\n", address, R32(address), value);
+                W32(address, value);
+            }
 
     // ParseImage leaves non-thunk import slots holding their record in host byte order.
     auto* imports = reinterpret_cast<const Xex2ImportHeader*>(getOptHeaderPtr(file.data(), XEX_HEADER_IMPORT_LIBRARIES));

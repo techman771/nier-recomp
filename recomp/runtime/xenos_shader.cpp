@@ -335,11 +335,14 @@ float3 CubeDirection(float3 c)
             }
             else if (vectorOp >= 20 && vectorOp <= 23)
             {
-                // Predicate push: true when a.w passes the test and b.w is zero; otherwise counts up a.x.
+                // Predicate push (Xenia's ucode.h): p0 = a.w == 0 && (b.w passes the test); the result is 0
+                // when the same holds for the x components, otherwise a.x + 1 (counts up a nesting level).
+                // The test applies to b, not a: with a = 0 (the usual case) setp_ne_push sets p0 to b != 0.
                 static const char* kTests[] = { " == 0.0", " != 0.0", " > 0.0", " >= 0.0" };
+                const char* test = kTests[vectorOp - 20];
                 body += "        float4 a_ = " + Source(1, w) + "; float4 b_ = " + Source(2, w) + ";\n";
-                body += std::string("        bool c_ = a_.w") + kTests[vectorOp - 20] + " && b_.w == 0.0;\n";
-                body += "        float4 v_ = c_ ? (float4)0 : (a_.x + 1.0).xxxx;\n        p0 = c_;\n";
+                body += std::string("        bool c_ = a_.w == 0.0 && b_.w") + test + ";\n";
+                body += std::string("        float4 v_ = (a_.x == 0.0 && b_.x") + test + ") ? (float4)0 : (a_.x + 1.0).xxxx;\n        p0 = c_;\n";
             }
             else if (vectorOp >= 24 && vectorOp <= 27)
             {

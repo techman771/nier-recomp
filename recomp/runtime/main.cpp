@@ -341,6 +341,28 @@ namespace
 
 void DumpGuestThreads() { DumpAllThreads(); }
 
+// The current thread's guest call chain, innermost first (for debugging logs).
+std::string GuestCallChain(int depth)
+{
+    void* frames[64];
+    const USHORT count = RtlCaptureStackBackTrace(0, 64, frames, nullptr);
+    std::string chain;
+    uint32_t last = 0;
+    for (USHORT i = 0, shown = 0; i < count && shown < depth; i++)
+    {
+        const uint32_t guest = GuestFunctionFor(reinterpret_cast<uintptr_t>(frames[i]));
+        if (guest && guest != last)
+        {
+            char text[16];
+            snprintf(text, sizeof(text), " %08X", guest);
+            chain += text;
+            shown++;
+        }
+        last = guest;
+    }
+    return chain;
+}
+
 // NIER_BREAK=<guest function>,<from frame> (debugging): from that frame on, a hardware breakpoint on
 // the function's recompiled code in every guest thread logs the guest registers of its first few
 // calls. NIER_BREAK_DUMP=r5:192,r6:96 also dumps memory at those registers.
@@ -357,10 +379,13 @@ namespace
         info->ContextRecord->EFlags |= 0x10000;   // resume flag: run the instruction without re-breaking
         static const uint32_t minR3 = [] { char v[16]; return GetEnvironmentVariableA("NIER_BREAK_MIN_R3", v, sizeof(v)) ? uint32_t(strtoul(v, nullptr, 0)) : 0u; }();
         if (reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx)->r3.u32 < minR3) return EXCEPTION_CONTINUE_EXECUTION;   // NIER_BREAK_MIN_R3: only calls with r3 >= that
-        if (gBreakHits++ >= 3) return EXCEPTION_CONTINUE_EXECUTION;
+        static const char* setF1 = [] { static char v[32]; return GetEnvironmentVariableA("NIER_BREAK_SET_F1", v, sizeof(v)) ? v : nullptr; }();
+        if (setF1) reinterpret_cast<PPCContext*>(info->ContextRecord->Rcx)->f1.f64 = atof(setF1);   // NIER_BREAK_SET_F1: overrides f1 on every call (experiments)
+        static const int maxHits = [] { char v[16]; return GetEnvironmentVariableA("NIER_BREAK_MAX", v, sizeof(v)) ? atoi(v) : 3; }();
+        if (gBreakHits++ >= maxHits) return EXCEPTION_CONTINUE_EXECUTION;
         const PPCContext* ctx = reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx);
-        Log("[break] sub_%08X frame %llu: r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X lr=%08llX\n", gBreakGuest, GpuFrameCount(),
-            ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->lr);
+        Log("[break] sub_%08X frame %llu: r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X f1=%g f2=%g lr=%08llX\n", gBreakGuest, GpuFrameCount(),
+            ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->f1.f64, ctx->f2.f64, ctx->lr);
         char spec[128];
         if (GetEnvironmentVariableA("NIER_BREAK_DUMP", spec, sizeof(spec)))
             for (char* item = strtok(spec, ","); item; item = strtok(nullptr, ","))
@@ -377,6 +402,20 @@ namespace
                 if (!address || !VirtualQuery(g_base + address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT)
                 {
                     Log("[break]   r%d=%08X not readable\n", reg, address);
+                    continue;
+                }
+                if (colon && colon[1] == 's')   // r4:s prints the register as a guest string
+                {
+                    char text[160];
+                    size_t n = 0;
+                    for (; n + 1 < sizeof(text); n++)
+                    {
+                        const char c = char(R8(address + uint32_t(n)));
+                        if (!c) break;
+                        text[n] = (c >= 32 && c < 127) ? c : '?';
+                    }
+                    text[n] = 0;
+                    Log("[break]   r%d \"%s\"\n", reg, text);
                     continue;
                 }
                 std::string line;
@@ -412,7 +451,8 @@ namespace
             }
             ResumeThread(record.thread);
         }
-        Log("[break] armed on sub_%08X (host %p) in %zu threads\n", gBreakGuest, (void*)gBreakHost, copy.size());
+        static bool announced = false;
+        if (!announced && (announced = true)) Log("[break] armed on sub_%08X (host %p) in %zu threads\n", gBreakGuest, (void*)gBreakHost, copy.size());
     }
 }
 
@@ -432,7 +472,11 @@ void BreakInit()
     AddVectoredExceptionHandler(1, BreakHandler);
     std::thread([frame] {
         while (GpuFrameCount() < frame) Sleep(20);
-        ArmBreakpoint();
+        for (int i = 0;; i++)   // re-armed every second, so threads created later are covered too
+        {
+            ArmBreakpoint();
+            Sleep(1000);
+        }
     }).detach();
 }
 

@@ -7,6 +7,31 @@
 namespace
 {
     HWND gWindow = nullptr;
+    bool gFullscreen = false;
+    WINDOWPLACEMENT gWindowedPlacement{ sizeof(WINDOWPLACEMENT) };
+
+    // Borderless fullscreen on the monitor the window is on (no display mode change; the renderer
+    // letterboxes to the game's aspect ratio). Alt+Enter or F11 toggles it; NIER_FULLSCREEN=1 starts in it.
+    void SetFullscreen(bool on)
+    {
+        if (on == gFullscreen) return;
+        gFullscreen = on;
+        if (on)
+        {
+            GetWindowPlacement(gWindow, &gWindowedPlacement);
+            MONITORINFO info{ sizeof(info) };
+            GetMonitorInfoA(MonitorFromWindow(gWindow, MONITOR_DEFAULTTOPRIMARY), &info);
+            SetWindowLongA(gWindow, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(gWindow, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right - info.rcMonitor.left,
+                info.rcMonitor.bottom - info.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        }
+        else
+        {
+            SetWindowLongA(gWindow, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowPlacement(gWindow, &gWindowedPlacement);
+            SetWindowPos(gWindow, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+    }
 
     LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l)
     {
@@ -17,6 +42,16 @@ namespace
             return 0;
         case WM_KEYDOWN:
             if (w == VK_F12) GpuRequestCapture();   // capture the next frame for debugging
+            if (w == VK_F11) SetFullscreen(!gFullscreen);
+            return DefWindowProcA(window, message, w, l);
+        case WM_SYSKEYDOWN:
+            if (w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30))) { SetFullscreen(!gFullscreen); return 0; }   // Alt+Enter
+            return DefWindowProcA(window, message, w, l);
+        case WM_SYSCHAR:
+            if (w == VK_RETURN) return 0;   // no beep for Alt+Enter
+            return DefWindowProcA(window, message, w, l);
+        case WM_SETCURSOR:
+            if (gFullscreen && LOWORD(l) == HTCLIENT) { SetCursor(nullptr); return TRUE; }   // no cursor over the game in fullscreen
             return DefWindowProcA(window, message, w, l);
         case WM_CLOSE:
             fflush(stdout);
@@ -70,7 +105,14 @@ namespace
         gWindow = CreateWindowA("NierRecompWindow", "NieR (recompiled)", WS_OVERLAPPEDWINDOW, x, y, width, height,
             nullptr, nullptr, windowClass.hInstance, nullptr);
         RendererInit(gWindow, 1280, 720);
-        ShowWindow(gWindow, SW_SHOWNOACTIVATE);  // so test runs don't take keyboard focus
+        char fullscreen[8];
+        if (GetEnvironmentVariableA("NIER_FULLSCREEN", fullscreen, sizeof(fullscreen)) && fullscreen[0] == '1')
+        {
+            ShowWindow(gWindow, SW_SHOW);
+            SetFullscreen(true);
+            SetForegroundWindow(gWindow);
+        }
+        else ShowWindow(gWindow, SW_SHOWNOACTIVATE);  // so test runs don't take keyboard focus
 
         MSG message;
         while (GetMessageA(&message, nullptr, 0, 0) > 0)

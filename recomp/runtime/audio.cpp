@@ -8,6 +8,8 @@
 #include <audioclient.h>
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <utility>
 #include <thread>
 #include "guest.h"
 
@@ -173,11 +175,55 @@ GUEST_IMPORT(XAudioUnregisterRenderDriverClient)
     ctx.r3.u64 = 0;
 }
 
+// NIER_AUDIO_DUMP=<frame>,<seconds>: records the game's six-channel mix to captures/audio.wav from that
+// guest frame on (32-bit float, 48 kHz), to check the output without listening (debugging).
+namespace
+{
+    FILE* gDumpFile = nullptr;
+    uint64_t gDumpFrames = 0, gDumpLimit = 0;
+    bool gDumpDone = false;
+
+    void DumpAudio(uint32_t samples)
+    {
+        static const std::pair<uint64_t, double> setting = [] {
+            char value[64];
+            if (!GetEnvironmentVariableA("NIER_AUDIO_DUMP", value, sizeof(value))) return std::make_pair(~0ull, 0.0);
+            const char* comma = strchr(value, ',');
+            return std::make_pair(strtoull(value, nullptr, 10), comma ? atof(comma + 1) : 10.0);
+        }();
+        if (gDumpDone || GpuFrameCount() < setting.first) return;
+        if (!gDumpFile)
+        {
+            CreateDirectoryA("..\\captures", nullptr);
+            gDumpFile = fopen("..\\captures\\audio.wav", "wb");
+            if (!gDumpFile) { gDumpDone = true; return; }
+            gDumpLimit = uint64_t(setting.second * SAMPLE_RATE / SAMPLES_PER_FRAME);
+            uint8_t header[44] = {};
+            fwrite(header, 1, 44, gDumpFile);   // filled in when done
+            Log("[audio] recording the mix from frame %llu\n", GpuFrameCount());
+        }
+        float block[SAMPLES_PER_FRAME * CHANNELS];
+        for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++)
+            for (uint32_t c = 0; c < CHANNELS; c++) block[i * CHANNELS + c] = ReadFloat(samples + c * PLANE_BYTES + i * 4);
+        fwrite(block, sizeof(block), 1, gDumpFile);
+        if (++gDumpFrames < gDumpLimit) return;
+        const uint32_t dataBytes = uint32_t(gDumpFrames * sizeof(block));
+        struct { char riff[4]; uint32_t size; char wave[4]; char fmt[4]; uint32_t fmtSize; uint16_t format, channels; uint32_t rate, byteRate; uint16_t align, bits; char data[4]; uint32_t dataSize; } h{
+            { 'R','I','F','F' }, 36 + dataBytes, { 'W','A','V','E' }, { 'f','m','t',' ' }, 16, 3, CHANNELS, SAMPLE_RATE, SAMPLE_RATE * CHANNELS * 4, CHANNELS * 4, 32, { 'd','a','t','a' }, dataBytes };
+        fseek(gDumpFile, 0, SEEK_SET);
+        fwrite(&h, sizeof(h), 1, gDumpFile);
+        fclose(gDumpFile);
+        gDumpDone = true;
+        Log("[audio] recorded %.1f s to captures/audio.wav\n", double(gDumpFrames) * SAMPLES_PER_FRAME / SAMPLE_RATE);
+    }
+}
+
 // Samples arrive as six consecutive planes of 256 big-endian floats: FL, FR, FC, LFE, BL, BR.
 GUEST_IMPORT(XAudioSubmitRenderDriverFrame)
 {
     uint32_t samples = ctx.r4.u32;
     gFramesSubmitted++;
+    DumpAudio(samples);
 
     float left[SAMPLES_PER_FRAME], right[SAMPLES_PER_FRAME];
     for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++)

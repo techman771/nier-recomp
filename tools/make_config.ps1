@@ -6,4 +6,5 @@ if ($LASTEXITCODE -ne 0) { throw "jumptables failed: $LASTEXITCODE" }
 # Hand-checked bounds (nier_functions.manual.toml) go at the start of the generated functions list.
 $manual = Get-Content "$cfg\nier_functions.manual.toml" | Where-Object { $_ -match '^\s*\{' }
 $functions = foreach ($line in Get-Content "$cfg\nier_functions.snippet.toml") { $line; if ($line -match '^functions\s*=\s*\[') { $manual } }
-(Get-Content "$cfg\nier.base.toml") + $functions | Set-Content -Encoding ascii "$cfg\nier.toml"
+# Mid-function hooks (nier_hooks.toml) go last: [[midasm_hook]] tables would capture keys after them.
+(Get-Content "$cfg\nier.base.toml") + $functions + (Get-Content "$cfg\nier_hooks.toml") | Set-Content -Encoding ascii "$cfg\nier.toml"
