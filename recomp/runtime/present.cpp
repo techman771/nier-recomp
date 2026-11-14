@@ -3,6 +3,7 @@
 #include <thread>
 #include "guest.h"
 #include "renderer.h"
+#include "settings.h"
 
 namespace
 {
@@ -10,8 +11,11 @@ namespace
     bool gFullscreen = false;
     WINDOWPLACEMENT gWindowedPlacement{ sizeof(WINDOWPLACEMENT) };
 
+    constexpr UINT WM_SET_FULLSCREEN = WM_APP + 1;   // wParam: on
+
     // Borderless fullscreen on the monitor the window is on (no display mode change; the renderer
-    // letterboxes to the game's aspect ratio). Alt+Enter or F11 toggles it; NIER_FULLSCREEN=1 starts in it.
+    // letterboxes to the game's aspect ratio). The PC Settings page's Display Mode chooses it (saved in
+    // settings.ini; NIER_FULLSCREEN overrides); Alt+Enter or F11 toggles it and updates the setting.
     void SetFullscreen(bool on)
     {
         if (on == gFullscreen) return;
@@ -42,10 +46,16 @@ namespace
             return 0;
         case WM_KEYDOWN:
             if (w == VK_F12) GpuRequestCapture();   // capture the next frame for debugging
-            if (w == VK_F11) SetFullscreen(!gFullscreen);
+            if (w == VK_F11) { SetFullscreen(!gFullscreen); Settings().borderless = gFullscreen; SettingsSave(); }
             return DefWindowProcA(window, message, w, l);
         case WM_SYSKEYDOWN:
-            if (w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30))) { SetFullscreen(!gFullscreen); return 0; }   // Alt+Enter
+            if (w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))   // Alt+Enter
+            {
+                SetFullscreen(!gFullscreen);
+                Settings().borderless = gFullscreen;
+                SettingsSave();
+                return 0;
+            }
             return DefWindowProcA(window, message, w, l);
         case WM_SYSCHAR:
             if (w == VK_RETURN) return 0;   // no beep for Alt+Enter
@@ -53,6 +63,9 @@ namespace
         case WM_SETCURSOR:
             if (gFullscreen && LOWORD(l) == HTCLIENT) { SetCursor(nullptr); return TRUE; }   // no cursor over the game in fullscreen
             return DefWindowProcA(window, message, w, l);
+        case WM_SET_FULLSCREEN:
+            SetFullscreen(w != 0);
+            return 0;
         case WM_CLOSE:
             fflush(stdout);
             TerminateProcess(GetCurrentProcess(), 0);
@@ -106,13 +119,23 @@ namespace
             nullptr, nullptr, windowClass.hInstance, nullptr);
         RendererInit(gWindow, 1280, 720);
         char fullscreen[8];
-        if (GetEnvironmentVariableA("NIER_FULLSCREEN", fullscreen, sizeof(fullscreen)) && fullscreen[0] == '1')
+        const bool testRun = GetEnvironmentVariableA("NIER_FULLSCREEN", fullscreen, sizeof(fullscreen)) && fullscreen[0] == '0';
+        if (testRun) ShowWindow(gWindow, SW_SHOWNOACTIVATE);   // test runs (NIER_FULLSCREEN=0) don't take keyboard focus
+        else
         {
             ShowWindow(gWindow, SW_SHOW);
-            SetFullscreen(true);
+            if (Settings().borderless) SetFullscreen(true);
+            // A process started from the background may not take the foreground, and without focus
+            // Mute in Background would keep it silent (a controller still works). Windows lets a
+            // process that just received input take it, so press and release Alt first.
+            INPUT alt[2] = {};
+            alt[0].type = alt[1].type = INPUT_KEYBOARD;
+            alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
+            alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, alt, sizeof(INPUT));
             SetForegroundWindow(gWindow);
+            if (GetForegroundWindow() != gWindow) Log("[present] couldn't take the foreground; click the window for keyboard and sound\n");
         }
-        else ShowWindow(gWindow, SW_SHOWNOACTIVATE);  // so test runs don't take keyboard focus
 
         MSG message;
         while (GetMessageA(&message, nullptr, 0, 0) > 0)
@@ -121,6 +144,11 @@ namespace
             DispatchMessageA(&message);
         }
     }
+}
+
+void PresenterSetFullscreen(bool on)
+{
+    if (gWindow) PostMessageA(gWindow, WM_SET_FULLSCREEN, on ? 1 : 0, 0);
 }
 
 bool PresenterHasFocus() { return gWindow && GetForegroundWindow() == gWindow; }

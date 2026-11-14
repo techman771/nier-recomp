@@ -1,8 +1,18 @@
 # Runs nier.exe with a time limit, writing output to recomp/boot.log. Usage: run_boot.ps1 [seconds] [-Trace]
-param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest)
-# -Playtest: a run for the user to play (sound, primary monitor, borderless fullscreen).
-if ($Playtest) { $Sound = $true; $env:NIER_FULLSCREEN = '1'; Remove-Item Env:NIER_MONITOR -ErrorAction SilentlyContinue } else { Remove-Item Env:NIER_FULLSCREEN -ErrorAction SilentlyContinue }
-if ($Fps30) { Remove-Item Env:NIER_60FPS -ErrorAction SilentlyContinue } else { $env:NIER_60FPS = '1' }   # 60 fps unless -Fps30 (the original's 30 fps cap)
+param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest, [int]$SaveSlot = 0)
+# -Playtest: a run for the user to play: sound, primary monitor, and the user's own settings.ini
+# (display mode, frame rate etc. from Options > Game Settings > PC Settings). Test runs instead use
+# recomp\test_settings.ini, stay windowed and unfocused (NIER_FULLSCREEN=0), and run at 60 fps
+# unless -Fps30.
+Remove-Item Env:NIER_60FPS, Env:NIER_30FPS -ErrorAction SilentlyContinue
+if ($Playtest) {
+    $Sound = $true
+    Remove-Item Env:NIER_MONITOR, Env:NIER_FULLSCREEN, Env:NIER_SETTINGS_FILE -ErrorAction SilentlyContinue
+} else {
+    $env:NIER_FULLSCREEN = '0'
+    $env:NIER_SETTINGS_FILE = Join-Path (Split-Path $PSScriptRoot -Parent) 'recomp\test_settings.ini'
+    if ($Fps30) { $env:NIER_30FPS = '1' } else { $env:NIER_60FPS = '1' }
+}
 if (-not $env:NIER_PLAYER_NAME) { $env:NIER_PLAYER_NAME = 'Nier' }   # skips the name window
 if (-not $Playtest -and -not $env:NIER_MONITOR) { $env:NIER_MONITOR = 'secondary' }      # keeps test windows off the main screen
 if ($Sound) { Remove-Item Env:NIER_MUTE -ErrorAction SilentlyContinue } else { $env:NIER_MUTE = '1' }   # test runs stay silent
@@ -16,6 +26,11 @@ if ($Playtest) { Remove-Item Env:NIER_SAVE_DIR -ErrorAction SilentlyContinue } e
     $testSave = Join-Path $root 'recomp\test_save'
     if (Test-Path $testSave) { Remove-Item -Recurse -Force $testSave }
     Copy-Item -Recurse (Join-Path $root 'save') $testSave
+    # -SaveSlot N (1-3) keeps only that game save in the copy, so the load list's cursor can only be
+    # on it (scripted routes: Continue, A to select, A to confirm).
+    if ($SaveSlot -gt 0) {
+        Get-ChildItem $testSave -Filter 'GAME_DATA*' | Where-Object { $_.Name -notmatch "^GAME_DATA$($SaveSlot - 1)(\.content)?$" } | Remove-Item -Recurse -Force
+    }
     $env:NIER_SAVE_DIR = $testSave
 }
 $exe = Join-Path $root 'recomp\build\nier.exe'

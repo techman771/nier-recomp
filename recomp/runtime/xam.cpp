@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include "guest.h"
+#include "dlc.h"
 
 namespace
 {
@@ -179,12 +180,24 @@ namespace
     }
 }
 
+namespace
+{
+    // Saves plus, for marketplace content (type 2), the user's DLC packages (dlc.cpp).
+    std::vector<std::array<uint8_t, kContentDataBytes>> ListContentAndDlc(uint32_t type)
+    {
+        auto items = ListContent(type);
+        if (type == 0 || type == 2)
+            for (const auto& item : DlcList()) items.push_back(item);
+        return items;
+    }
+}
+
 GUEST_IMPORT(XamContentCreateEnumerator)
 {
     const uint32_t device = ctx.r4.u32, type = ctx.r5.u32, itemsPerCall = ctx.r7.u32;
     const uint32_t bufferSizeOut = ctx.r8.u32, handleOut = ctx.r9.u32;
     Enumerator enumerator;
-    if (device == 0 || device == 1) enumerator.items = ListContent(type);
+    if (device == 0 || device == 1) enumerator.items = ListContentAndDlc(type);
     enumerator.itemsPerCall = itemsPerCall ? itemsPerCall : 1;
     const uint32_t bufferSize = enumerator.itemsPerCall * kContentDataBytes;
     uint32_t handle;
@@ -243,6 +256,19 @@ GUEST_IMPORT(XamContentCreateEx)
 
     char name[43]{};
     memcpy(name, g_base + content + 0x108, 42);
+
+    // Downloadable content: served read-only from the unpacked package, licensed.
+    if (std::string dlcDirectory; R32(content + 4) == 2 && DlcMount(name, dlcDirectory))
+    {
+        SaveRootRegister(root, dlcDirectory);
+        if (dispositionOut) W32(dispositionOut, kOpened);
+        if (licenseOut) W32(licenseOut, 0xFFFFFFFF);
+        Log("[xam] content open root \"%s\" DLC \"%s\" frame %llu by %s\n", root.c_str(), name, GpuFrameCount(), GuestCallChain(10).c_str());
+        CompleteOverlapped(overlapped, 0, 0);
+        ctx.r3.u64 = overlapped ? X_ERROR_IO_PENDING : 0;
+        return;
+    }
+
     const std::string saveFolder = SaveFolder();
     const std::string directory = saveFolder + "\\" + name;
     CreateDirectoryA(saveFolder.c_str(), nullptr);
@@ -552,36 +578,6 @@ void XamInstallHooks()
 {
     if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
     PPC_LOOKUP_FUNC(g_base, 0x8213BE50) = ShowSaveMessage;
-}
-
-// "Select Device" in the options / pause menu (PC port: there's one storage device). The menu
-// builder sub_8241A188 fills 24 item records of 56 bytes at +3916 (+0 type, 0 = unused; +40 item
-// id; +44 label text id; +48 help text id), then lays them out. The layout walks the records in
-// order, so an emptied record would still be a (blank) stop. A mid-asm hook (nier_hooks.toml)
-// between the two removes the record labelled "Select Device": the later records move up one and
-// the last becomes what the builder's clearing loop leaves (item handlers go by item id, not by
-// position). Text ids come from the loaded text table ({id, string} pairs): 11100300 and 6731600
-// are "Select Device" (6740000 is Audio Output).
-void HideSelectDeviceOption(PPCRegister& r31)
-{
-    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
-    constexpr uint32_t kRecords = 3916, kRecordSize = 56, kRecordCount = 24;
-    const uint32_t first = r31.u32 + kRecords;
-    for (uint32_t i = 0; i < kRecordCount; i++)
-    {
-        const uint32_t record = first + i * kRecordSize;
-        const uint32_t label = R32(record + 44);
-        if (label != 11100300 && label != 6731600) continue;
-        static std::atomic<int> logged{ 0 };
-        if (logged++ < 4) Log("[xam] menu %08X: removed Select Device (record %u, item %u, type %u)\n", r31.u32, i, R32(record + 40), R8(record));
-        memmove(g_base + record, g_base + record + kRecordSize, (kRecordCount - 1 - i) * kRecordSize);
-        const uint32_t last = first + (kRecordCount - 1) * kRecordSize;
-        memset(g_base + last, 0, kRecordSize);
-        W32(last + 40, 0xFFFFFFFF);
-        W32(last + 52, 0xFFFFFFFF);
-        W32(r31.u32 + 5264, R32(r31.u32 + 5264) - 1);   // records in use (counted just before the hook)
-        i--;   // the next record is now at this position
-    }
 }
 
 // "Select Device" row on the save list (load and save screens): see nier_hooks.toml.

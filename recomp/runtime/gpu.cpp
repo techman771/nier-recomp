@@ -16,6 +16,8 @@
 #include <vector>
 #include "guest.h"
 #include "renderer.h"
+#include "settings.h"
+#include "glyphs.h"
 #include "xenos_shader.h"
 #include <xxHash/xxhash.h>   // texture content hashes (xxhash.lib is linked already)
 
@@ -607,7 +609,7 @@ namespace
         binding.scale[0] = float(t.width) / float(widthBlocks * blockSize);
         binding.scale[1] = float(t.height) / float(heightBlocks * blockSize);
         auto found = gDecodedTextures.find(key);
-        if (found != gDecodedTextures.end() && found->second->contentHash == content) return found->second;
+        if (found != gDecodedTextures.end() && found->second->contentHash == content) return GlyphAtlasFor(found->second, t.format, t.width, t.height);
 
         auto decoded = std::make_shared<DecodedTexture>();
         decoded->key = key;
@@ -698,7 +700,7 @@ namespace
             }
         }
         gDecodedTextures[key] = decoded;
-        return decoded;
+        return GlyphAtlasFor(decoded, t.format, t.width, t.height);   // button icons for the device in use
     }
 
     // EDRAM records no surface height, so a surface extends over all the tiles (80x16 samples each,
@@ -1019,6 +1021,17 @@ namespace
                 if (logged++ < 2) Log("[gpu] one-row texture slot %u dimension %u format %u width %u: mag filter %u min filter %u mip filter %u, dword3 %08X\n", slot, t.dimension, t.format, t.width, (c[3] >> 19) & 3, (c[3] >> 21) & 3, (c[3] >> 23) & 3, c[3]);
             }
             binding.baseOnly = ((c[3] >> 23) & 3) == 2;   // mip filter: base map only
+            // Exponent adjust (signed, 6 bits): the hardware multiplies sampled values by 2^n. The
+            // soft-particle mist reads its depth texture through it; ignored, the depth compare was
+            // off by that factor and the mist covered everything.
+            const int expAdjust = int32_t(c[3] << 13) >> 26;
+            binding.expScale = std::ldexp(1.0f, expAdjust);
+            if (expAdjust)
+            {
+                static std::set<uint32_t> seenExp;
+                if (seenExp.size() < 16 && seenExp.insert(t.format << 8 | uint32_t(expAdjust & 0x3F)).second)
+                    Log("[gpu] texture format %u (%ux%u) uses exponent adjust %d\n", t.format, t.width, t.height, expAdjust);
+            }
             // Sign modes belong to the texture's components; the view's swizzle has already moved them.
             const uint32_t signs = (c[0] >> 2) & 0xFF;
             binding.sign = 0;
@@ -1102,7 +1115,8 @@ namespace
                     fwrite(draw.constants.data(), 4, draw.constants.size(), file);
                     if (draw.textures[16].decoded) fwrite(draw.textures[16].decoded->data.data(), 1, draw.textures[16].decoded->data.size(), file);
                     fclose(file);
-                    Log("[gpu] dumped draw to %s (frame %llu, t16 fetch constant dword 0 %08X)\n", path, gFrames.load(), gRegisters[REG_FETCH_CONSTANTS + 16 * 6]);
+                    Log("[gpu] dumped draw to %s (frame %llu, t16 fetch constant dword 0 %08X, vertex fetch 95 %08X %08X)\n", path, gFrames.load(),
+                        gRegisters[REG_FETCH_CONSTANTS + 16 * 6], gRegisters[REG_FETCH_CONSTANTS + 95 * 2], gRegisters[REG_FETCH_CONSTANTS + 95 * 2 + 1]);
                 }
             }
         }
@@ -1146,6 +1160,25 @@ namespace
         draw.scissor[3] = clampTo((int((bottomRight >> 16) & 0x3FFF) + scissorShiftY) * int(scale), draw.target.height);
 
         gSubmittedDraws++;
+        // Colour clears done as depth fills: D3D clears a colour surface by drawing a depth-only
+        // rectangle (always pass, depth write) through a depth surface at the SAME EDRAM base, which
+        // overwrites the colour pixels with the 24.8 value. Colour and depth are separate host
+        // surfaces here, so the colour target with that base is cleared explicitly. Without this the
+        // half-resolution particle layer was never wiped and the village mist piled up frame on frame.
+        if (!hasColor && draw.rectList && (draw.depthControl & 0x76) == 0x76 && (r[0x2002] & 0xFFF) == (r[0x2001] & 0xFFF) && draw.vertexData.size() >= 12)
+        {
+            const float z = std::clamp(reinterpret_cast<const float*>(draw.vertexData.data())[2], 0.0f, 1.0f);
+            const uint32_t stencil = (draw.depthControl & 1) ? (draw.stencilRefMask & 0xFF) : 0;
+            RendererResolve clear;
+            clear.source = draw.depth;      // same base and width as the colour surface
+            clear.copyColor = false;
+            clear.clearColor = true;
+            clear.colorClear = (uint32_t(z * 16777215.0f) << 8) | stencil;   // read as 0xAARRGGBB
+            static std::set<uint64_t> logged;
+            if (logged.size() < 8 && logged.insert(uint64_t(clear.source.edramBase) << 32 | clear.source.width).second)
+                Log("[gpu] depth-fill colour clear: base %X width %u value %08X\n", clear.source.edramBase, clear.source.width, clear.colorClear);
+            gFrameCommands.emplace_back(std::move(clear));
+        }
         // Debugging: vertex data and state of depth-only and rect draws in the logged frame.
         if (gFrames.load() == gLogDrawsAt)
         {
@@ -1537,7 +1570,7 @@ void GpuResetFrameTiming()
     gWaitStats.clear();
 }
 
-// 60 fps (NIER_60FPS=1): D3D queues each flip from the swap interrupt (sub_8257A4B0, reached only
+// 60 fps (the PC Settings page's Frame Rate; NIER_60FPS / NIER_30FPS override): D3D queues each flip from the swap interrupt (sub_8257A4B0, reached only
 // through the indirect call table). Its swap word carries the present interval in bits 8-11 (2 in
 // 3D scenes: 30 fps); the flip may happen that many vblanks after the previous one, and the GPU waits
 // for it. An interval of 1 lets 3D scenes present every vblank, like the Series X's FPS Boost.
@@ -1548,19 +1581,19 @@ namespace
     {
         const uint32_t word = ctx.r3.u32, interval = (word >> 8) & 0xF;
         static std::atomic<int> logged{ 0 };
-        if (interval > 1 && logged++ == 0) Log("[gpu] 60 fps: present interval %u lowered to 1\n", interval);
-        if (interval > 1) ctx.r3.u64 = (word & ~0xF00u) | 0x100u;
+        if (interval > 1 && Settings().frameRate60)
+        {
+            if (logged++ == 0) Log("[gpu] 60 fps: present interval %u lowered to 1\n", interval);
+            ctx.r3.u64 = (word & ~0xF00u) | 0x100u;
+        }
         __imp__sub_8257A4B0(ctx, base);
     }
 }
 
 void GpuInstallHooks()
 {
-    if (GetEnvironmentVariableA("NIER_60FPS", nullptr, 0) > 0)
-    {
-        PPC_LOOKUP_FUNC(g_base, 0x8257A4B0) = QueueFlipEveryVblank;
-        Log("[gpu] NIER_60FPS: flips may happen every vblank\n");
-    }
+    PPC_LOOKUP_FUNC(g_base, 0x8257A4B0) = QueueFlipEveryVblank;   // checks the Frame Rate setting on every flip
+    Log("[gpu] frame rate: %s\n", Settings().frameRate60 ? "60 fps" : "30 fps cap");
 }
 
 void GpuDumpStats()

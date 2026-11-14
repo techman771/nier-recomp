@@ -53,6 +53,7 @@ struct TextureBinding
     bool baseOnly = false;                     // the fetch constant's mip filter says base map only
     float scale[2] = { 1.0f, 1.0f };
     uint32_t sign = 0;   // 2-bit sign mode per output component, bit 8: 8-bit host data (two's complement applies)
+    float expScale = 1.0f;   // 2^exp_adjust from the fetch constant (dword 3 bits 13-18): scales every sampled value
 };
 
 struct RenderTargetKey

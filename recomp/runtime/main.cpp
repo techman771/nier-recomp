@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include "guest.h"
+#include "settings.h"
 
 namespace
 {
@@ -180,11 +181,12 @@ namespace
     std::vector<uint8_t*> gWatchPages;   // host addresses of the watched page in each window
     thread_local bool tWatchStepping = false;
     std::map<std::string, int> gWatchSeen;
+    bool gWatchReads = false;   // NIER_WATCH_READ: the page is inaccessible, so reads fault too
 
     void ProtectWatch(bool on)
     {
         DWORD old;
-        for (uint8_t* page : gWatchPages) VirtualProtect(page, 4096, on ? PAGE_READONLY : PAGE_READWRITE, &old);
+        for (uint8_t* page : gWatchPages) VirtualProtect(page, 4096, on ? (gWatchReads ? PAGE_NOACCESS : PAGE_READONLY) : PAGE_READWRITE, &old);
     }
 
     LONG WINAPI WatchHandler(EXCEPTION_POINTERS* info)
@@ -196,8 +198,10 @@ namespace
             ProtectWatch(true);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || info->ExceptionRecord->ExceptionInformation[0] != 1)
+        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2)
             return EXCEPTION_CONTINUE_SEARCH;
+        const bool isWrite = info->ExceptionRecord->ExceptionInformation[0] == 1;
+        if (!isWrite && !gWatchReads) return EXCEPTION_CONTINUE_SEARCH;
         const uint8_t* fault = reinterpret_cast<const uint8_t*>(info->ExceptionRecord->ExceptionInformation[1]);
         bool ours = false;
         for (uint8_t* page : gWatchPages) ours = ours || (fault >= page && fault < page + 4096);
@@ -235,7 +239,7 @@ namespace
             }
             if (gWatchSeen[chain + " @" + std::to_string((offset - start) / 64)]++ < 3)   // per writer and 64-byte block
             {
-                Log("[watch] write to %08X (+%u) by%s (frame %llu)\n", guest, offset - start, chain.c_str(), GpuFrameCount());
+                Log("[watch] %s %08X (+%u) by%s (frame %llu)\n", isWrite ? "write to" : "read of", guest, offset - start, chain.c_str(), GpuFrameCount());
                 if (PPCContext* ctx = CurrentContext())
                     Log("[watch]   r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r31=%08X lr=%08llX\n",
                         ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->r9.u32, ctx->r10.u32, ctx->r11.u32, ctx->r31.u32, ctx->lr);
@@ -248,10 +252,20 @@ namespace
     }
 }
 
+// NIER_WATCH_READ=<guest address>,<bytes>,<from frame>: the same for reads and writes; the page is
+// made inaccessible only from that frame on (a file read into a protected page would fail).
 void WatchInit()
 {
     char value[64];
-    if (!GetEnvironmentVariableA("NIER_WATCH_WRITE", value, sizeof(value))) return;
+    uint64_t armFrame = 0;
+    if (GetEnvironmentVariableA("NIER_WATCH_READ", value, sizeof(value)))
+    {
+        gWatchReads = true;
+        const char* second = strchr(value, ',');
+        const char* third = second ? strchr(second + 1, ',') : nullptr;
+        armFrame = third ? strtoull(third + 1, nullptr, 10) : 0;
+    }
+    else if (!GetEnvironmentVariableA("NIER_WATCH_WRITE", value, sizeof(value))) return;
     gWatchStart = strtoul(value, nullptr, 16);
     const char* comma = strchr(value, ',');
     gWatchBytes = comma ? strtoul(comma + 1, nullptr, 0) : 16;
@@ -260,8 +274,9 @@ void WatchInit()
         for (uint32_t window : { 0xA0000000u, 0xC0000000u }) gWatchPages.push_back(g_base + window + page);   // they share storage
     else gWatchPages.push_back(g_base + (gWatchStart & ~0xFFFu));
     AddVectoredExceptionHandler(1, WatchHandler);
-    ProtectWatch(true);
-    Log("[watch] watching writes to %08X, %u bytes\n", gWatchStart, gWatchBytes);
+    if (armFrame == 0) ProtectWatch(true);
+    else std::thread([armFrame] { while (GpuFrameCount() < armFrame) Sleep(5); ProtectWatch(true); }).detach();
+    Log("[watch] watching %s %08X, %u bytes\n", gWatchReads ? "reads and writes of" : "writes to", gWatchStart, gWatchBytes);
 }
 
 namespace
@@ -381,6 +396,29 @@ namespace
         if (reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx)->r3.u32 < minR3) return EXCEPTION_CONTINUE_EXECUTION;   // NIER_BREAK_MIN_R3: only calls with r3 >= that
         static const char* setF1 = [] { static char v[32]; return GetEnvironmentVariableA("NIER_BREAK_SET_F1", v, sizeof(v)) ? v : nullptr; }();
         if (setF1) reinterpret_cast<PPCContext*>(info->ContextRecord->Rcx)->f1.f64 = atof(setF1);   // NIER_BREAK_SET_F1: overrides f1 on every call (experiments)
+        // NIER_BREAK_IF=<offset>:<hex value> limits everything below to calls where the word at
+        // *(r3+offset) equals the value; NIER_BREAK_W8=<offset>:<value> then writes a byte at
+        // r3+offset on every such call (experiments: e.g. switch one kind of object off).
+        static const char* onlyIf = [] { static char v[48]; return GetEnvironmentVariableA("NIER_BREAK_IF", v, sizeof(v)) ? v : nullptr; }();
+        static const char* write8 = [] { static char v[48]; return GetEnvironmentVariableA("NIER_BREAK_W8", v, sizeof(v)) ? v : nullptr; }();
+        if (onlyIf || write8)
+        {
+            const uint32_t object = reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx)->r3.u32;
+            MEMORY_BASIC_INFORMATION memory{};
+            if (!object || !VirtualQuery(g_base + object, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return EXCEPTION_CONTINUE_EXECUTION;
+            if (onlyIf)
+            {
+                const uint32_t pointer = R32(object + strtoul(onlyIf, nullptr, 0));
+                const char* colon = strchr(onlyIf, ':');
+                if (!pointer || !VirtualQuery(g_base + pointer, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return EXCEPTION_CONTINUE_EXECUTION;
+                if (R32(pointer) != (colon ? strtoul(colon + 1, nullptr, 16) : 0)) return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if (write8)
+            {
+                const char* colon = strchr(write8, ':');
+                W8(object + strtoul(write8, nullptr, 0), uint8_t(colon ? strtoul(colon + 1, nullptr, 0) : 0));
+            }
+        }
         static const int maxHits = [] { char v[16]; return GetEnvironmentVariableA("NIER_BREAK_MAX", v, sizeof(v)) ? atoi(v) : 3; }();
         if (gBreakHits++ >= maxHits) return EXCEPTION_CONTINUE_EXECUTION;
         const PPCContext* ctx = reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx);
@@ -403,6 +441,19 @@ namespace
                 {
                     Log("[break]   r%d=%08X not readable\n", reg, address);
                     continue;
+                }
+                // rN@offset:bytes follows the pointer stored at rN+offset (e.g. r3@36:128).
+                const char* at = strchr(item, '@');
+                const uint32_t pointerOffset = at ? strtoul(at + 1, nullptr, 0) : 0;
+                if (at)
+                {
+                    address = R32(address + pointerOffset);
+                    if (!address || !VirtualQuery(g_base + address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT)
+                    {
+                        Log("[break]   r%d@%u=%08X not readable\n", reg, pointerOffset, address);
+                        continue;
+                    }
+                    Log("[break]   r%d@%u -> %08X\n", reg, pointerOffset, address);
                 }
                 if (colon && colon[1] == 's')   // r4:s prints the register as a guest string
                 {
@@ -503,6 +554,7 @@ int main(int argc, char** argv)
     InstallCrashHandler();
     MemoryInit();
     ThreadsInit();
+    SettingsLoad();
     PresenterInit();
     BuildFunctionIndex();
     uint32_t entry = LoadGame(gameDir);

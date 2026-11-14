@@ -12,6 +12,7 @@
 #include <utility>
 #include <thread>
 #include "guest.h"
+#include "settings.h"
 
 namespace
 {
@@ -244,17 +245,47 @@ GUEST_IMPORT(XAudioSubmitRenderDriverFrame)
         gMeasuredSamples++;
     }
 
+    // PC Settings: master volume, and silence in the background. The gain moves a little per sample
+    // so changes don't click.
+    static float gain = 1.0f;
+    SettingsPollPage();   // so Master Volume is heard while it's adjusted
+    const PcSettings& settings = Settings();
+    const bool focused = PresenterHasFocus();
+    const float target = (settings.muteInBackground && !focused) ? 0.0f : settings.masterVolume / 10.0f;
+    float out[SAMPLES_PER_FRAME * 2];
+    double outSquares = 0, inSquares = 0;
+    for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++)
+    {
+        gain += (target - gain) * 0.002f;
+        out[i * 2] = left[i] * gain;
+        out[i * 2 + 1] = right[i] * gain;
+        outSquares += double(out[i * 2]) * out[i * 2];
+        inSquares += double(left[i]) * left[i];
+    }
+
+    // NIER_AUDIO_LEVELS=1: the mix and output level about every 5 s, with what decides the gain.
+    static const bool logLevels = GetEnvironmentVariableA("NIER_AUDIO_LEVELS", nullptr, 0) > 0;
+    static double levelIn = 0, levelOut = 0;
+    static uint32_t levelFrames = 0;
+    if (logLevels)
+    {
+        levelIn += inSquares; levelOut += outSquares;
+        if (++levelFrames == 5 * SAMPLE_RATE / SAMPLES_PER_FRAME)
+        {
+            const double n = double(levelFrames) * SAMPLES_PER_FRAME;
+            Log("[audio] level: mix rms %.4f, output rms %.4f, gain %.2f (volume %d, mute in background %d, focused %d, device %d)\n",
+                std::sqrt(levelIn / n), std::sqrt(levelOut / n), gain, settings.masterVolume.load(), settings.muteInBackground.load(), focused, gDeviceOk);
+            levelIn = levelOut = 0;
+            levelFrames = 0;
+        }
+    }
+
     if (gDeviceOk)
     {
         BYTE* destination = nullptr;
         if (SUCCEEDED(gRender->GetBuffer(SAMPLES_PER_FRAME, &destination)))
         {
-            auto* out = reinterpret_cast<float*>(destination);
-            for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++)
-            {
-                out[i * 2] = left[i];
-                out[i * 2 + 1] = right[i];
-            }
+            memcpy(destination, out, sizeof(out));
             gRender->ReleaseBuffer(SAMPLES_PER_FRAME, 0);
         }
     }

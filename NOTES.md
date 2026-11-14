@@ -536,7 +536,9 @@ routes load Game 1 by default rather than start a new game, unless the user says
 
 From the user's playthrough (open unless marked):
 - Blocky shadows.
-- PC settings in the menu (in-game menu or our own overlay; undecided).
+- PC settings menu: phase 1 done (see "PC Settings page"). Still to come, by phase: mouse input and
+  rebinding (controllers and input-aware glyphs are done, see "Controllers and button glyphs"); graphics quality
+  (resolution scale, shadow resolution, ambient occlusion); a Vulkan renderer (then DX12 / Vulkan).
 - Fixed (confirmed by the user): missing colour in the 3D scene (house grey, open world
   washed out; HUD and 2D fine). The final composite (ps A386CE74148E6F9C) converts to HSV, adjusts,
   and converts back inside a `setp_ne_push` branch. We translated the predicate push as
@@ -548,6 +550,22 @@ From the user's playthrough (open unless marked):
   your console." etc.). The English message table is in guest memory (keys `INFO_SYS_MES_*_SID`,
   `INFO_WINDOW_SAVE_LOAD_*`, around 0x85803400 in one run); `NIER_SCAN_TEXT=<text>` (at a
   `NIER_PROFILE` exit) finds strings as bytes or UTF-16.
+- Fixed (confirmed by the user): village fog with the Game 2 save. The camera-attached mist
+  emitter (effect 0x220, ~330 faint sprites) is normally drawn straight into the scene; in some
+  states the game draws it into a half-resolution layer (EDRAM 0x2D0, 640x360) and composites it.
+  D3D clears that layer with a depth fill: a depth-only rectangle (always pass, depth write)
+  through a 4x MSAA depth surface at the same EDRAM base as the colour surface, which overwrites
+  the colour pixels. Our colour and depth surfaces are separate, so the layer was never wiped and
+  the mist accumulated frame on frame. gpu.cpp now turns such a fill (mode 5, rect list, depth base
+  == colour base) into a clear of the colour target with that base and width, value = 24.8 depth
+  read as 0xAARRGGBB. Ruled out on the way: DLC, 60 fps, game clock, emitter state (identical in
+  Game 1 and Game 2). Debug aids added: `NIER_BREAK_DUMP=rN@offset:bytes` (follow a pointer),
+  `NIER_BREAK_IF=<offset>:<hex>` + `NIER_BREAK_W8=<offset>:<value>` (poke matching objects),
+  `run_boot.ps1 -SaveSlot N` (test copy keeps only that save; route in recomp/loadsave_args.txt:
+  A every 200 frames from 760 handles Continue, two DLC notice pages, select, confirm).
+- Quit to Desktop: replace the title menu's "Downloadable Content" (store only). Its label is a
+  texture (not the text table), so it needs texture replacement (also wanted for button glyphs);
+  the entry is greyed out without Xbox Live.
 - Fixed: music silent after the intro; crash at frame 42445 (switch index); fullscreen option.
 
 ### Storage messages
@@ -564,15 +582,70 @@ box stays idle and the saves load at once (save list at frame ~800 instead of ~9
 route). `NIER_STORAGE_MESSAGES=1` keeps them. `NIER_POKE32=<address>=<value>,...` overwrites image
 words at load (experiments).
 
+### Controllers and button glyphs
+
+Input goes through SDL3 (input.cpp; `tools/get_sdl3.ps1` fetches the official VC devel package into
+`tools/SDL3`, hash-checked, not committed; `SDL3.dll` is copied beside the exe). An SDL thread owns the
+devices; every connected controller (Xbox, DualShock 4, DualSense, Switch Pro, USB or Bluetooth)
+drives player one, merged, with rumble renewed every 0.7 s (SDL rumble has a duration); the
+touchpad click doubles as Back. The keyboard still acts as player one's pad. `InputLastStyle()`
+tracks the device used last (Xbox / PS4 / PS5 / Nintendo / keyboard).
+
+Glyphs: the game draws all button icons from one atlas (128x192 DXT5, base 13A1D000 on the save
+list; 4x6 grid of 32-px cells: A B X Y / LT RT LB RB / L R L3 R3 / Back Start D-pad Guide / D-pad
+right left up down / L left-right, L up-down, the game emblem, empty). glyphs.cpp recognises it by
+shape and content (empty last cell, opaque A cell) at the end of `DecodeTexture` and hands the
+renderer one of our atlases instead (256x384 RGBA, drawn by `tools/make_glyphs.ps1` into
+`recomp/build/glyphs/*.rgba` at build time; the emblem cell is copied from the game's atlas):
+xbox (Series), ps4, ps5, keyboard, chosen by the last device used. `NIER_GLYPHS=<set>|original`
+forces one. Still to do: mouse input (and mouse glyphs), rebinding, DualSense extras, a PC Settings
+entry to pick the icon set.
+
+### Downloadable content
+
+The user's DLC ("15 Nightmares", "Extra outfit and battle quest pack": `media/DLC01.cpk` plus
+`name.txt`) lives in `dlc/535107E8/00000002/<package>` as a console stores it (git-ignored;
+`NIER_DLC_DIR` elsewhere). dlc.cpp reads STFS packages (consecutive files only so far) and xam.cpp
+lists them for marketplace content (type 2) and, when opened, unpacks one once into `<package>.d/`
+and serves it read-only with a full license. `tools/stfs.py` lists or extracts a package.
+The game lists DLC at boot (sub_82116548 keeps items that pass sub_8255B970 in its manager, count
++23352, entries of 328 bytes from +2376) but mounts one only on request: sub_82116B48 / 82116BB0
+queue it (from sub_8211E658 and sub_8211EB70, called by sub_82117400 and the manager thread
+sub_8211BD00); sub_82116670 then opens it and reads name.txt. In the story it is offered at Nier's
+house after getting Grimoire Weiss (a second sparkle; Grimoire mentions "the world of the recycled
+vessel"), so it is untested until the playthrough gets there. The title menu's "Downloadable
+Content" only opens the store (greyed out without Xbox Live); it is to become Quit to Desktop.
+
+### PC Settings page
+
+`settings.ini` beside the exe (`NIER_SETTINGS_FILE` elsewhere; test runs use
+`recomp/test_settings.ini`) holds borderless, frame_rate_60, vsync, master_volume (0-10) and
+mute_in_background; `NIER_FULLSCREEN`, `NIER_60FPS`, `NIER_30FPS` override it. It is edited in game:
+"Select Device" at the bottom of Game Settings (title Options and pause menu) is relabelled "PC
+Settings" and opens our page in place of the device selector (pcsettings.cpp; hooks in
+nier_hooks.toml):
+- Text: our text ids (0x7E000000+) are answered at the text lookup sub_823CB8C8; a record's value
+  text ("Borderless", "60 fps") at sub_82416C20.
+- Open (action item 27 in the input handler sub_8241C020, case at 0x8241C828): the Game Settings
+  records, record count (+5264), first record in view (+3572) and cursor row (+3576) are saved, ours
+  written (item ids 60+, which the game's config copy sub_82415C48 and action switch ignore), and the
+  page laid out again with the calls the builder makes after its records (824197A8, 824178D0,
+  82416168, 82419120, 82416038), without its config copy, so pending Game Settings changes survive.
+- Return / B (sub_8241BB60): on our page, the values are read back, saved and applied, and the Game
+  Settings records restored.
+Display Mode posts to the window thread; Frame Rate is checked on every flip (the 60 fps hook is
+always installed); VSync off presents with tearing allowed when DXGI supports it; volume and
+background mute scale the final mix with a short ramp. Alt+Enter / F11 also update the setting.
+`NIER_WATCH_READ=<address>,<bytes>,<from frame>` catches reads (it found the text lookup).
+
 ### "Select Device" removed (PC port)
 
 Mid-asm hooks now exist: `recomp/config/nier_hooks.toml` (appended last by `make_config.ps1`,
 since `[[midasm_hook]]` tables would capture keys after them), implemented in xam.cpp.
 - Options / pause Game Settings: the builder sub_8241A188 fills 24 records of 56 bytes at +3916
   (+0 type, 0 = unused; +40 item id; +44 label text id; +48 help text id), counts the used ones into
-  +5264, then lays them out. `HideSelectDeviceOption` (at 0x8241B7DC, between the two) removes the
-  record labelled "Select Device" (text 11100300 or 6731600): later records move up, the last is
-  cleared, the count drops by one. Emptying it in place left a blank, selectable stop.
+  +5264, then lays them out. `HideSelectDeviceOption` (at 0x8241B7DC, between the two) removed the
+  record labelled "Select Device"; superseded by the PC Settings page (below), which relabels it.
 - Save list (load and save screens; refreshed by sub_82427978): the 4th cursor stop is the device
   row. `DisableSelectDeviceRow` clears its enable byte (+8367; sub_824274E8 skips disabled stops)
   and `BlankSelectDeviceRow` sets its label to an empty string. The row's underline still shows.

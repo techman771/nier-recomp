@@ -23,6 +23,7 @@
 #include <vector>
 #include "guest.h"
 #include "renderer.h"
+#include "settings.h"
 #include <xxHash/xxhash.h>   // shader cache keys
 
 using Microsoft::WRL::ComPtr;
@@ -85,6 +86,7 @@ float4 PSMain(Interpolated input) : SV_Target
     ComPtr<ID3D12Device> gDevice;
     ComPtr<ID3D12CommandQueue> gQueue;
     ComPtr<IDXGISwapChain3> gSwapChain;
+    UINT gSwapChainFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;   // + ALLOW_TEARING when supported
     ComPtr<ID3D12DescriptorHeap> gRtvHeap, gSrvHeap;
     ComPtr<ID3D12CommandAllocator> gAllocator;
     ComPtr<ID3D12GraphicsCommandList> gList;
@@ -1084,6 +1086,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             s->samplerPoint[i] = (binding.point ? 25 : 0) + binding.addressU * 5 + binding.addressV;   // sampler index
             s->texScale[i][0] = binding.scale[0];
             s->texScale[i][1] = binding.scale[1];
+            s->texScale[i][2] = binding.expScale;   // 1 for unbound slots (the default)
             s->texSign[i] = binding.valid ? binding.sign : 0;
             WriteTextureDescriptor(cpu, binding);
             cpu.ptr += gSrvStep;
@@ -1468,7 +1471,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
         swapDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         swapDesc.BufferCount = kBackBuffers;
         swapDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        swapDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        // VSync off (PC Settings) presents at once, tearing where the display path allows it.
+        BOOL tearing = FALSE;
+        if (SUCCEEDED(factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing)
+            gSwapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        swapDesc.Flags = gSwapChainFlags;
         ComPtr<IDXGISwapChain1> swapChain;
         if (!Check(factory->CreateSwapChainForHwnd(gQueue.Get(), gWindow, &swapDesc, nullptr, nullptr, &swapChain), "swap chain")) return false;
         factory->MakeWindowAssociation(gWindow, DXGI_MWA_NO_ALT_ENTER);
@@ -1717,7 +1724,9 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
         ID3D12CommandList* lists[] = { gList.Get() };
         gQueue->ExecuteCommandLists(1, lists);
-        HRESULT presented = gSwapChain->Present(1, 0);
+        const bool vsync = Settings().vsync != 0;
+        const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        HRESULT presented = gSwapChain->Present(vsync ? 1 : 0, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(presented))
         {
             Log("[d3d12] present failed: 0x%08lX, device status 0x%08lX\n", presented, gDevice->GetDeviceRemovedReason());
@@ -1754,7 +1763,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (!width || !height) return;
         WaitForGpu();
         for (auto& buffer : gBackBuffers) buffer.Reset();
-        if (!Check(gSwapChain->ResizeBuffers(kBackBuffers, width, height, kBackBufferFormat, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT), "resize")) return;
+        if (!Check(gSwapChain->ResizeBuffers(kBackBuffers, width, height, kBackBufferFormat, gSwapChainFlags), "resize")) return;
         gWidth = width;
         gHeight = height;
         AcquireBackBuffers();

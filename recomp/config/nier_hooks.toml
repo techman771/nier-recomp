@@ -2,12 +2,41 @@
 # Mid-function hooks (appended last by tools/make_config.ps1). Each calls a runtime function
 # with the listed guest registers by reference; see NOTES.md.
 
-# Options / pause menu builder (sub_8241A188), after its record loop and before the layout calls:
-# hides "Select Device" (no storage devices on PC). Runtime: xam.cpp.
+# PC Settings page (runtime: pcsettings.cpp). The options / pause menu builder (sub_8241A188), after
+# its record loop and before the layout calls: "Select Device" is relabelled "PC Settings".
 [[midasm_hook]]
-name = "HideSelectDeviceOption"
+name = "PcSettingsPageBuilt"
 address = 0x8241B7DC
 registers = ["r31"]
+
+# Text lookup (sub_823CB8C8: r3 table, r4 id; returns the string): our text ids.
+[[midasm_hook]]
+name = "PcSettingsText"
+address = 0x823CB8C8
+registers = ["r3", "r4"]
+return_on_true = true
+
+# A record's value text (sub_82416C20: r3 record; returns the string): our choices.
+[[midasm_hook]]
+name = "PcSettingsValueText"
+address = 0x82416C20
+registers = ["r3"]
+return_on_true = true
+
+# The menu input handler (sub_8241C020), action item 27 ("Select Device", now "PC Settings"):
+# open the PC page and skip the device selector call (on to the case's common tail).
+[[midasm_hook]]
+name = "PcSettingsOpen"
+address = 0x8241C828
+registers = ["r31"]
+jump_address_on_true = 0x8241C860
+
+# Return / B (sub_8241BB60: r3 the menu): on the PC page, go back to Game Settings.
+[[midasm_hook]]
+name = "PcSettingsReturn"
+address = 0x8241BB60
+registers = ["r3"]
+return_on_true = true
 
 # Save list (load / save screens; sub_82427978 refreshes it): the fourth cursor stop is the
 # "Select Device" row. Its enable byte (+8367) is set right before 0x824279B4; clearing it makes

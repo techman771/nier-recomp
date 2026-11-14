@@ -14,14 +14,16 @@ $runtime = Get-ChildItem (Join-Path $root 'recomp\runtime') -Filter *.cpp | Sele
 $x = '../../tools/XenonRecomp'
 $common = "/nologo /c /std:c++20 /MT /arch:AVX -msse4.1 -fno-strict-aliasing -Wno-everything -I$x/thirdparty/simde -I../out"
 $lib = '../../tools/build'
-$libs = "$lib/XenonUtils/XenonUtils.lib $lib/thirdparty/disasm/disasm.lib $lib/thirdparty/fmt/fmt.lib $lib/thirdparty/xxHash/cmake_unofficial/xxhash.lib"
+$sdl = '../../tools/SDL3'   # tools/get_sdl3.ps1 fetches it; SDL3.dll is copied beside nier.exe below
+if (-not (Test-Path (Join-Path $PSScriptRoot 'SDL3\include\SDL3\SDL.h'))) { & (Join-Path $PSScriptRoot 'get_sdl3.ps1') }
+$libs = "$sdl/lib/x64/SDL3.lib $lib/XenonUtils/XenonUtils.lib $lib/thirdparty/disasm/disasm.lib $lib/thirdparty/fmt/fmt.lib $lib/thirdparty/xxHash/cmake_unofficial/xxhash.lib"
 $ninja = @(
     "rule cxx",
     "  command = clang-cl $common $Opt /EHs-c- /GS- `$in /Fo:`$out",
     "  description = `$in",
     "",
     "rule rt",
-    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
+    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$sdl/include -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
     "  description = `$in",
     "",
     "rule link",
@@ -40,4 +42,10 @@ foreach ($s in $runtime) { $ninja += "build rt_$s.obj: rt ../runtime/$s | $heade
 $ninja += "build nier.exe: link $($objects -join ' ')"
 Set-Content -Encoding ascii (Join-Path $build 'build.ninja') $ninja
 ninja -C $build -k 0
-exit $LASTEXITCODE
+$result = $LASTEXITCODE
+Copy-Item (Join-Path $PSScriptRoot 'SDL3/lib/x64/SDL3.dll') $build -Force
+# Button glyph atlases (PlayStation, Xbox Series, keyboard), drawn by make_glyphs.ps1.
+$glyphScript = Join-Path $PSScriptRoot 'make_glyphs.ps1'
+$glyphOut = Join-Path $build 'glyphs\xbox.rgba'
+if (-not (Test-Path $glyphOut) -or (Get-Item $glyphScript).LastWriteTime -gt (Get-Item $glyphOut).LastWriteTime) { & $glyphScript | Out-Null }
+exit $result

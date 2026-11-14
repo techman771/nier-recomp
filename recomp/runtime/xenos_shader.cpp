@@ -497,7 +497,8 @@ float3 CubeDirection(float3 c)
             snprintf(sample, sizeof(sample), "t%u%ssamplers[samplerIndex[%u][%u]], %s%s",
                 slot, call.c_str(), slot / 4, slot % 4, where.c_str(), level.c_str());
             body += OpenPredicate(w[1] >> 31, w[2] >> 31);
-            body += std::string("        float4 f_ = ApplySign(") + sample + Format(", texSign[%d][%d]);\n", int(slot / 4), int(slot % 4));
+            // Exponent adjust from the fetch constant (texScale.z = 2^n) scales the result after the sign mode.
+            body += std::string("        float4 f_ = ApplySign(") + sample + Format(", texSign[%d][%d]) * texScale[%d].z;\n", int(slot / 4), int(slot % 4), int(slot));
             WriteFetched(dest, w[1] & 0xFFF);
             body += "    }\n";
         }
