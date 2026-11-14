@@ -11,6 +11,7 @@ struct PcSettings
     // Internal resolution (applied between frames): 0 640x360, 1 854x480, 2 960x540, 3 1280x720 (the original),
     // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
     std::atomic<int> resolutionScale{ 3 };
+    std::atomic<int> shadowQuality{ 0 };       // shadow map size: 0 the original 1024, 1 2048, 2 3072, 3 4096
     std::atomic<int> masterVolume{ 10 };       // 0-10
     std::atomic<int> muteInBackground{ 1 };    // silence while the window isn't focused
     std::atomic<int> mouseSensitivity{ 5 };    // 0-10; 0 turns the mouse camera off

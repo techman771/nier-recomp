@@ -223,6 +223,7 @@ namespace
     MovieSource gMovie;
     uint64_t gLogDrawsAt = ~0ull;
     std::atomic<bool> gCaptureRequested{ false };
+    std::atomic<bool> gRecordingRequested{ false };   // F9: record every frame for 10 seconds (framecapture.cpp)
     uint64_t gCaptureFrame = ~0ull;
 
     constexpr uint32_t PRIM_QUAD_LIST = 13, FORMAT_8 = 2;
@@ -319,6 +320,7 @@ namespace
         const size_t commandCount = gFrameCommands.size();
         output.commands = std::move(gFrameCommands);
         output.scanoutBase = gScanoutBase;
+        if (FrameSequenceActive()) FrameSequenceAdd(output);
         if (frame == gSaveCommandsAt)
         {
             char path[96];
@@ -1394,6 +1396,24 @@ namespace
                     return GetEnvironmentVariableA("NIER_CAPTURE_AT", value, sizeof(value)) ? strtoull(value, nullptr, 10) : ~0ull;
                 }();
                 if (frame == captureAt) gCaptureRequested = true;
+                // NIER_RECORD_AT=<frame>[,<seconds>]: the same as pressing F9 at that frame.
+                static const std::pair<uint64_t, double> recordAt = [] {
+                    char value[32];
+                    std::pair<uint64_t, double> at{ ~0ull, 10.0 };
+                    if (GetEnvironmentVariableA("NIER_RECORD_AT", value, sizeof(value)))
+                    {
+                        at.first = strtoull(value, nullptr, 10);
+                        if (const char* comma = strchr(value, ',')) at.second = atof(comma + 1);
+                    }
+                    return at;
+                }();
+                if (frame == recordAt.first || gRecordingRequested.exchange(false))
+                {
+                    CreateDirectoryA("../captures", nullptr);
+                    char path[96];
+                    snprintf(path, sizeof(path), "../captures/seq_f%llu.nseq", frame);
+                    FrameSequenceStart(path, frame == recordAt.first ? recordAt.second : 10.0, ShaderWords);
+                }
                 // NIER_RES_AT=<frame>,<index>[;...]: sets the Resolution setting at those frames, as the
                 // menu would (test runs).
                 static const std::map<uint64_t, int> resolutionAt = [] {
@@ -1822,6 +1842,7 @@ GUEST_IMPORT(ExGetXConfigSetting)
 }
 
 void GpuRequestCapture() { gCaptureRequested = true; }
+void GpuRequestRecording() { gRecordingRequested = true; }
 
 // Writes a resolve's pixels into guest memory the way the copy hardware lays out a 32-bit colour
 // destination: tiled with the destination pitch, red/blue swapped if requested, then endian-swapped.

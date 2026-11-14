@@ -39,7 +39,8 @@ if ($Playtest) { Remove-Item Env:NIER_SAVE_DIR -ErrorAction SilentlyContinue } e
     $env:NIER_SAVE_DIR = $testSave
 }
 $exe = Join-Path $root 'recomp\build\nier.exe'
-$log = Join-Path $root 'recomp\boot.log'
+# A playtest logs to its own file: test runs made while the user plays would otherwise share boot.log.
+$log = Join-Path $root $(if ($Playtest) { 'recomp\playtest.log' } else { 'recomp\boot.log' })
 if ($Trace) { $env:NIER_TRACE_IMPORTS = '1' } else { Remove-Item Env:NIER_TRACE_IMPORTS -ErrorAction SilentlyContinue }
 if ($DumpAfter -gt 0) { $env:NIER_DUMP_AFTER = "$DumpAfter" } else { Remove-Item Env:NIER_DUMP_AFTER -ErrorAction SilentlyContinue }
 $p = Start-Process -FilePath $exe -ArgumentList "`"$root\Nier`"" -WorkingDirectory (Split-Path $exe) -RedirectStandardOutput $log -RedirectStandardError "$log.err" -NoNewWindow -PassThru

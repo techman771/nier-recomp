@@ -585,6 +585,31 @@ gameplay HUD, pause menu) and switching to 2560x1440 while paused. Not checked: 
 windows, movies with subtitles, loading screens, and 2D that is depth-tested (it would stay at
 the render size). 3D-looking UI is unaffected by design.
 
+### Shadow quality
+
+PC Settings > Shadow Quality (`shadow_quality` in settings.ini: 0 Original, 1 High, 2 Very High,
+3 Ultra; `NIER_SHADOW_SCALE=<1-4>` overrides) sizes the shadow map: 1024, 2048, 3072 or 4096
+texels a side. The blocky character shadows were never a screen-resolution matter. Each frame the
+game renders one 1024x1024 depth map of the casters from the light (commands into target 2D0/1040,
+square viewport, ending in a depth copy to 07A7D000), then a half-size mask pass (target B8/640,
+640x360; pixel shaders 1F81BF6889FC24EC and D0CE46D136802B42) reads that map with a hand-written
+filter, nine taps one texel apart blended by the position inside a texel, and the result
+(07E7D000) is laid over the scene. The map covers a wide area, so Nier fills about 5 by 15
+texels: his shadow is a few squares at any render size.
+`ShadowPasses` (renderer_d3d12.cpp) finds the shadow passes: a square depth copy of at least
+256 texels, and the commands before it back to the previous copy (rectangles and draws through
+a square viewport). They run at `gShadowTwelfths` instead of the render scale, so their depth
+target and the resolved depth texture are that much larger; nothing else about them changes.
+The filter's idea of the map comes from pixel shader constants the game sets: 257.z = 1024,
+257.w = 1/1024, 258 = (0, 1, 2, 3) texels. For a draw that binds a shadow-scaled square depth
+texture and has those constants, `ExecuteDraw` restates them for the real size (without that the
+taps skip texels and the shadow streaks). Four times is the most: the map's surface is 1040 by
+about 2500 guest pixels, and a texture side can't pass 16384.
+Checked on captures with `NIER_SHOW_SURFACE=07E7D000` (the mask alone: squares at 1x, Nier's
+outline at 4x), in the final picture of four scenes, and in a live run at 4x. Not measured: the
+cost. Not done: the mask itself is still half the render size, so its edges soften rather than
+sharpen at high render sizes; wide shadows (trees, clouds) come from elsewhere and are unchanged.
+
 ### Frame captures (the fastest way to work on a graphics bug)
 
 F12 in the game (or `NIER_CAPTURE_AT=<frame>` in a test run) saves that frame's renderer commands
@@ -605,6 +630,24 @@ nothing that depends on game logic or timing; textures that the previous frame r
 approximated by replaying the frame repeatedly (40 times by default); texture decoding is not
 redone (the capture holds decoded textures).
 
+### Recordings (10 seconds of frames)
+
+F9 in the game (or `NIER_RECORD_AT=<frame>[,<seconds>]` in a test run) records every frame for 10
+seconds to `recomp/captures/seq_f<N>.nseq`, for faults that only show in motion and for stutter
+(framecapture.cpp). Shaders, textures and data blocks (vertex data, indices, constants in
+256-float pieces) are stored once however many frames use them: about 650 MB for 10 seconds at
+The Aerie. Beside it a `.txt` has one line per frame: milliseconds since the frame before, new
+textures (count, KB), new shaders, new data KB, and the renderer's waits in that frame (shader
+compiles, pipeline creation, pipeline waits), then `frames: N`. Recording costs a little time
+per frame (it hashes the frame's data), so judge stutter from the pattern, not the absolute times.
+`tools/replay_frame.ps1 seq_f<N>.nseq` plays it once at 60 frames a second and saves every
+`-Every`'th frame (default 6; 1 for all) as .ppm into `<capture>_frames/` or `-Out`; `-Show`
+loops it in a window; `-Surface <address>`, `-PsDebug`, `-Patch`, `-Zoom`, `-Cull` work as for a
+single capture, and `recomp/replay.log` lists each recorded frame's interval.
+A playtest now logs to `recomp/playtest.log`; test runs keep `recomp/boot.log` (they used to share
+the file when run at the same time). Test runs and replays made while the user plays also compete
+with their game for the CPU and the graphics card: avoid them while a stutter is being judged.
+
 ### Playtest issues
 
 Saves: the user's playthrough saves live in `save/` (backup in `save_backups/`). Test runs from
@@ -613,7 +656,7 @@ of `save/` made every run, so they can load the playthrough (Game 1) without wri
 routes load Game 1 by default rather than start a new game, unless the user says otherwise.
 
 From the user's playthrough (open unless marked):
-- Blocky shadows.
+- Blocky shadows: see "Shadow quality" (a setting; awaiting the user's check).
 - FIXED (confirmed by the user in play): square patches on the sheep's
   legs and beards, Yonah's dress and hair, Nier's waist cloth, AND the dust that filled the screen
   in the cutscene after the Lost Shrine boss. One cause: no face culling. Cloth, fur and hair are
@@ -651,6 +694,26 @@ From the user's playthrough (open unless marked):
   whole 3D scene (316 depth-tested draws against 201 in play); nothing marks a menu closing.
   Next step: log the guest call chain at those legend lookups to find each menu's object and its
   per-frame handler (as sub_8241C020 is for the settings pages), then hook that.
+- Shadows "still flicker" at higher Shadow Quality (user, at 3840x2160 with shadow maps x3 / x4):
+  NOT reproduced. Standing still (Game 3) the shadow mask is identical frame to frame (955 +/- 1
+  dark pixels over 10 frames); in a 3-second recording of running, the mask follows the stride
+  smoothly with no dropouts. Guess, untested: the nine-tap filter is one texel wide, so at a
+  larger map the edge is harder and its stair steps crawl as the light's projection moves; a
+  wider filter or a blur of the mask would hide it. Needs an F9 recording from the user.
+- Micro stutter at The Aerie (Game 1): reproduced. Walking for 10 seconds with nothing else
+  running, 6 to 7 of about 593 frames take two refreshes (while recording; 4 of 604 under the
+  profiler), none with new textures, shaders or pipelines. The scene is about 670 draws a
+  frame; the command-processing thread works 10.6 ms of each 16.7 ms frame on average and
+  18.1 ms in the late ones, so it has little headroom. Its time (NIER_PROFILE): OnDraw 56%, of
+  which texture hashing in DecodeTexture 14% (XXH3 over small textures on every use),
+  AssemblePrimitives 14% (index lists rebuilt per draw), copying vertex data 9%, byte-swapping
+  it 9%, allocation 7%. The game's main thread is 100% busy in sub_82579D50 <- sub_82573758 <-
+  sub_8257AB38 (looks like a spin wait in the D3D library; not examined). Next: cut the command
+  thread's work (memoise small texture hashes per frame, a bulk path for plain triangle lists,
+  share vertex data between a mesh's passes) and see what makes the late frames heavier.
+- "Magic orbs show a square outline" (user, possibly since the resolution change): no capture
+  of it exists yet (the newest on disk, f8452 / f8519, show none). The user will capture it in
+  the Aerie boss fight.
 - DLC notice on Continue ("The quest "Recycled World" is now available." and where to find it:
   info-window messages 2481 / 2482, two pages to confirm on every load) is skipped: sub_8219B0D0
   shows it through sub_823C5140 while a flag at its object +0x20C00 is set, then clears the flag;

@@ -7,6 +7,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -277,6 +278,11 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     // being executed: the render scale, or the display's for the frame's closing 2D pass (see
     // FindFlatPhase). Surfaces of the two scales are separate objects.
     uint32_t gDisplayTwelfths = 12, gActiveTwelfths = 12;
+    // Shadow maps have their own scale (PC Settings > Shadow Quality): the game's are 1024x1024 over
+    // a wide area, so a character covers a handful of texels and its shadow is a few squares. They
+    // are square depth passes that end in a depth copy (see ShadowPasses); the scale applies to
+    // their targets and to the resolved depth texture the scene reads.
+    uint32_t gShadowTwelfths = 12;
     inline uint32_t Scaled(uint32_t guest) { return guest ? (std::max)((guest * gActiveTwelfths + 6) / 12, 1u) : 0; }
     inline int ScaledInt(int guest) { return guest >= 0 ? int((uint32_t(guest) * gActiveTwelfths + 6) / 12) : -int((uint32_t(-guest) * gActiveTwelfths + 6) / 12); }
 
@@ -1109,6 +1115,34 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
         ArenaBlock constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
         memcpy(constants.cpu, draw.constants.data(), draw.constants.size() * 4);
+        if (gShadowTwelfths != 12)
+        {
+            // The shaders that read a shadow map filter it by hand: nine taps one texel apart, blended
+            // by the position inside a texel. The game passes the map's size and the texel steps as
+            // pixel shader constants 257.z (1024), 257.w (1/1024) and 258 (0, 1, 2, 3 texels); with a
+            // larger map they are restated for its real size, or the taps skip texels and streak.
+            float* c257 = reinterpret_cast<float*>(constants.cpu) + 257 * 4;
+            float* c258 = c257 + 4;
+            const float size = c257[2];
+            const bool shadowConstants = size >= 256.0f && size <= 4096.0f && std::fabs(c257[3] * size - 1.0f) < 0.01f &&
+                c258[0] == 0.0f && std::fabs(c258[1] * size - 1.0f) < 0.01f && std::fabs(c258[2] * size - 2.0f) < 0.01f;
+            if (shadowConstants)
+            {
+                bool readsShadowMap = false;
+                for (const TextureBinding& binding : draw.textures)
+                    if (binding.valid && !binding.decoded)
+                    {
+                        auto found = gResolved.find(binding.resolvedBase);
+                        readsShadowMap = readsShadowMap || (found != gResolved.end() && found->second.depth && found->second.twelfths == gShadowTwelfths && found->second.width == found->second.height);
+                    }
+                if (readsShadowMap)
+                {
+                    const float k = gShadowTwelfths / 12.0f;
+                    c257[2] *= k; c257[3] /= k;
+                    for (int i = 1; i < 4; i++) c258[i] /= k;
+                }
+            }
+        }
 
         ArenaBlock system = ArenaAlloc(sizeof(SystemConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
         auto* s = reinterpret_cast<SystemConstants*>(system.cpu);
@@ -1441,6 +1475,39 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
     bool SameTarget(const RenderTargetKey& a, const RenderTargetKey& b) { return a.edramBase == b.edramBase && a.width == b.width && a.height == b.height; }
 
+    // The frame's shadow map passes, as [first command, last command] ranges. A shadow map is a
+    // square depth copy (1024x1024 in this game; the scene's own depth copies have the screen's
+    // shape) that isn't the picture. Its pass is the commands before that copy back to the previous
+    // copy from the same surface or the start of the frame: the clears and the casters' draws.
+    std::vector<std::pair<size_t, size_t>> ShadowPasses(const RendererFrame& frame)
+    {
+        std::vector<std::pair<size_t, size_t>> passes;
+        if (gShadowTwelfths == gResTwelfths) return passes;
+        for (size_t i = 0; i < frame.commands.size(); i++)
+        {
+            const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]);
+            if (!resolve || !resolve->copyDepth || resolve->width != resolve->height || resolve->width < 256) continue;
+            size_t start = i;
+            while (start > 0)
+            {
+                const RendererCommand& before = frame.commands[start - 1];
+                if (const RendererResolve* earlier = std::get_if<RendererResolve>(&before))
+                {
+                    if (earlier->copyColor || earlier->copyDepth) break;   // another pass's result
+                }
+                else
+                {
+                    const RendererDraw& draw = std::get<RendererDraw>(before);
+                    // Its casters are drawn through a square viewport; clears are rectangles.
+                    if (!draw.rectList && std::fabs(draw.viewport[2] - draw.viewport[3]) > 0.5f) break;
+                }
+                start--;
+            }
+            passes.emplace_back(start, i);
+        }
+        return passes;
+    }
+
     // The frame's closing 2D pass. A frame ends with the copy that produces the picture shown (the
     // scanout); before it the game draws the final full-screen composite of the 3D scene and then
     // the HUD, menus and text into the same target, none of it depth-tested. That run of draws is
@@ -1528,10 +1595,21 @@ float PSMain(float4 position : SV_Position) : SV_Target
         const size_t flatStart = FindFlatPhase(frame, flatTarget);
         const bool hasFlat = flatStart < frame.commands.size();
         bool flatBegun = false, drawnThisFrame = false;
+        const std::vector<std::pair<size_t, size_t>> shadowPasses = ShadowPasses(frame);
+        size_t shadowPass = 0;
         for (size_t index = 0; index < frame.commands.size(); index++)
         {
             const auto& command = frame.commands[index];
             gActiveTwelfths = gResTwelfths;
+            while (shadowPass < shadowPasses.size() && index > shadowPasses[shadowPass].second) shadowPass++;
+            if (shadowPass < shadowPasses.size() && index >= shadowPasses[shadowPass].first)
+            {
+                // A shadow map pass: its own scale, nothing else applies.
+                gActiveTwelfths = gShadowTwelfths;
+                if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
+                else ExecuteResolve(std::get<RendererResolve>(command));
+                continue;
+            }
             if (auto* draw = std::get_if<RendererDraw>(&command))
             {
                 const bool onTarget = hasFlat && draw->hasColor && SameTarget(draw->target, flatTarget);
@@ -1803,14 +1881,28 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // Every surface whose size depends on the scale is dropped; the frame about to be drawn creates
     // what it uses at the new size. Surfaces the game resolved in the frame before are missing for
     // that one frame.
+    // Shadow Quality: 0 the original 1024, 1 2048, 2 3072, 3 4096 texels a side (the map's surface is
+    // 1040 wide and about 2500 high in guest pixels, and a texture side can't pass 16384: four times
+    // is the most). NIER_SHADOW_SCALE=<1-4> overrides with a scale.
+    uint32_t ShadowWanted()
+    {
+        static const double forced = [] {
+            char value[16];
+            return GetEnvironmentVariableA("NIER_SHADOW_SCALE", value, sizeof(value)) ? atof(value) : 0.0;
+        }();
+        static const uint32_t kSettingTwelfths[] = { 12, 24, 36, 48 };
+        const double asked = forced > 0.0 ? forced : kSettingTwelfths[std::clamp(Settings().shadowQuality.load(), 0, 3)] / 12.0;
+        return uint32_t(std::clamp(int(asked * 12.0 + 0.5), 12, 48));
+    }
+
     void ApplyResolutionSetting()
     {
-        const uint32_t wanted = ResolutionWanted();
+        const uint32_t wanted = ResolutionWanted(), shadow = ShadowWanted();
         // The display's scale: the largest 16:9 picture that fits the window, against 1280x720.
         const double fit = (std::min)(gWidth / 1280.0, gHeight / 720.0);
         const uint32_t display = uint32_t(std::clamp(int(fit * 12.0 + 0.5), 6, 48));
-        if (wanted == gResTwelfths && display == gDisplayTwelfths && gResolutionLogged) return;
-        if (wanted != gResTwelfths || display != gDisplayTwelfths)
+        if (wanted == gResTwelfths && display == gDisplayTwelfths && shadow == gShadowTwelfths && gResolutionLogged) return;
+        if (wanted != gResTwelfths || display != gDisplayTwelfths || shadow != gShadowTwelfths)
         {
             gTargets.clear();
             gDepths.clear();
@@ -1820,11 +1912,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
             gDepthsCreated = 0;
             gResTwelfths = wanted;
             gDisplayTwelfths = display;
+            gShadowTwelfths = shadow;
         }
         gActiveTwelfths = gResTwelfths;
         gResolutionLogged = true;
-        Log("[d3d12] internal resolution %ux%u (scale %.3f), 2D at %ux%u\n", Scaled(1280), Scaled(720), gResTwelfths / 12.0,
-            (1280 * gDisplayTwelfths + 6) / 12, (720 * gDisplayTwelfths + 6) / 12);
+        Log("[d3d12] internal resolution %ux%u (scale %.3f), 2D at %ux%u, shadow maps x%.1f\n", Scaled(1280), Scaled(720), gResTwelfths / 12.0,
+            (1280 * gDisplayTwelfths + 6) / 12, (720 * gDisplayTwelfths + 6) / 12, gShadowTwelfths / 12.0);
     }
 
     void RenderFrame(const MailboxPlane planes[3], bool movie, uint64_t frame, const RendererFrame* guest)
@@ -2156,6 +2249,7 @@ void RendererDumpStats()
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
 bool RendererReady() { return gReady; }
+void RendererWaitTotals(double totals[3]) { totals[0] = gShaderWaitMs.load(); totals[1] = gPipelineMs.load(); totals[2] = gPipelineWaitMs.load(); }
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader) { QueueShader(shader); }
 
 // Starts creating the pipeline a draw needs, if this combination is new (GPU emulation thread).

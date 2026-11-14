@@ -65,6 +65,7 @@ namespace
             return 0;
         case WM_KEYDOWN:
             if (w == VK_F12) GpuRequestCapture();   // capture the next frame for debugging
+            if (w == VK_F9 && !(l & (1 << 30))) GpuRequestRecording();   // record 10 seconds (not on key repeat)
             if (w == VK_F11) { SetFullscreen(!gFullscreen); Settings().borderless = gFullscreen; SettingsSave(); }
             return DefWindowProcA(window, message, w, l);
         case WM_SYSKEYDOWN:

@@ -121,6 +121,9 @@ struct RendererFrame
 void RendererInit(void* nativeWindow, uint32_t width, uint32_t height);
 void RendererResize(uint32_t width, uint32_t height);
 bool RendererReady();   // the device exists and frames are accepted
+// Running totals in milliseconds: time the render thread waited for shader compiles, time spent
+// creating pipelines, time the render thread waited for pipelines.
+void RendererWaitTotals(double totals[3]);
 
 // Called once per guest swap. The planes are copied before returning.
 void RendererSubmitMovieFrame(uint64_t frame, const RendererPlane& y, const RendererPlane& u, const RendererPlane& v);

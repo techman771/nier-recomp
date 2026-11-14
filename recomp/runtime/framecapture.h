@@ -13,6 +13,12 @@
 void FrameCaptureSave(const RendererFrame& frame, const std::string& path,
                       const std::function<const std::vector<uint32_t>*(bool pixel, uint64_t hash)>& microcode);
 
-// NIER_REPLAY_FRAME=<file>: renders that capture instead of running the game; never returns then.
+// Recordings: every frame over `seconds` in one file (see framecapture.cpp). Start, then add each
+// frame as it is submitted; the recording ends itself. GPU emulation thread only.
+void FrameSequenceStart(const std::string& path, double seconds, const std::function<const std::vector<uint32_t>*(bool pixel, uint64_t hash)>& microcode);
+bool FrameSequenceActive();
+void FrameSequenceAdd(const RendererFrame& frame);
+
+// NIER_REPLAY_FRAME=<file>: renders that capture or recording instead of running the game; never returns then.
 // Call once the presenter has been started.
 void FrameReplayRunIfRequested();
