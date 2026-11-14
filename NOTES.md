@@ -711,6 +711,33 @@ From the user's playthrough (open unless marked):
   sub_8257AB38 (looks like a spin wait in the D3D library; not examined). Next: cut the command
   thread's work (memoise small texture hashes per frame, a bulk path for plain triangle lists,
   share vertex data between a mesh's passes) and see what makes the late frames heavier.
+  Done since (awaiting the user's playtest): (1) command thread: only data textures (one row
+  or a float format) are hashed on every use, the rest once a frame; plain triangle lists are
+  taken as read and strips written through a pointer; vertex and index data are copied and
+  byte-swapped in one pass into a buffer that isn't zero-filled (`ByteBuffer`). Its work per
+  frame went from 10.6 to about 7.3 ms (OnDraw 56% -> 37% of the thread), late guest frames
+  under the profiler from 4 of 604 to 0 of 609. The main thread's sub_82579D50 is the D3D
+  library's spin wait for the GPU, not work. (2) Presentation: the user's display is 240 Hz,
+  and a 60 fps frame presented at the next refresh stayed up 3, 4 or 5 refreshes depending on
+  when it was ready. On a display at 120, 180 or 240 Hz each game frame is now presented with
+  that sync interval (2-4), or 1 when frames are queued so no delay builds up; the display's
+  rate is re-read every 120 frames (`[present] display at ...` in the log;
+  NIER_PRESENT_INTERVAL=<n> forces the count, 1 turns it off). Nothing can be done this way
+  for 144 or 165 Hz (60 doesn't divide them). (3) The guest vblank is 60 Hz exactly instead of
+  59.94, so the game doesn't fall a frame behind the display every 17 seconds. Checked at
+  120 Hz on monitor 2: 609 of 609 frames on time. IDXGISwapChain::GetFrameStatistics gave no
+  usable on-screen durations in the windowed flip model, so evenness is judged by eye.
+  Test runs are noisy when the user is using the machine (one run showed 40 late frames).
+  User after (1)-(3): "frame pacing is much better, there are still some tiny stutters on the
+  aerie". (4) Two free-running 60 Hz clocks (the vblank thread's timer and the display) still
+  drift, and each crossing shows one frame too long or too briefly. The vblank thread now waits
+  on the display itself: `RendererWaitDisplayVblank` (IDXGIOutput::WaitForVBlank on the swap
+  chain's containing output, once per refresh in the 60 Hz period) when vsync is on and the
+  display's rate is 60, 120, 180 or 240 Hz; otherwise, or if the wait returns at once or fails,
+  the timer as before (NIER_NO_VBLANK_LOCK=1 forces the timer). Log: `[present] the game's
+  vblank follows the display`. Test run at 120 Hz with the user's 4K playtest running beside
+  it: 604 of 607 frames on time. Awaiting the user's verdict. The user plays at 3840x2160
+  internal with shadow maps x3, so GPU time is the next suspect if stutters remain (F9).
 - FIXED (confirmed by the user in play): the Aerie boss's red orbs
   showed their whole quad as a square. Not the resolution work (it shows at 1x with the 2D pass
   off): the renderer had no alpha test. The orbs are 19 quads drawn with the 2D shader (vs

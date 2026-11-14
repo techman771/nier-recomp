@@ -449,10 +449,41 @@ namespace
             }
     }
 
+    // Copies and corrects the byte order in one pass over the data (vertex and index buffers go
+    // through here on every draw; copying and then swapping in place read it all twice).
     void CopySwapped(uint8_t* out, const uint8_t* in, uint32_t bytes, uint32_t endian)
     {
-        memcpy(out, in, bytes);
-        SwapInPlace(out, bytes, endian);
+        uint32_t i = 0;
+        if (endian == 1)
+            for (; i + 4 <= bytes; i += 4)
+            {
+                uint32_t v;
+                memcpy(&v, in + i, 4);
+                v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                memcpy(out + i, &v, 4);
+            }
+        else if (endian == 2)
+            for (; i + 4 <= bytes; i += 4)
+            {
+                uint32_t v;
+                memcpy(&v, in + i, 4);
+                v = __builtin_bswap32(v);
+                memcpy(out + i, &v, 4);
+            }
+        else if (endian == 3)
+            for (; i + 4 <= bytes; i += 4)
+            {
+                uint32_t v;
+                memcpy(&v, in + i, 4);
+                v = (v << 16) | (v >> 16);
+                memcpy(out + i, &v, 4);
+            }
+        else { memcpy(out, in, bytes); return; }
+        if (i < bytes)   // an odd tail: as SwapInPlace leaves it
+        {
+            memcpy(out + i, in + i, bytes - i);
+            SwapInPlace(out + i, bytes - i, endian);
+        }
     }
 
     std::map<uint32_t, uint64_t> gSubstitutedFormats;
@@ -613,13 +644,16 @@ namespace
         // into the same host texture rather than creating a new one each time.
         const uint64_t key = (uint64_t(t.base) << 20) ^ (uint64_t(t.format) << 8) ^ (uint64_t(t.width) << 44) ^ (uint64_t(t.height) << 30) ^ (t.tiled ? 1 : 0) ^ (uint64_t(faces) << 1) ^ (uint64_t(levels) << 58) ^ (uint64_t(t.mipAddress) << 4);
         const uint8_t* source = g_base + guest;
-        // Hashing the contents on every use dominated the command thread. Small textures (bone
-        // matrices, rewritten between draws) are still hashed every time; larger ones once per frame,
+        // Hashing the contents on every use dominated the command thread. Small data textures (bone
+        // matrices, rewritten between draws) are still hashed every time; the rest once per frame,
         // since the game streams them in between frames.
         struct HashMemo { uint64_t frame = ~0ull, hash = 0; };
         static std::unordered_map<uint64_t, HashMemo> hashMemo;
         static const bool hashEveryUse = GetEnvironmentVariableA("NIER_HASH_EVERY_USE", nullptr, 0) > 0;   // debugging
-        const bool large = !hashEveryUse && bytes + (levels > 1 ? mipBytes : 0) > 64 * 1024;
+        // Of the small ones only data textures are (one row, or a float format); hashing every small
+        // image on each use was still a seventh of the thread's time in a busy scene.
+        const bool dataTexture = t.height == 1 || t.format == 29 || (t.format >= 31 && t.format <= 38);
+        const bool large = !hashEveryUse && (bytes + (levels > 1 ? mipBytes : 0) > 64 * 1024 || !dataTexture);
         HashMemo* memo = large ? &hashMemo[key] : nullptr;
         // Every byte is hashed (XXH3, many GB/s): a bone matrix rewritten in place may change only some
         // of a texel's components, which sampling would miss.
@@ -891,7 +925,8 @@ namespace
     }
 
     // Converts the guest primitive type to a triangle list (rect lists stay as triples for the GS).
-    bool AssemblePrimitives(uint32_t primitive, const std::vector<uint32_t>& in, RendererDraw& draw)
+    // `in` is consumed: a triangle list without restart markers, the usual case, is taken as it is.
+    bool AssemblePrimitives(uint32_t primitive, std::vector<uint32_t>& in, RendererDraw& draw)
     {
         auto& out = draw.indices;
         auto forEachSegment = [&](auto&& emit) {
@@ -908,24 +943,47 @@ namespace
         switch (primitive)
         {
         case 4: case 8:
-            for (size_t i = 0; i + 3 <= in.size(); i += 3)
-                if (in[i] != kRestart && in[i + 1] != kRestart && in[i + 2] != kRestart) out.insert(out.end(), { in[i], in[i + 1], in[i + 2] });
+        {
             draw.rectList = primitive == 8;
+            uint32_t restarts = 0;
+            for (uint32_t index : in) restarts += index == kRestart;
+            if (!restarts)
+            {
+                in.resize(in.size() - in.size() % 3);
+                out = std::move(in);
+                return true;
+            }
+            out.reserve(in.size());
+            for (size_t i = 0; i + 3 <= in.size(); i += 3)
+                if (in[i] != kRestart && in[i + 1] != kRestart && in[i + 2] != kRestart) { out.push_back(in[i]); out.push_back(in[i + 1]); out.push_back(in[i + 2]); }
             return true;
+        }
         case 5:
+            out.reserve(in.size() * 3);
             forEachSegment([&](size_t begin, size_t end) {
-                for (size_t i = begin + 2; i < end; i++) out.insert(out.end(), { in[begin], in[i - 1], in[i] });
+                for (size_t i = begin + 2; i < end; i++) { out.push_back(in[begin]); out.push_back(in[i - 1]); out.push_back(in[i]); }
             });
             return true;
         case 6:
+        {
+            // Strips are most of the game's geometry: written through a pointer into room for the
+            // largest result (three indices for each one read), then cut to what was written.
+            out.resize(in.size() * 3);
+            uint32_t* write = out.data();
+            const uint32_t* read = in.data();
             forEachSegment([&](size_t begin, size_t end) {
                 for (size_t i = begin + 2; i < end; i++)
                 {
                     const bool odd = (i - begin) & 1;
-                    out.insert(out.end(), { in[odd ? i - 1 : i - 2], in[odd ? i - 2 : i - 1], in[i] });
+                    write[0] = read[odd ? i - 1 : i - 2];
+                    write[1] = read[odd ? i - 2 : i - 1];
+                    write[2] = read[i];
+                    write += 3;
                 }
             });
+            out.resize(size_t(write - out.data()));
             return true;
+        }
         case 13:
             for (size_t i = 0; i + 4 <= in.size(); i += 4) out.insert(out.end(), { in[i], in[i + 1], in[i + 2], in[i], in[i + 2], in[i + 3] });
             return true;
@@ -1046,14 +1104,12 @@ namespace
             copies[copyCount++] = { slot, first, last - first, d1 & 3, g_base + PhysicalToGuest(d0 & ~3u) };
             totalBytes += last - first;
         }
-        // Appended rather than resized first: resizing zero-fills, which cost as much as the copy.
-        draw.vertexData.reserve(totalBytes);
+        draw.vertexData.resize(totalBytes);   // not zero-filled
         uint32_t written = 0;
         for (uint32_t i = 0; i < copyCount; i++)
         {
             const VertexCopy& copy = copies[i];
-            draw.vertexData.insert(draw.vertexData.end(), copy.source + copy.first, copy.source + copy.first + copy.bytes);
-            SwapInPlace(draw.vertexData.data() + written, copy.bytes, copy.endian);
+            CopySwapped(draw.vertexData.data() + written, copy.source + copy.first, copy.bytes, copy.endian);
             draw.vertexBase[copy.slot] = written - copy.first;
             written += copy.bytes;
         }
@@ -1631,14 +1687,17 @@ namespace
         LARGE_INTEGER frequency, next;
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&next);
-        const int64_t period = frequency.QuadPart * 1001 / 60000;
+        // 60 Hz exactly, as the console's HD video modes are (not NTSC's 59.94): on a PC display the
+        // game then keeps step with the refresh instead of falling a frame behind every 17 seconds.
+        const int64_t period = frequency.QuadPart / 60;
         while (true)
         {
             // Sleep until about 2 ms before the vblank, then yield until it: Sleep(1) alone made
             // vblanks up to a millisecond late, and late vblanks delay 60 fps flips.
             next.QuadPart += period;
             const int64_t margin = frequency.QuadPart * 2 / 1000;
-            for (LARGE_INTEGER now;;)
+            if (RendererWaitDisplayVblank()) QueryPerformanceCounter(&next);   // in step with the display
+            else for (LARGE_INTEGER now;;)
             {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= next.QuadPart) break;

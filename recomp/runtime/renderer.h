@@ -3,6 +3,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <variant>
@@ -61,6 +62,26 @@ struct RenderTargetKey
     uint32_t edramBase = 0, width = 0, height = 0;
 };
 
+// A draw's vertex bytes. Unlike a std::vector, sizing it doesn't zero-fill: the bytes are written
+// straight after (zero-filling cost as much as the copy), and resizing discards what was there.
+struct ByteBuffer
+{
+    std::unique_ptr<uint8_t[]> bytes;
+    size_t count = 0;
+    ByteBuffer() = default;
+    ByteBuffer(ByteBuffer&&) = default;
+    ByteBuffer& operator=(ByteBuffer&&) = default;
+    ByteBuffer(const ByteBuffer& other) { assign(other.data(), other.count); }
+    ByteBuffer& operator=(const ByteBuffer& other) { if (this != &other) assign(other.data(), other.count); return *this; }
+    ByteBuffer& operator=(const std::vector<uint8_t>& other) { assign(other.data(), other.size()); return *this; }
+    void resize(size_t size) { bytes.reset(size ? new uint8_t[size] : nullptr); count = size; }
+    void assign(const uint8_t* from, size_t size) { resize(size); if (size) memcpy(bytes.get(), from, size); }
+    uint8_t* data() { return bytes.get(); }
+    const uint8_t* data() const { return bytes.get(); }
+    size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+};
+
 struct RendererDraw
 {
     std::shared_ptr<GuestShader> vs, ps;
@@ -88,7 +109,7 @@ struct RendererDraw
     bool frontCounterClockwise = true;
     uint32_t vertexCount = 0;
     std::vector<uint32_t> indices;             // empty means non-indexed
-    std::vector<uint8_t> vertexData;           // byte order already corrected
+    ByteBuffer vertexData;                     // byte order already corrected
     std::array<uint32_t, 96> vertexBase{};
     std::array<float, 2048> constants{};
     std::array<uint32_t, 8> boolConstants{};
@@ -130,6 +151,7 @@ struct RendererFrame
 // `nativeWindow` is the platform's window handle.
 void RendererInit(void* nativeWindow, uint32_t width, uint32_t height);
 void RendererResize(uint32_t width, uint32_t height);
+bool RendererWaitDisplayVblank();   // waits one 60 Hz period of the display's own refreshes; false if it can't
 bool RendererReady();   // the device exists and frames are accepted
 // Running totals in milliseconds: time the render thread waited for shader compiles, time spent
 // creating pipelines, time the render thread waited for pipelines.

@@ -113,6 +113,7 @@ float4 PSMain(Interpolated input) : SV_Target
     std::atomic<uint64_t> gRequestedSave{ 0 };   // from other threads; picked up by the render thread
     std::atomic<uint64_t> gSubmitted{ 0 }, gPresented{ 0 }, gMovieImages{ 0 }, gLateImages{ 0 };
     uint64_t gGapBins[8];
+    std::atomic<UINT> gVblankDivider{ 0 };   // display refreshes in a 60 Hz period when the display's rate is a multiple of 60 (and vsync is on); else 0
     uint64_t gLastHash = 0;
     LARGE_INTEGER gLastImage{};
     double gWorstGap = 0;
@@ -2055,7 +2056,40 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gQueue->ExecuteCommandLists(1, lists);
         const bool vsync = Settings().vsync != 0;
         const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
-        HRESULT presented = gSwapChain->Present(vsync ? 1 : 0, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        // Even frame pacing: on a display refreshing at a multiple of 60 Hz (120, 180, 240) a 60 fps
+        // frame presented at the next refresh lasted 3, 4 or 5 refreshes depending on when it happened
+        // to be ready, which shows as micro stutter in slow camera moves. Each game frame is instead
+        // held for the whole multiple. With frames waiting (the game is ahead) the frame is shown for
+        // one refresh, so the delay never builds up. NIER_PRESENT_INTERVAL=<n> forces the count; 1 turns this off (debugging).
+        UINT interval = vsync ? 1 : 0;
+        if (!vsync) gVblankDivider = 0;
+        if (vsync && guest)
+        {
+            static const UINT forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_PRESENT_INTERVAL", v, sizeof(v)) ? UINT(atoi(v)) : 0u; }();
+            static UINT multiple = 1, checked = 0;
+            if (checked++ % 120 == 0)   // the window can move to another display
+            {
+                MONITORINFOEXA info{};
+                info.cbSize = sizeof(info);
+                DEVMODEA mode{};
+                mode.dmSize = sizeof(mode);
+                UINT hz = 0;
+                if (GetMonitorInfoA(MonitorFromWindow(gWindow, MONITOR_DEFAULTTONEAREST), &info) && EnumDisplaySettingsA(info.szDevice, ENUM_CURRENT_SETTINGS, &mode))
+                    hz = mode.dmDisplayFrequency;
+                const UINT n = (hz + 30) / 60;
+                const UINT now = forced ? std::min<UINT>(forced, 4) : (n >= 2 && n <= 4 && hz + 1 >= n * 60 && hz <= n * 60 + 1) ? n : 1;
+                if (now != multiple || checked == 1) Log("[present] display at %u Hz: each 60 fps frame is held for %u refresh%s\n", hz, now, now == 1 ? "" : "es");
+                multiple = now;
+                gVblankDivider = (n >= 1 && n <= 4 && hz + 1 >= n * 60 && hz <= n * 60 + 1) ? n : 0;
+            }
+            bool waiting;
+            {
+                std::lock_guard lock(gMailboxMutex);
+                waiting = !gFrameQueue.empty();
+            }
+            if (!waiting && Settings().frameRate60) interval = multiple;
+        }
+        HRESULT presented = gSwapChain->Present(interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(presented))
         {
             Log("[d3d12] present failed: 0x%08lX, device status 0x%08lX\n", presented, gDevice->GetDeviceRemovedReason());
@@ -2256,6 +2290,34 @@ void RendererDumpStats()
         Log("[present] %llu new images on screen: worst gap %.1fms, %llu gaps over 60ms\n", gMovieImages.load(), gWorstGap, gLateImages.load());
         Log("[present] gaps in refreshes: 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7+:%llu\n", gGapBins[0], gGapBins[1], gGapBins[2], gGapBins[3], gGapBins[4], gGapBins[5], gGapBins[6], gGapBins[7]);
     }
+}
+
+// Waits for the display refreshes that make up one 60 Hz period, so that the game's vblank keeps
+// step with the display itself (two free-running 60 Hz clocks drift apart, and each time they
+// cross a frame is shown too long or too briefly). False when that isn't possible (the rate isn't
+// a multiple of 60, vsync is off, the display is asleep): the caller then keeps its own time.
+bool RendererWaitDisplayVblank()
+{
+    static const bool off = GetEnvironmentVariableA("NIER_NO_VBLANK_LOCK", nullptr, 0) > 0;   // debugging
+    const UINT divider = gVblankDivider.load();
+    if (off || !divider || !gReady || !gSwapChain) return false;
+    static ComPtr<IDXGIOutput> output;   // only the vblank thread comes here
+    static uint32_t uses = 0;
+    if (!output || uses++ % 240 == 0)    // the window can move to another display
+    {
+        output.Reset();
+        if (FAILED(gSwapChain->GetContainingOutput(&output))) return false;
+    }
+    LARGE_INTEGER frequency, begin, end;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&begin);
+    for (UINT i = 0; i < divider; i++)
+        if (FAILED(output->WaitForVBlank())) { output.Reset(); return false; }
+    QueryPerformanceCounter(&end);
+    const double ms = double(end.QuadPart - begin.QuadPart) * 1000.0 / double(frequency.QuadPart);
+    static bool logged = false;
+    if (!logged && ms >= 8.0 && ms <= 40.0) { logged = true; Log("[present] the game's vblank follows the display (every %u refresh%s)\n", divider, divider == 1 ? "" : "es"); }
+    return ms >= 8.0 && ms <= 40.0;   // an output that doesn't really wait returns at once
 }
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
