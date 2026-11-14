@@ -1,5 +1,6 @@
 # Runs nier.exe with a time limit, writing output to recomp/boot.log. Usage: run_boot.ps1 [seconds] [-Trace]
-param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest, [int]$SaveSlot = 0)
+param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest, [int]$SaveSlot = 0, [string]$Record = '', [string]$Replay = '')
+# -Record <file> writes the pad input given to the game; -Replay <file> plays such a file back (test runs).
 # -Playtest: a run for the user to play: sound, primary monitor, and the user's own settings.ini
 # (display mode, frame rate etc. from Options > Game Settings > PC Settings). Test runs instead use
 # recomp\test_settings.ini, stay windowed and unfocused (NIER_FULLSCREEN=0), and run at 60 fps
@@ -17,6 +18,10 @@ if (-not $env:NIER_PLAYER_NAME) { $env:NIER_PLAYER_NAME = 'Nier' }   # skips the
 if (-not $Playtest -and -not $env:NIER_MONITOR) { $env:NIER_MONITOR = 'secondary' }      # keeps test windows off the main screen
 if ($Sound) { Remove-Item Env:NIER_MUTE -ErrorAction SilentlyContinue } else { $env:NIER_MUTE = '1' }   # test runs stay silent
 if ($LogDrawsAt -gt 0) { $env:NIER_LOG_DRAWS_AT = "$LogDrawsAt" } else { Remove-Item Env:NIER_LOG_DRAWS_AT -ErrorAction SilentlyContinue }
+# Test runs ignore real controllers (the player may be holding one); a recording run and a playtest read them.
+if ($Playtest -or $Record) { Remove-Item Env:NIER_IGNORE_PADS -ErrorAction SilentlyContinue } else { $env:NIER_IGNORE_PADS = '1' }
+if ($Record) { $env:NIER_RECORD_INPUT = $Record } else { Remove-Item Env:NIER_RECORD_INPUT -ErrorAction SilentlyContinue }
+if ($Replay) { $env:NIER_REPLAY_INPUT = $Replay } else { Remove-Item Env:NIER_REPLAY_INPUT -ErrorAction SilentlyContinue }
 if ($AutoPress) { $env:NIER_AUTO_PRESS = $AutoPress } else { Remove-Item Env:NIER_AUTO_PRESS -ErrorAction SilentlyContinue }
 if ($SaveFrames) { $env:NIER_SAVE_FRAMES = $SaveFrames } else { Remove-Item Env:NIER_SAVE_FRAMES -ErrorAction SilentlyContinue }
 $root = Split-Path $PSScriptRoot -Parent

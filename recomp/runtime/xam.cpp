@@ -580,6 +580,18 @@ void XamInstallHooks()
     PPC_LOOKUP_FUNC(g_base, 0x8213BE50) = ShowSaveMessage;
 }
 
+// The notice that DLC quests are available, shown every time Continue is chosen (two pages to
+// confirm): skipped, with the flag that asks for it cleared as the game does after showing it.
+// NIER_DLC_NOTICE=1 keeps it. See nier_hooks.toml.
+bool SkipDlcNotice(PPCRegister& r30)
+{
+    if (GetEnvironmentVariableA("NIER_DLC_NOTICE", nullptr, 0) > 0) return false;
+    W8(r30.u32, 0);
+    static std::atomic<int> logged{ 0 };
+    if (logged++ < 2) Log("[xam] skipped the DLC notice\n");
+    return true;
+}
+
 // "Select Device" row on the save list (load and save screens): see nier_hooks.toml.
 void DisableSelectDeviceRow(PPCRegister& r30)
 {

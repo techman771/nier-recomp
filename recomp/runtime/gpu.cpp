@@ -18,6 +18,7 @@
 #include "renderer.h"
 #include "settings.h"
 #include "glyphs.h"
+#include "framecapture.h"
 #include "xenos_shader.h"
 #include <xxHash/xxhash.h>   // texture content hashes (xxhash.lib is linked already)
 
@@ -208,6 +209,12 @@ namespace
         out.packedMips = (c[5] >> 11) & 1;
         out.mipAddress = c[5] & 0xFFFFF000;
         out.maxLevel = (c[4] >> 6) & 0xF;
+        if (out.width <= 16 && out.height <= 16 && out.format >= 18 && out.format <= 20)
+        {
+            static std::set<uint32_t> seen;   // debugging: the raw state of tiny compressed textures
+            if (seen.size() < 12 && seen.insert(out.base ^ slot).second)
+                Log("[gpu] tiny texture slot %u %ux%u format %u base %08X: %08X %08X %08X %08X %08X %08X\n", slot, out.width, out.height, out.format, out.base, c[0], c[1], c[2], c[3], c[4], c[5]);
+        }
         return true;
     }
 
@@ -271,6 +278,9 @@ namespace
         gMovieLastSwap = frame;
     }
 
+    uint64_t gSaveCommandsAt = ~0ull;   // F12: the frame whose renderer commands are saved (framecapture.cpp)
+    const std::vector<uint32_t>* ShaderWords(bool pixel, uint64_t hash);
+
     // Until real rendering exists, only movie frames have a picture to show.
     void PresentCurrentFrame(uint64_t frame)
     {
@@ -309,6 +319,14 @@ namespace
         const size_t commandCount = gFrameCommands.size();
         output.commands = std::move(gFrameCommands);
         output.scanoutBase = gScanoutBase;
+        if (frame == gSaveCommandsAt)
+        {
+            char path[96];
+            CreateDirectoryA("../captures", nullptr);
+            snprintf(path, sizeof(path), "../captures/frame_f%llu.nfrm", frame - 1);
+            FrameCaptureSave(output, path, ShaderWords);
+            gSaveCommandsAt = ~0ull;
+        }
         gFrameCommands.clear();
         gFrameCommands.reserve(commandCount + commandCount / 4 + 16);   // draws are large; avoid regrowing
         RendererSubmitFrame(std::move(output));
@@ -341,6 +359,12 @@ namespace
             if (FILE* file = fopen(path, "wb")) { fwrite(words.data(), 4, words.size(), file); fclose(file); }
             gShaderLibrary[stage][hash] = std::move(words);
         }
+    }
+
+    const std::vector<uint32_t>* ShaderWords(bool pixel, uint64_t hash)
+    {
+        auto found = gShaderLibrary[pixel ? 1 : 0].find(hash);
+        return found == gShaderLibrary[pixel ? 1 : 0].end() ? nullptr : &found->second;
     }
 
     struct CachedShader { std::shared_ptr<GuestShader> shader; TranslatedShader info; };
@@ -684,7 +708,17 @@ namespace
                 for (char* item = strtok(value, ","); item; item = strtok(nullptr, ",")) bases.insert(strtoul(item, nullptr, 16));
             return bases;
         }();
-        if (dumpTextures.count(t.base))
+        // NIER_DUMP_TEX_FORMAT=<guest format>: the same for the first 48 mipmapped 2D textures of that
+        // format. After the base level come the level count and, per further level, row pitch, rows
+        // and data (tools can then compare each level with the base scaled down).
+        static const uint32_t dumpFormat = [] {
+            char value[16];
+            return GetEnvironmentVariableA("NIER_DUMP_TEX_FORMAT", value, sizeof(value)) ? uint32_t(strtoul(value, nullptr, 10)) : ~0u;
+        }();
+        static int formatDumps = 0;
+        const bool dumpByFormat = t.format == dumpFormat && levels > 1 && faces == 1 && formatDumps < 48;
+        if (dumpByFormat) formatDumps++;
+        if (dumpTextures.count(t.base) || dumpByFormat)
         {
             CreateDirectoryA("..\\captures", nullptr);
             char path[96];
@@ -695,6 +729,15 @@ namespace
                 const uint32_t header[6] = { uint32_t(format), decoded->width, decoded->height, sub.rowPitch, sub.rows, t.format };
                 fwrite(header, 4, 6, file);
                 fwrite(decoded->data.data() + sub.offset, 1, size_t(sub.rowPitch) * sub.rows, file);
+                const uint32_t levelCount = faces == 1 ? uint32_t(decoded->subresources.size()) : 1;
+                fwrite(&levelCount, 4, 1, file);
+                for (uint32_t level = 1; level < levelCount; level++)
+                {
+                    const DecodedTexture::Subresource& mip = decoded->subresources[level];
+                    const uint32_t shape[2] = { mip.rowPitch, mip.rows };
+                    fwrite(shape, 4, 2, file);
+                    fwrite(decoded->data.data() + mip.offset, 1, size_t(mip.rowPitch) * mip.rows, file);
+                }
                 fclose(file);
                 Log("[gpu] dumped texture %08X (%ux%u format %u, pitch %u, tiled %d, endian %u, levels %u, packed %d)\n", t.base, t.width, t.height, t.format, t.pitch, t.tiled ? 1 : 0, t.endian, levels, t.packedMips ? 1 : 0);
             }
@@ -922,6 +965,18 @@ namespace
         draw.hasColor = hasColor;
         draw.depthControl = r[0x2200];
         draw.stencilRefMask = r[0x210D];
+        {
+            // PA_SU_SC_MODE_CNTL: bit 0 culls front faces, bit 1 back faces, bit 2 set makes clockwise
+            // the front. Rectangles are never culled. NIER_NO_CULL=1 turns culling off (debugging).
+            static const bool noCull = GetEnvironmentVariableA("NIER_NO_CULL", nullptr, 0) > 0;
+            const uint32_t mode = r[0x2205];
+            if (!draw.rectList && !noCull)
+            {
+                if ((mode & 3) == 3) { SkipDraw("both faces culled"); return; }
+                draw.cull = (mode & 1) ? 1 : (mode & 2) ? 2 : 0;
+            }
+            draw.frontCounterClockwise = !((mode >> 2) & 1);
+        }
         static const bool depthDisabled = GetEnvironmentVariableA("NIER_NO_DEPTH", nullptr, 0) > 0;  // debugging
         if ((draw.depthControl & 3) && !depthDisabled)   // stencil or depth test enabled
         {
@@ -1332,10 +1387,19 @@ namespace
                 Log("[capture] frame %llu captured\n", gCaptureFrame);
                 gCaptureFrame = ~0ull;
             }
+            {
+                // NIER_CAPTURE_AT=<frame>: the same as pressing F12 at that frame (test runs).
+                static const uint64_t captureAt = [] {
+                    char value[32];
+                    return GetEnvironmentVariableA("NIER_CAPTURE_AT", value, sizeof(value)) ? strtoull(value, nullptr, 10) : ~0ull;
+                }();
+                if (frame == captureAt) gCaptureRequested = true;
+            }
             if (gCaptureRequested.exchange(false))
             {
                 // The frame starting now is logged draw by draw and its image saved.
                 gCaptureFrame = frame;
+                gSaveCommandsAt = frame + 1;   // its commands are submitted at the next swap
                 gLogDrawsAt = frame;
                 CreateDirectoryA("..\\captures", nullptr);
                 char path[96];

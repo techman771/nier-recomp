@@ -527,6 +527,26 @@ read pointer writeback, memory and scratch writes, fences, `WAIT_REG_MEM`, CP in
   silent. The title movie's audio doesn't need it.
 - Movie smoothness: see below.
 
+### Frame captures (the fastest way to work on a graphics bug)
+
+F12 in the game (or `NIER_CAPTURE_AT=<frame>` in a test run) saves that frame's renderer commands
+to `recomp/captures/frame_f<N>.nfrm` next to the draw log and the picture: every draw's shaders
+(with their microcode), raw vertex data, constants, state and decoded textures, and the resolves
+(framecapture.cpp; about 90 MB a frame, not committed). `tools/replay_frame.ps1 <capture>` renders
+it without the game in about two seconds and writes a PNG beside it (or `-Out`); the picture
+matches the game's. `-Cull 'mode,ccw'` forces face culling (captures made before culling
+existed, version 1, hold no cull state). `tools/nfrm.py` reads a capture: lists commands,
+prints a draw's vertex streams, histograms a bit field, returns constants. The shaders are translated again from the microcode, so translator changes,
+`-PsDebug '<hash>=<expr>'` and `-Patch '<hash>|<find>|<replace>'` apply. `-Zoom 'z,x,y'` magnifies
+the scene z times around the screen point x,y (0-1); it is a real close-up, not an enlarged
+picture: the viewport of depth-tested draws into full-width targets is scaled, while full-screen
+passes, the HUD and shadow passes are left alone. `-Skip '3,10-14'` leaves commands out and
+`-Stop n` drops every draw from command n on; `recomp/replay.log` lists the commands by index
+with their shaders and textures. `-Show` keeps the window open. Limits: one frozen frame, so
+nothing that depends on game logic or timing; textures that the previous frame resolved are
+approximated by replaying the frame repeatedly (40 times by default); texture decoding is not
+redone (the capture holds decoded textures).
+
 ### Playtest issues
 
 Saves: the user's playthrough saves live in `save/` (backup in `save_backups/`). Test runs from
@@ -536,6 +556,39 @@ routes load Game 1 by default rather than start a new game, unless the user says
 
 From the user's playthrough (open unless marked):
 - Blocky shadows.
+- FIXED (confirmed by the user in play): square patches on the sheep's
+  legs and beards, Yonah's dress and hair, Nier's waist cloth, AND the dust that filled the screen
+  in the cutscene after the Lost Shrine boss. One cause: no face culling. Cloth, fur and hair are
+  modelled double-sided as two coincident layers, every vertex twice at the same position with
+  exactly opposite normals (877 of 1,234 seam pairs on Yonah's dress), and the game culls back
+  faces (PA_SU_SC_MODE_CNTL, register 0x2205: bit 0 cull front, bit 1 cull back, bit 2 clockwise
+  is front). The renderer drew with culling off, so the inward layer fought the outward one at
+  equal depth and won in patches; the dust and light-ray effects likewise showed the faces that
+  should be hidden. Now `RendererDraw::cull` / `frontCounterClockwise` (gpu.cpp BuildDraw,
+  pipeline state in renderer_d3d12.cpp); a draw with both faces culled is skipped; rectangles
+  are never culled; `NIER_NO_CULL=1` turns it off. In the village frame 163 draws cull back
+  faces, 92 don't cull, none cull front. Found with a frame capture: showing `input.t[0]` (the
+  interpolated normal) with -PsDebug gave a checker, and tools/nfrm.py showed the paired vertices.
+  Dead ends on the way, all ruled out: NaN in shader 46155F8651382D13 (the select translation
+  was still wrong for NaN and is fixed; its guard is now `precise`), IEEE strictness, a precise
+  vertex position, broken mip levels, the 4x4 texture in slot 10 of Yonah's dress, handedness.
+- Test tools added for this: `run_boot.ps1 -Record <file>` / `-Replay <file>` (NIER_RECORD_INPUT,
+  NIER_REPLAY_INPUT: the pad state by frame; scripted presses still apply during a replay) and
+  NIER_AUTO_MOVE=<frame>,<frames>,<lx>,<ly>[;...] for the left stick. Test runs ignore real
+  controllers (NIER_IGNORE_PADS=1, set by run_boot.ps1 unless -Playtest or -Record). `recomp/recordings/shrine_roof.txt` (not committed)
+  loads Game 2 (Lost Shrine: Roof) and walks through the boss door to the altar where Yonah
+  lies, about 5,000 frames; Examine there only says a force blocks the way.
+- DLC ("The World of Recycled Vessel"): works, confirmed by the user after getting Grimoire Weiss.
+- DLC notice on Continue ("The quest "Recycled World" is now available." and where to find it:
+  info-window messages 2481 / 2482, two pages to confirm on every load) is skipped: sub_8219B0D0
+  shows it through sub_823C5140 while a flag at its object +0x20C00 is set, then clears the flag;
+  the hook `SkipDlcNotice` at 0x8219B300 clears the flag and jumps past (xam.cpp;
+  NIER_DLC_NOTICE=1 keeps the notice). The load route in loadsave_args.txt still works; its
+  extra A presses now land after the save has loaded.
+- "Press START to Skip" in cutscenes: text 11202000 now returns "Press <ICON=13> to Skip"
+  (confirmed by the user). `<ICON=n>` in game text draws cell n of
+  the button atlas (0 A, 1 B, 2 X, 3 Y, 4-7 LT RT LB RB, 8 L, 9 R, 11 R3, 12 Back, 13 Start,
+  16-19 d-pad right left up down); the tutorials use it.
 - PC settings menu: phase 1 done (see "PC Settings page"). Still to come, by phase: mouse input and
   rebinding (controllers and input-aware glyphs are done, see "Controllers and button glyphs"); graphics quality
   (resolution scale, shadow resolution, ambient occlusion); a Vulkan renderer (then DX12 / Vulkan).

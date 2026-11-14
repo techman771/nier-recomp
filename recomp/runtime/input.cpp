@@ -440,8 +440,11 @@ GUEST_IMPORT(XamInputGetState)
 
     if (user != 0) { ctx.r3.u64 = X_ERROR_DEVICE_NOT_CONNECTED; return; }   // every controller drives player one
 
+    // NIER_IGNORE_PADS=1: controllers are not read. Test runs set it (run_boot.ps1), or a controller
+    // in the player's hands would drive them too; a recording run leaves it off.
+    static const bool ignorePads = GetEnvironmentVariableA("NIER_IGNORE_PADS", nullptr, 0) > 0;
     PadState pad;
-    for (uint32_t slot = 0; slot < USERS; slot++)
+    for (uint32_t slot = 0; slot < USERS && !ignorePads; slot++)
     {
         PadState one;
         InputStyle style = InputStyle::Xbox;
@@ -468,7 +471,71 @@ GUEST_IMPORT(XamInputGetState)
         const uint64_t frame = GpuFrameCount();
         if (frame >= hold.frame && frame < hold.frame + hold.frames) { pad.rx = int16_t(hold.rx); pad.ry = int16_t(hold.ry); }
     }
+    {
+        // NIER_AUTO_MOVE=<frame>,<frames>,<lx>,<ly>[;...]: holds the left stick over those frames, to
+        // walk somewhere in a test run (stick range -32768..32767, y up).
+        struct Move { uint64_t frame, frames; int lx, ly; };
+        static const std::vector<Move> moves = [] {
+            std::vector<Move> list; char value[512];
+            if (GetEnvironmentVariableA("NIER_AUTO_MOVE", value, sizeof(value)))
+                for (char* item = strtok(value, ";"); item; item = strtok(nullptr, ";"))
+                {
+                    Move m{};
+                    if (sscanf(item, "%llu,%llu,%d,%d", &m.frame, &m.frames, &m.lx, &m.ly) == 4) list.push_back(m);
+                }
+            return list;
+        }();
+        const uint64_t frame = GpuFrameCount();
+        for (const Move& m : moves)
+            if (frame >= m.frame && frame < m.frame + m.frames) { pad.lx = int16_t(m.lx); pad.ly = int16_t(m.ly); }
+    }
     pad.buttons |= ScriptedButtons();
+    {
+        // Recorded input for test runs. NIER_RECORD_INPUT=<file> writes the pad state the game is
+        // given each time it changes ("frame buttons lt rt lx ly rx ry"); NIER_REPLAY_INPUT=<file>
+        // gives the game that state back by frame and ignores every device (scripted presses still
+        // apply). Loading
+        // takes wall-clock time, so a replay drifts by a few frames: fine for walking somewhere,
+        // not for a fight.
+        struct Entry { uint64_t frame; PadState pad; };
+        static const std::vector<Entry> replay = [] {
+            std::vector<Entry> list; char path[MAX_PATH];
+            if (GetEnvironmentVariableA("NIER_REPLAY_INPUT", path, sizeof(path)))
+                if (FILE* file = fopen(path, "r"))
+                {
+                    unsigned long long frame; unsigned buttons, lt, rt; int lx, ly, rx, ry;
+                    while (fscanf(file, "%llu %x %u %u %d %d %d %d", &frame, &buttons, &lt, &rt, &lx, &ly, &rx, &ry) == 8)
+                        list.push_back({ frame, { uint16_t(buttons), uint8_t(lt), uint8_t(rt), int16_t(lx), int16_t(ly), int16_t(rx), int16_t(ry) } });
+                    fclose(file);
+                    Log("[input] replaying %zu recorded pad states from %s\n", list.size(), path);
+                }
+            return list;
+        }();
+        const uint64_t frame = GpuFrameCount();
+        if (!replay.empty())
+        {
+            auto next = std::upper_bound(replay.begin(), replay.end(), frame, [](uint64_t f, const Entry& e) { return f < e.frame; });
+            pad = next == replay.begin() ? PadState{} : (next - 1)->pad;
+            pad.buttons |= ScriptedButtons();   // NIER_AUTO_PRESS still applies, to go on from where a recording ends
+        }
+        static FILE* record = [] {
+            char path[MAX_PATH];
+            return GetEnvironmentVariableA("NIER_RECORD_INPUT", path, sizeof(path)) ? fopen(path, "w") : nullptr;
+        }();
+        if (record)
+        {
+            static std::mutex mutex;
+            static PadState last;
+            static bool any = false;
+            std::lock_guard lock(mutex);
+            if (!any || memcmp(&last, &pad, sizeof(pad)) != 0)
+            {
+                fprintf(record, "%llu %x %u %u %d %d %d %d\n", (unsigned long long)frame, pad.buttons, pad.leftTrigger, pad.rightTrigger, pad.lx, pad.ly, pad.rx, pad.ry);
+                fflush(record);
+                last = pad; any = true;
+            }
+        }
+    }
 
     if (state)
     {

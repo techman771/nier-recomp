@@ -12,6 +12,7 @@
 #include <vector>
 #include "guest.h"
 #include "settings.h"
+#include "framecapture.h"
 
 namespace
 {
@@ -556,6 +557,7 @@ int main(int argc, char** argv)
     ThreadsInit();
     SettingsLoad();
     PresenterInit();
+    FrameReplayRunIfRequested();   // NIER_REPLAY_FRAME: render a saved frame instead of running the game
     BuildFunctionIndex();
     uint32_t entry = LoadGame(gameDir);
     ProfilerInit();

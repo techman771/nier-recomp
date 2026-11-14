@@ -67,3 +67,12 @@ jump_address_on_true = 0x8241C860
 name = "PcSettingsTick"
 address = 0x8241C020
 registers = ["r3"]
+
+# The DLC notice on Continue (sub_8219B0D0: "The quest "Recycled World" is now available." and where
+# to find it, messages 2481 / 2482, shown while the flag at r30 is set): clear the flag and go on
+# as after the notice (runtime: xam.cpp).
+[[midasm_hook]]
+name = "SkipDlcNotice"
+address = 0x8219B300
+registers = ["r30"]
+jump_address_on_true = 0x8219B368

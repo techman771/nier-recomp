@@ -605,11 +605,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::shared_ptr<GuestShader> vs, ps;
         uint32_t blendControl = 0, writeMask = 0, depthControl = 0, stencilRefMask = 0;
         bool rectList = false, hasColor = false, depthBound = false;
+        uint8_t cull = 0;
+        bool frontCounterClockwise = true;
     };
 
     PipelineState PipelineStateOf(const RendererDraw& draw)
     {
-        return { draw.vs, draw.ps, draw.blendControl, draw.writeMask, draw.depthControl, draw.stencilRefMask, draw.rectList, draw.hasColor, draw.depthBound };
+        return { draw.vs, draw.ps, draw.blendControl, draw.writeMask, draw.depthControl, draw.stencilRefMask, draw.rectList, draw.hasColor, draw.depthBound,
+                 draw.cull, draw.frontCounterClockwise };
     }
 
     uint64_t PipelineKey(const PipelineState& s)
@@ -618,6 +621,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         key = (key ^ s.blendControl) * 1099511628211ull;
         key = (key ^ (uint64_t(s.writeMask) << 1) ^ (s.rectList ? 1 : 0)) * 1099511628211ull;
         key = (key ^ s.depthControl ^ (uint64_t(s.stencilRefMask & 0xFFFF00) << 32) ^ (uint64_t(s.hasColor) << 60) ^ (uint64_t(s.depthBound) << 61)) * 1099511628211ull;
+        key = (key ^ s.cull ^ (s.frontCounterClockwise ? 4 : 0)) * 1099511628211ull;
         return key;
     }
 
@@ -722,7 +726,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
             target.RenderTargetWriteMask = UINT8(draw.writeMask);
             desc.SampleMask = UINT_MAX;
             desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.CullMode = draw.rectList || draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+            desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
             desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             desc.NumRenderTargets = draw.hasColor ? 1 : 0;
             desc.RTVFormats[0] = draw.hasColor ? kTargetFormat : DXGI_FORMAT_UNKNOWN;
@@ -1904,6 +1909,7 @@ void RendererDumpStats()
 }
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
+bool RendererReady() { return gReady; }
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader) { QueueShader(shader); }
 
 // Starts creating the pipeline a draw needs, if this combination is new (GPU emulation thread).

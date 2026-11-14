@@ -232,9 +232,12 @@ float3 CubeDirection(float3 c)
             case 9: return "trunc(" + a + ")";
             case 10: return "floor(" + a + ")";
             case 11: return a + " * " + b + " + " + c;
-            case 12: return "lerp(" + c + ", " + b + ", float4(" + a + " == 0.0))";
-            case 13: return "lerp(" + c + ", " + b + ", float4(" + a + " >= 0.0))";
-            case 14: return "lerp(" + c + ", " + b + ", float4(" + a + " > 0.0))";
+            // Conditional selects (CNDEQ, CNDGE, CNDGT). A true per-component select, not a lerp: some
+            // shaders use them to replace NaN (x - x compared with itself after a 1 / 0), and a lerp
+            // with a NaN operand is NaN whatever the weight.
+            case 12: return "((" + a + " == 0.0) ? " + b + " : " + c + ")";
+            case 13: return "((" + a + " >= 0.0) ? " + b + " : " + c + ")";
+            case 14: return "((" + a + " > 0.0) ? " + b + " : " + c + ")";
             case 15: return "dot(" + a + ", " + b + ").xxxx";
             case 16: return "dot((" + a + ").xyz, (" + b + ").xyz).xxxx";
             case 17: return "(dot((" + a + ").xy, (" + b + ").xy) + (" + c + ").x).xxxx";
@@ -353,7 +356,12 @@ float3 CubeDirection(float3 c)
             }
             else
             {
-                body += "        float4 v_ = " + VectorExpression(vectorOp, Source(1, w), Source(2, w), Source(3, w)) + ";\n";
+                // The game's NaN test is x - x (an add of a value and its negation) followed by a
+                // compare of the result with itself. Both are marked `precise`, or the compiler and
+                // the driver may fold them to 0 and "equal" and the NaN gets through.
+                const std::string a = Source(1, w), b = Source(2, w);
+                const bool nanTest = (vectorOp == 0 && (a == "(-" + b + ")" || b == "(-" + a + ")")) || (vectorOp == 4 && a == b);
+                body += std::string("        ") + (nanTest ? "precise " : "") + "float4 v_ = " + VectorExpression(vectorOp, a, b, Source(3, w)) + ";\n";
             }
             scalarAfter.clear();
             body += "        float s_ = " + ScalarExpression(scalarOp, w) + ";\n";

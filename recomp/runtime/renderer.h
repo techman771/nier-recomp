@@ -71,6 +71,11 @@ struct RendererDraw
     uint32_t depthControl = 0, stencilRefMask = 0;
     uint32_t blendControl = 0, writeMask = 0xF;
     bool rectList = false;
+    // Face culling (PA_SU_SC_MODE_CNTL): 0 none, 1 front faces, 2 back faces; which winding is the
+    // front. Double-sided cloth, fur and hair are modelled as two coincident layers with opposite
+    // normals and rely on this to hide the one facing away.
+    uint8_t cull = 0;
+    bool frontCounterClockwise = true;
     uint32_t vertexCount = 0;
     std::vector<uint32_t> indices;             // empty means non-indexed
     std::vector<uint8_t> vertexData;           // byte order already corrected
@@ -115,6 +120,7 @@ struct RendererFrame
 // `nativeWindow` is the platform's window handle.
 void RendererInit(void* nativeWindow, uint32_t width, uint32_t height);
 void RendererResize(uint32_t width, uint32_t height);
+bool RendererReady();   // the device exists and frames are accepted
 
 // Called once per guest swap. The planes are copied before returning.
 void RendererSubmitMovieFrame(uint64_t frame, const RendererPlane& y, const RendererPlane& u, const RendererPlane& v);
