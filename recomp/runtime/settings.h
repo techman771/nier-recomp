@@ -10,6 +10,7 @@ struct PcSettings
     std::atomic<int> vsync{ 1 };
     std::atomic<int> masterVolume{ 10 };       // 0-10
     std::atomic<int> muteInBackground{ 1 };    // silence while the window isn't focused
+    std::atomic<int> mouseSensitivity{ 5 };    // 0-10; 0 turns the mouse camera off
 };
 
 PcSettings& Settings();
@@ -19,3 +20,9 @@ void SettingsPollPage();   // live values while the PC Settings page is open (ca
 
 // Applying settings that need more than a read at the point of use.
 void PresenterSetFullscreen(bool on);   // present.cpp; safe from any thread
+void PresenterTakeMouseMotion(int& dx, int& dy);   // mouse movement since the last call, in device counts
+
+// Menu pointer (present.cpp): the cursor in the game's 1280x720 screen space and what the mouse did
+// since the last call. False when the window isn't focused (or the pointer is outside the picture).
+struct MenuMouse { float x = 0, y = 0; bool moved = false; int leftClicks = 0, rightClicks = 0, wheel = 0; };
+bool PresenterTakeMenuMouse(MenuMouse& mouse);

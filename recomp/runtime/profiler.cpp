@@ -346,6 +346,31 @@ namespace
                 }
             }
         }
+        // NIER_SCAN_F32=<value>,<tolerance>: logs guest addresses holding a big-endian float that close to the value.
+        char nearText[64];
+        if (GetEnvironmentVariableA("NIER_SCAN_F32", nearText, sizeof(nearText)))
+        {
+            const float wanted = strtof(nearText, nullptr);
+            const char* comma = strchr(nearText, ',');
+            const float tolerance = comma ? strtof(comma + 1, nullptr) : 0.001f;
+            MEMORY_BASIC_INFORMATION info{};
+            int found = 0;
+            for (uint64_t address = 0; address < 0x100000000ull && found < 200;)
+            {
+                if (!VirtualQuery(g_base + address, &info, sizeof(info)) || !info.RegionSize) break;
+                const uint64_t start = uint64_t(static_cast<uint8_t*>(info.BaseAddress) - g_base);
+                address = start + info.RegionSize;
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
+                if (info.State != MEM_COMMIT || !(info.Protect & readable) || (info.Protect & PAGE_GUARD)) continue;
+                for (uint64_t at = start; at + 4 <= start + info.RegionSize && found < 200; at += 4)
+                {
+                    const uint32_t bits = R32(uint32_t(at));
+                    float value;
+                    memcpy(&value, &bits, 4);
+                    if (std::fabs(value - wanted) <= tolerance) { Log("[scan] %08X holds %.6f\n", uint32_t(at), value); found++; }
+                }
+            }
+        }
         // NIER_SCAN_TEXT=<ascii>: logs guest addresses holding that text as bytes, UTF-16BE or UTF-16LE,
         // with the surrounding text.
         char text[128];

@@ -7,3 +7,7 @@ struct DecodedTexture;
 // The texture to draw in place of a decoded guest texture: one of our glyph atlases when it is the
 // game's button atlas and the device in use calls for another set; otherwise the texture itself.
 std::shared_ptr<DecodedTexture> GlyphAtlasFor(const std::shared_ptr<DecodedTexture>& original, uint32_t guestFormat, uint32_t width, uint32_t height);
+
+// The keyboard set (keyglyphs.cpp): drawn from the current key bindings.
+bool DrawKeyboardAtlas(uint8_t* rgba, uint32_t width, uint32_t height);
+uint64_t KeyBindingsStamp();   // changes when a key is rebound

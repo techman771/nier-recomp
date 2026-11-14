@@ -13,12 +13,14 @@
 #include <SDL3/SDL_main.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include "guest.h"
 #include "input.h"
+#include "settings.h"
 
 namespace
 {
@@ -223,34 +225,189 @@ namespace
 
     bool Key(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 
+    // Keyboard bindings: each pad control has one key (rebindable from PC Settings > Key Bindings,
+    // saved in settings.ini as key_<id>). Order matters: 0-11 are the buttons page, 12-23 the
+    // movement page.
+    enum Kind { Button, LeftTrigger, RightTrigger, LxMinus, LxPlus, LyPlus, LyMinus, RxMinus, RxPlus, RyPlus, RyMinus };
+    struct Action { KeyAction info; Kind kind; uint16_t bit; };
+    const Action kActions[kKeyActions] = {
+        { { "a", "Jump / Confirm (A)", VK_SPACE }, Button, 0x1000 }, { { "b", "Talk / Cancel (B)", VK_LSHIFT }, Button, 0x2000 },
+        { { "x", "Attack (X)", VK_LBUTTON }, Button, 0x4000 }, { { "y", "Heavy Attack (Y)", VK_RBUTTON }, Button, 0x8000 },
+        { { "lb", "Ability Slot (LB)", 'Q' }, Button, 0x0100 }, { { "rb", "Ability Slot (RB)", 'F' }, Button, 0x0200 },
+        { { "lt", "Ability Slot (LT)", 'Z' }, LeftTrigger, 0 }, { { "rt", "Ability Slot (RT)", 'C' }, RightTrigger, 0 },
+        { { "start", "Pause Menu (Start)", VK_ESCAPE }, Button, 0x0010 }, { { "back", "Map (Back)", VK_TAB }, Button, 0x0020 },
+        { { "l3", "Left Stick Click (L3)", 0 }, Button, 0x0040 }, { { "r3", "Reset Camera (R3)", VK_MBUTTON }, Button, 0x0080 },
+        { { "move_up", "Move Up", 'W' }, LyPlus, 0 }, { { "move_down", "Move Down", 'S' }, LyMinus, 0 },
+        { { "move_left", "Move Left", 'A' }, LxMinus, 0 }, { { "move_right", "Move Right", 'D' }, LxPlus, 0 },
+        { { "camera_up", "Camera Up", 'I' }, RyPlus, 0 }, { { "camera_down", "Camera Down", 'K' }, RyMinus, 0 },
+        { { "camera_left", "Camera Left", 'J' }, RxMinus, 0 }, { { "camera_right", "Camera Right", 'L' }, RxPlus, 0 },
+        { { "dpad_up", "Item Menu (D-Pad Up)", VK_UP }, Button, 0x0001 }, { { "dpad_down", "1H Sword Menu (D-Pad Down)", VK_DOWN }, Button, 0x0002 },
+        { { "dpad_left", "2H Sword Menu (D-Pad Left)", VK_LEFT }, Button, 0x0004 }, { { "dpad_right", "Spear Menu (D-Pad Right)", VK_RIGHT }, Button, 0x0008 },
+    };
+    std::atomic<int> gKeys[kKeyActions];
+    std::atomic<bool> gKeysReady{ false }, gCapture{ false }, gCaptureArmed{ false };
+
+    void EnsureKeys()
+    {
+        if (gKeysReady.exchange(true)) return;
+        for (int i = 0; i < kKeyActions; i++) if (!gKeys[i].load()) gKeys[i] = kActions[i].info.defaultKey;
+    }
+
+    std::atomic<uint64_t> gPointerUntil{ 0 }, gInjectUntil{ 0 };
+    std::atomic<uint16_t> gInjected{ 0 };
+    bool IsMouseButton(int key) { return key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2; }
+
     // Returns true when a bound key is down.
     bool ApplyKeyboard(PadState& s)
     {
-        if (!PresenterHasFocus()) return false;
+        if (!PresenterHasFocus() || gCapture.load()) return false;   // a key being captured for a binding isn't input
+        EnsureKeys();
         bool any = false;
-        struct Binding { int key; uint16_t button; };
-        static const Binding kBindings[] = {
-            { VK_UP, 0x0001 }, { VK_DOWN, 0x0002 }, { VK_LEFT, 0x0004 }, { VK_RIGHT, 0x0008 },
-            { VK_RETURN, 0x0010 }, { VK_TAB, 0x0020 }, { 'V', 0x0040 }, { 'B', 0x0080 },
-            { 'Q', 0x0100 }, { 'F', 0x0200 }, { VK_SPACE, 0x1000 }, { VK_LSHIFT, 0x2000 },
-            { 'E', 0x4000 }, { 'R', 0x8000 },
-        };
-        for (const auto& binding : kBindings) if (Key(binding.key)) { s.buttons |= binding.button; any = true; }
-        if (Key('Z')) { s.leftTrigger = 255; any = true; }
-        if (Key('C')) { s.rightTrigger = 255; any = true; }
-        if (Key('A')) { s.lx = -32767; any = true; }
-        if (Key('D')) { s.lx = 32767; any = true; }
-        if (Key('W')) { s.ly = 32767; any = true; }
-        if (Key('S')) { s.ly = -32767; any = true; }
-        if (Key('J')) { s.rx = -32767; any = true; }
-        if (Key('L')) { s.rx = 32767; any = true; }
-        if (Key('I')) { s.ry = 32767; any = true; }
-        if (Key('K')) { s.ry = -32767; any = true; }
+        for (int i = 0; i < kKeyActions; i++)
+        {
+            const int key = gKeys[i].load();
+            if (!key || !Key(key)) continue;
+            if (IsMouseButton(key) && InputPointerMode()) continue;   // the mouse is a menu pointer right now
+            any = true;
+            switch (kActions[i].kind)
+            {
+            case Button: s.buttons |= kActions[i].bit; break;
+            case LeftTrigger: s.leftTrigger = 255; break;
+            case RightTrigger: s.rightTrigger = 255; break;
+            case LxMinus: s.lx = -32767; break;
+            case LxPlus: s.lx = 32767; break;
+            case LyPlus: s.ly = 32767; break;
+            case LyMinus: s.ly = -32767; break;
+            case RxMinus: s.rx = -32767; break;
+            case RxPlus: s.rx = 32767; break;
+            case RyPlus: s.ry = 32767; break;
+            case RyMinus: s.ry = -32767; break;
+            }
+        }
         return any;
     }
 }
 
 InputStyle InputLastStyle() { return InputStyle(gLastStyle.load()); }
+
+void InputKeepPointerMode() { gPointerUntil = GetTickCount64() + 150; }
+bool InputPointerMode() { return GetTickCount64() < gPointerUntil.load(); }
+void InputInject(uint16_t buttons) { gInjected = buttons; gInjectUntil = GetTickCount64() + 60; gLastStyle = int(InputStyle::Keyboard); }
+
+// Mouse camera: the game only knows a right stick, so mouse speed becomes stick deflection. The
+// movement since the last sample (counts per second, scaled by Mouse Sensitivity) is held for a few
+// milliseconds, because the game may read the pad several times a frame; a small offset lifts
+// slow movement over the game's stick dead zone. Returns true while the mouse is turning the camera.
+static bool ApplyMouseCamera(PadState& pad)
+{
+    static std::mutex mutex;
+    static LARGE_INTEGER frequency, last;
+    static int16_t stickX = 0, stickY = 0;
+    const int sensitivity = Settings().mouseSensitivity;
+    if (sensitivity <= 0 || gCapture.load() || InputPointerMode()) return false;
+    std::lock_guard lock(mutex);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!frequency.QuadPart) { QueryPerformanceFrequency(&frequency); last = now; }
+    const double elapsed = double(now.QuadPart - last.QuadPart) / double(frequency.QuadPart);
+    if (elapsed >= 0.008)
+    {
+        int dx, dy;
+        PresenterTakeMouseMotion(dx, dy);
+        last = now;
+        auto stick = [&](int counts) -> int16_t {
+            if (!counts) return 0;
+            const double rate = double(counts) / elapsed;                      // counts per second
+            const double deflection = rate * sensitivity / (2400.0 * 5.0);     // sensitivity 5: full tilt at 2400 counts/s
+            const double magnitude = (std::min)(1.0, std::fabs(deflection));
+            const double value = 9000.0 + magnitude * (32767.0 - 9000.0);     // start above the dead zone
+            return int16_t(deflection < 0 ? -value : value);
+        };
+        stickX = stick(dx);
+        stickY = stick(-dy);   // moving the mouse away looks up
+    }
+    bool used = false;
+    if (abs(stickX) > abs(pad.rx)) { pad.rx = stickX; used = true; }
+    if (abs(stickY) > abs(pad.ry)) { pad.ry = stickY; used = true; }
+    return used;
+}
+
+const KeyAction& InputKeyAction(int index) { return kActions[index].info; }
+int InputGetKey(int index) { EnsureKeys(); return gKeys[index].load(); }
+
+// Binds a key; an action that already had it takes this action's old key, so nothing is left unbound.
+void InputSetKey(int index, int key)
+{
+    EnsureKeys();
+    const int previous = gKeys[index].exchange(key);
+    for (int i = 0; i < kKeyActions; i++)
+        if (i != index && gKeys[i].load() == key) gKeys[i] = previous;
+}
+
+bool InputSetKeyById(const char* id, int key)
+{
+    EnsureKeys();
+    for (int i = 0; i < kKeyActions; i++)
+        if (strcmp(kActions[i].info.id, id) == 0)
+        {
+            // Settings saved before Esc became the pause key still have Enter there.
+            if (strcmp(id, "start") == 0 && key == VK_RETURN) key = VK_ESCAPE;
+            gKeys[i] = key;
+            return true;
+        }
+    return false;
+}
+
+void InputResetKeys()
+{
+    for (int i = 0; i < kKeyActions; i++) gKeys[i] = kActions[i].info.defaultKey;
+    gKeysReady = true;
+}
+
+std::string InputKeyName(int key)
+{
+    switch (key)
+    {
+    case 0: return "(none)";
+    case VK_LBUTTON: return "Left Mouse"; case VK_RBUTTON: return "Right Mouse"; case VK_MBUTTON: return "Middle Mouse";
+    case VK_XBUTTON1: return "Mouse 4"; case VK_XBUTTON2: return "Mouse 5";
+    case VK_UP: return "Up Arrow"; case VK_DOWN: return "Down Arrow"; case VK_LEFT: return "Left Arrow"; case VK_RIGHT: return "Right Arrow";
+    case VK_LSHIFT: return "Left Shift"; case VK_RSHIFT: return "Right Shift"; case VK_LCONTROL: return "Left Ctrl"; case VK_RCONTROL: return "Right Ctrl";
+    case VK_LMENU: return "Left Alt"; case VK_RMENU: return "Right Alt"; case VK_RETURN: return "Enter"; case VK_SPACE: return "Space";
+    case VK_INSERT: return "Insert"; case VK_DELETE: return "Delete"; case VK_HOME: return "Home"; case VK_END: return "End";
+    case VK_PRIOR: return "Page Up"; case VK_NEXT: return "Page Down";
+    }
+    char name[64] = {};
+    const UINT scan = MapVirtualKeyA(UINT(key), MAPVK_VK_TO_VSC);
+    if (scan && GetKeyNameTextA(LONG(scan << 16), name, sizeof(name)) > 0) return name;
+    snprintf(name, sizeof(name), "Key %d", key);
+    return name;
+}
+
+// While capturing, keys don't act as the pad; InputPollNewKey returns the next key pressed once every
+// key has been released (0 until then). NIER_FAKE_KEY=<frame>:<vk> presses one for tests.
+void InputSetCapture(bool on) { gCapture = on; gCaptureArmed = false; }
+
+int InputPollNewKey()
+{
+    static const std::pair<uint64_t, int> fake = [] {
+        char value[32];
+        if (!GetEnvironmentVariableA("NIER_FAKE_KEY", value, sizeof(value))) return std::pair<uint64_t, int>{ ~0ull, 0 };
+        const char* colon = strchr(value, ':');
+        return std::pair<uint64_t, int>{ strtoull(value, nullptr, 10), colon ? int(strtol(colon + 1, nullptr, 0)) : 0 };
+    }();
+    if (fake.second && GpuFrameCount() >= fake.first) return fake.second;
+    if (!PresenterHasFocus()) return 0;
+    int down = 0;
+    for (int key = 1; key < 0xFF; key++)   // 1, 2, 4, 5, 6 are the mouse buttons
+    {
+        if (key == VK_CANCEL || key == 7) continue;
+        if (key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU) continue;   // the left/right variants are reported instead
+        if (Key(key)) { down = key; break; }
+    }
+    if (!gCaptureArmed.load()) { if (!down) gCaptureArmed = true; return 0; }
+    return down;
+}
 
 GUEST_IMPORT(XamInputGetCapabilities)
 {
@@ -296,10 +453,25 @@ GUEST_IMPORT(XamInputGetState)
         if (abs(one.ry) > abs(pad.ry)) pad.ry = one.ry;
     }
     if (ApplyKeyboard(pad)) SetLastStyle(InputStyle::Keyboard);
+    if (ApplyMouseCamera(pad)) SetLastStyle(InputStyle::Keyboard);
+    if (GetTickCount64() < gInjectUntil.load()) pad.buttons |= gInjected.load();
+    {
+        // NIER_AUTO_STICK=<frame>,<frames>,<rx>,<ry>: holds the right stick for tests.
+        static const struct Auto { uint64_t frame = ~0ull, frames = 0; int rx = 0, ry = 0; } hold = [] {
+            Auto a; char value[64];
+            if (GetEnvironmentVariableA("NIER_AUTO_STICK", value, sizeof(value))) sscanf(value, "%llu,%llu,%d,%d", &a.frame, &a.frames, &a.rx, &a.ry);
+            return a;
+        }();
+        const uint64_t frame = GpuFrameCount();
+        if (frame >= hold.frame && frame < hold.frame + hold.frames) { pad.rx = int16_t(hold.rx); pad.ry = int16_t(hold.ry); }
+    }
     pad.buttons |= ScriptedButtons();
 
     if (state)
     {
+        static std::atomic<int> logged{ 0 };
+        if (GetEnvironmentVariableA("NIER_LOG_PAD", nullptr, 0) > 0 && GpuFrameCount() > 3000 && logged++ < 4)
+            Log("[input] pad state buffer %08X, caller %s\n", state, GuestCallChain(6).c_str());
         W32(state, gPacket.fetch_add(1));
         W16(state + 4, pad.buttons);
         W8(state + 6, pad.leftTrigger);

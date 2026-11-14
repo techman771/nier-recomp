@@ -98,6 +98,18 @@ namespace
 
     std::shared_ptr<DecodedTexture> Build(const DecodedTexture& original, Set set)
     {
+        const uint32_t width = kAtlasWidth * kScale, height = kAtlasHeight * kScale;
+        auto texture = std::make_shared<DecodedTexture>();
+        texture->data.resize(size_t(width) * height * 4);
+        if (set == Keyboard)
+        {
+            // Drawn from the current key bindings (keyglyphs.cpp).
+            if (!DrawKeyboardAtlas(texture->data.data(), width, height)) return nullptr;
+            if (GetEnvironmentVariableA("NIER_DUMP_GLYPHS", nullptr, 0) > 0)   // debugging: the drawn atlas, raw RGBA
+                if (FILE* dump = fopen("../captures/keyboard_atlas.rgba", "wb")) { fwrite(texture->data.data(), 1, texture->data.size(), dump); fclose(dump); }
+        }
+        else
+        {
         char exe[MAX_PATH];
         GetModuleFileNameA(nullptr, exe, sizeof(exe));
         std::string path = exe;
@@ -105,13 +117,12 @@ namespace
         FILE* file = fopen(path.c_str(), "rb");
         if (!file) { Log("[glyphs] %s is missing (tools/make_glyphs.ps1 creates it); keeping the game's icons\n", path.c_str()); return nullptr; }
         uint32_t header[3] = {};
-        const uint32_t width = kAtlasWidth * kScale, height = kAtlasHeight * kScale;
-        auto texture = std::make_shared<DecodedTexture>();
-        texture->data.resize(size_t(width) * height * 4);
         const bool ok = fread(header, 4, 3, file) == 3 && memcmp(header, "NGLY", 4) == 0 && header[1] == width && header[2] == height &&
             fread(texture->data.data(), 1, texture->data.size(), file) == texture->data.size();
         fclose(file);
         if (!ok) { Log("[glyphs] %s isn't a %ux%u glyph atlas\n", path.c_str(), width, height); return nullptr; }
+
+        }
 
         // The game's emblem (column 2, row 5) stays, scaled up.
         uint8_t cell[kCell * kCell * 4];
@@ -121,7 +132,7 @@ namespace
                 memcpy(&texture->data[(size_t(5 * kCell * kScale + y) * width + 2 * kCell * kScale + x) * 4], cell + ((y / kScale) * kCell + x / kScale) * 4, 4);
 
         texture->key = original.key ^ (0x9E3779B97F4A7C15ull * uint64_t(set + 1));
-        texture->contentHash = original.contentHash ^ uint64_t(set + 1);
+        texture->contentHash = original.contentHash ^ uint64_t(set + 1) ^ (set == Keyboard ? KeyBindingsStamp() : 0);
         texture->format = GuestTextureFormat::RGBA8;
         texture->width = width;
         texture->height = height;
@@ -143,9 +154,10 @@ std::shared_ptr<DecodedTexture> GlyphAtlasFor(const std::shared_ptr<DecodedTextu
     if (check.first != original->contentHash) check = { original->contentHash, LooksLikeGlyphAtlas(*original) };
     if (!check.second) return original;
     Built& built = gBuilt[{ original->key, int(set) }];
-    if (!built.texture || built.sourceHash != original->contentHash)
+    const uint64_t source = original->contentHash ^ (set == Keyboard ? KeyBindingsStamp() : 0);   // rebuilt when a key is rebound
+    if (!built.texture || built.sourceHash != source)
     {
-        built.sourceHash = original->contentHash;
+        built.sourceHash = source;
         built.texture = Build(*original, set);
     }
     return built.texture ? built.texture : original;

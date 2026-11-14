@@ -26,6 +26,7 @@
 #include <vector>
 #include "guest.h"
 #include "settings.h"
+#include "input.h"
 
 extern "C" PPC_FUNC(__imp__sub_824197A8);
 extern "C" PPC_FUNC(__imp__sub_824178D0);
@@ -55,6 +56,7 @@ namespace
             { "vsync", &gSettings.vsync, 0, 1 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
+            { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },
         };
     }
 
@@ -68,6 +70,8 @@ namespace
         T_MasterVolume, T_MasterVolumeHelp, T_MuteInBackground, T_MuteInBackgroundHelp, T_ReturnHelp,
         T_Windowed, T_Borderless, T_30fps, T_60fps, T_On, T_Off,
         T_QuitToDesktop,
+        T_KeysButtons, T_KeysButtonsHelp, T_KeysMove, T_KeysMoveHelp, T_KeysDefaults, T_KeysDefaultsHelp, T_KeyHelp, T_KeysReturnHelp, T_PressKey,
+        T_MouseSensitivity, T_MouseSensitivityHelp,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
@@ -80,6 +84,13 @@ namespace
         "Save PC settings and return to Game Settings.",
         "Windowed", "Borderless", "30 fps", "60 fps", "On", "Off",
         "Quit to Desktop",
+        "Key Bindings: Actions", "Choose the keys and mouse buttons for attacks, abilities and menus.",
+        "Key Bindings: Movement", "Choose the keyboard keys for movement and the camera.",
+        "Restore Default Keys", "Put every key binding back to its default.",
+        "Press Left or Right, then the new key or mouse button. Backspace cancels.",
+        "Save the key bindings and return to PC Settings.",
+        "Press a key...",
+        "Mouse Sensitivity", "Adjust how fast the mouse turns the camera. The lowest setting turns it off.",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -97,11 +108,26 @@ namespace
         return gStrings[id - kTextBase];
     }
 
+    // Text that changes (key names): one guest buffer per slot, rewritten in place.
+    constexpr uint32_t kKeyLabelText = kTextBase + 0x1000;   // + action index: the action's name
+    uint32_t DynamicText(uint32_t slot, const std::string& text)
+    {
+        static uint32_t buffers[kKeyActions * 2] = {};
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        if (!buffers[slot]) buffers[slot] = GuestAlloc(64, 4, Region::Heap);
+        strncpy(reinterpret_cast<char*>(g_base + buffers[slot]), text.c_str(), 63);
+        W8(buffers[slot] + 63, 0);
+        return buffers[slot];
+    }
+
     // ---- the page -----------------------------------------------------------------------------
     constexpr uint32_t kRecords = 3916, kRecordSize = 56, kRecordCount = 24, kRecordsInUse = 5264, kPageKind = 3556;
     constexpr uint32_t kScroll = 3572, kCursorRow = 3576;
     constexpr uint32_t kSelectDeviceLabel = 11100300, kReturnLabel = 6731000;
     constexpr uint32_t kItemReturn = 22, kItemSpacer = 37, kItemSelectDevice = 27;
+    constexpr uint32_t kItemKeysButtons = 70, kItemKeysMove = 71, kItemKeysDefaults = 72, kItemKey = 100;   // kItemKey + action index
+    constexpr int kKeysPerPage = 12;
 
     struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[2]; };
     const Item kItems[] = {
@@ -110,6 +136,7 @@ namespace
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },
+        { 65, 6, &gSettings.mouseSensitivity, 10, T_MouseSensitivity, T_MouseSensitivityHelp, {} },
     };
     const Item* FindItem(uint32_t id)
     {
@@ -118,8 +145,15 @@ namespace
     }
 
     // One menu at a time can be showing the PC page; its Game Settings records wait here.
+    // Pages: PC Settings sits on Game Settings; the two Key Bindings pages sit on PC Settings.
+    enum class Page { Pc, Keys };
     std::mutex gPageMutex;
     uint32_t gPcMenu = 0;
+    Page gPage = Page::Pc;
+    int gKeysFirst = 0;                 // first action on the open Key Bindings page
+    uint32_t gPcCursorRow = 0;          // where the cursor was on PC Settings
+    int gCaptureAction = -1;            // action waiting for a key, or -1
+    uint32_t gCaptureRow = 0;
     std::vector<uint8_t> gSavedRecords;
     uint32_t gSavedCount = 0, gSavedScroll = 0, gSavedCursorRow = 0;
 
@@ -143,10 +177,39 @@ namespace
         uint32_t n = 0;
         for (const Item& item : kItems)
             WriteRecord(first + n++ * kRecordSize, item.type, uint8_t(item.value->load()), 0, item.max, item.type == 2 ? 1 : 0, item.id, item.label, item.help);
+        WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysButtons, T_KeysButtons, T_KeysButtonsHelp);
+        WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysMove, T_KeysMove, T_KeysMoveHelp);
         WriteRecord(first + n++ * kRecordSize, 8, 0, 0, 0, 0, kItemSpacer, 0xFFFFFFFF, 0xFFFFFFFF);
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemReturn, kReturnLabel, T_ReturnHelp);
         for (uint32_t i = n; i < kRecordCount; i++) ClearRecord(first + i * kRecordSize);
         return n;
+    }
+
+    // A Key Bindings page: one two-way row per action (changing it starts the key capture; its value
+    // text is the key's name), Restore Default Keys and Return.
+    uint32_t FillKeyRecords(uint32_t menu, int firstAction)
+    {
+        const uint32_t first = menu + kRecords;
+        uint32_t n = 0;
+        // Actions: the buttons (the left stick click, 10, does nothing in this game) and the D-pad's
+        // menus; Movement: the two sticks.
+        static const int kActionsPage[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 20, 21, 22, 23 };
+        static const int kMovementPage[] = { 12, 13, 14, 15, 16, 17, 18, 19 };
+        const int* list = firstAction ? kMovementPage : kActionsPage;
+        const int count = firstAction ? int(std::size(kMovementPage)) : int(std::size(kActionsPage));
+        for (int i = 0; i < count; i++)
+            WriteRecord(first + n++ * kRecordSize, 2, 0, 0, 1, 1, kItemKey + list[i], kKeyLabelText + list[i], T_KeyHelp);
+        WriteRecord(first + n++ * kRecordSize, 8, 0, 0, 0, 0, kItemSpacer, 0xFFFFFFFF, 0xFFFFFFFF);
+        WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysDefaults, T_KeysDefaults, T_KeysDefaultsHelp);
+        WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemReturn, kReturnLabel, T_KeysReturnHelp);
+        for (uint32_t i = n; i < kRecordCount; i++) ClearRecord(first + i * kRecordSize);
+        return n;
+    }
+
+    void EndCapture()
+    {
+        gCaptureAction = -1;
+        InputSetCapture(false);
     }
 
     // Copies the page's values into the settings. Display Mode waits for Return (live, the window
@@ -200,6 +263,7 @@ void SettingsLoad()
             if (sscanf(line, " %63[^= ] = %d", key, &value) != 2) continue;
             for (const Field& field : Fields())
                 if (strcmp(field.key, key) == 0) field.value->store(std::clamp(value, field.min, field.max));
+            if (strncmp(key, "key_", 4) == 0) InputSetKeyById(key + 4, std::clamp(value, 0, 254));
         }
         fclose(file);
         Log("[settings] loaded %s\n", path.c_str());
@@ -218,6 +282,8 @@ void SettingsSave()
     if (!file) { Log("[settings] couldn't write %s\n", path.c_str()); return; }
     fprintf(file, "; NieR (recompiled) PC settings. Edited from Options > Game Settings > PC Settings.\n");
     for (const Field& field : Fields()) fprintf(file, "%s = %d\n", field.key, field.value->load());
+    fprintf(file, "; Keyboard bindings (Windows virtual-key codes), from PC Settings > Key Bindings.\n");
+    for (int i = 0; i < kKeyActions; i++) fprintf(file, "key_%s = %d\n", InputKeyAction(i).id, InputGetKey(i));
     fclose(file);
     Log("[settings] saved %s\n", path.c_str());
 }
@@ -226,7 +292,7 @@ void SettingsSave()
 void SettingsPollPage()
 {
     std::unique_lock lock(gPageMutex, std::try_to_lock);
-    if (lock && gPcMenu) ReadPcRecords(gPcMenu, false);
+    if (lock && gPcMenu && gPage == Page::Pc) ReadPcRecords(gPcMenu, false);
 }
 
 // ---- mid-asm hooks (nier_hooks.toml) -------------------------------------------------------------
@@ -234,6 +300,11 @@ void SettingsPollPage()
 // sub_823CB8C8 (text table, id): our ids return our strings.
 bool PcSettingsText(PPCRegister& r3, PPCRegister& r4)
 {
+    if (r4.u32 >= kKeyLabelText && r4.u32 < kKeyLabelText + kKeyActions)
+    {
+        r3.u64 = DynamicText(r4.u32 - kKeyLabelText, InputKeyAction(int(r4.u32 - kKeyLabelText)).label);
+        return true;
+    }
     if (r4.u32 < kTextBase || r4.u32 >= T_Count) return false;
     r3.u64 = GuestText(r4.u32);
     return true;
@@ -242,7 +313,24 @@ bool PcSettingsText(PPCRegister& r3, PPCRegister& r4)
 // sub_82416C20 (record): the value text of our choices.
 bool PcSettingsValueText(PPCRegister& r3)
 {
-    const Item* item = FindItem(R32(r3.u32 + 40));
+    const uint32_t id = R32(r3.u32 + 40);
+    if (id >= kItemKey && id < kItemKey + kKeyActions)
+    {
+        // A key row: the game asks for its text when it changes the row (Left / Right), which is
+        // the request to rebind it; PcSettingsTick takes the key.
+        const int action = int(id - kItemKey);
+        std::lock_guard lock(gPageMutex);
+        if (R8(r3.u32 + 1) != 0 && gCaptureAction < 0 && gPcMenu && gPage == Page::Keys)
+        {
+            gCaptureAction = action;
+            gCaptureRow = R32(gPcMenu + kScroll) + R32(gPcMenu + kCursorRow);
+            InputSetCapture(true);
+        }
+        if (gCaptureAction == action) r3.u64 = GuestText(T_PressKey);
+        else r3.u64 = DynamicText(kKeyActions + action, InputKeyName(InputGetKey(action)));
+        return true;
+    }
+    const Item* item = FindItem(id);
     if (!item || item->type != 2) return false;
     const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, 1);
     r3.u64 = GuestText(item->values[value]);
@@ -279,6 +367,8 @@ bool PcSettingsOpen(PPCRegister& r31)
         gSavedScroll = R32(menu + kScroll);
         gSavedCursorRow = R32(menu + kCursorRow);
         gPcMenu = menu;
+        gPage = Page::Pc;
+        EndCapture();
     }
     W32(menu + kRecordsInUse, FillPcRecords(menu));
     W32(menu + kScroll, 0);
@@ -292,19 +382,128 @@ bool PcSettingsOpen(PPCRegister& r31)
 bool PcSettingsReturn(PPCRegister& r3)
 {
     const uint32_t menu = r3.u32;
+    bool backToPc = false;
     {
         std::lock_guard lock(gPageMutex);
         if (gPcMenu != menu || gSavedRecords.size() != kRecordCount * kRecordSize) return false;
+        if (gPage == Page::Keys)
+        {
+            // Back from Key Bindings to PC Settings.
+            EndCapture();
+            gPage = Page::Pc;
+            W32(menu + kRecordsInUse, FillPcRecords(menu));
+            W32(menu + kScroll, 0);
+            W32(menu + kCursorRow, gPcCursorRow);
+            backToPc = true;
+        }
+        else
+        {
         ReadPcRecords(menu, true);
         memcpy(g_base + menu + kRecords, gSavedRecords.data(), gSavedRecords.size());
         W32(menu + kRecordsInUse, gSavedCount);
         W32(menu + kScroll, gSavedScroll);
         W32(menu + kCursorRow, gSavedCursorRow);
         gPcMenu = 0;
+        }
     }
     SettingsSave();
+    if (backToPc) { LayOutPage(menu); return true; }
     ApplySettings();
     LayOutPage(menu);
     Log("[settings] PC Settings page closed\n");
     return true;
+}
+
+// sub_8241C020, an action row was chosen (r4 its item id, r31 the menu): our own actions.
+bool PcSettingsAction(PPCRegister& r4, PPCRegister& r31)
+{
+    const uint32_t item = r4.u32, menu = r31.u32;
+    if (item != kItemKeysButtons && item != kItemKeysMove && item != kItemKeysDefaults) return false;
+    {
+        std::lock_guard lock(gPageMutex);
+        if (gPcMenu != menu) return false;
+        EndCapture();
+        if (item == kItemKeysDefaults) InputResetKeys();
+        else
+        {
+            ReadPcRecords(menu, true);
+            gPcCursorRow = R32(menu + kScroll) + R32(menu + kCursorRow);
+            gPage = Page::Keys;
+            gKeysFirst = item == kItemKeysMove ? kKeysPerPage : 0;
+            W32(menu + kRecordsInUse, FillKeyRecords(menu, gKeysFirst));
+            W32(menu + kScroll, 0);
+            W32(menu + kCursorRow, 0);
+        }
+    }
+    if (item == kItemKeysDefaults) SettingsSave();
+    LayOutPage(menu);
+    return true;
+}
+
+// The mouse as a pointer on a settings page (any of them: Game Settings, PC Settings, Key Bindings).
+// Rows are 38 pixels apart from y = 172 in the game's 1280x720 space, nine to a screen, between
+// x = 240 and 905; values sit around x = 755. Hovering moves the game's cursor (its row within
+// the view, +3576); a left click confirms an action row or steps a value down / up depending on
+// which side of the value was clicked; a right click goes back; the wheel moves the cursor.
+static void MenuPointer(uint32_t menu)
+{
+    constexpr float kTop = 172, kRowHeight = 38, kLeft = 240, kRight = 905, kValueCentre = 755;
+    constexpr uint32_t kVisibleRows = 9;
+    const uint32_t kind = R32(menu + kPageKind);
+    if (kind < 4 || kind > 7) return;
+    InputKeepPointerMode();
+    MenuMouse mouse;
+    if (!PresenterTakeMenuMouse(mouse)) return;
+    if (mouse.rightClicks) { InputInject(0x2000); return; }                     // B: back
+    if (mouse.wheel) { InputInject(mouse.wheel > 0 ? 0x0001 : 0x0002); return; }   // d-pad up / down
+    if (mouse.x < kLeft || mouse.x > kRight || mouse.y < kTop) return;
+    const uint32_t row = uint32_t((mouse.y - kTop) / kRowHeight), scroll = R32(menu + kScroll), count = R32(menu + kRecordsInUse);
+    if (row >= kVisibleRows || scroll + row >= count || scroll + row >= kRecordCount) return;
+    const uint32_t record = menu + kRecords + (scroll + row) * kRecordSize;
+    const uint8_t type = R8(record);
+    if (type == 0 || type == 8) return;   // unused, spacer
+    if ((mouse.moved || mouse.leftClicks) && R32(menu + kCursorRow) != row)
+    {
+        W32(menu + kCursorRow, row);
+        LayOutPage(menu);
+    }
+    if (mouse.leftClicks)
+    {
+        if (type == 9 || type == 10) InputInject(0x1000);                        // A: open / confirm
+        else InputInject(mouse.x < kValueCentre ? 0x0004 : 0x0008);              // d-pad left / right: adjust
+    }
+}
+
+// sub_8241C020 entry, every frame a settings page is open (r3 the menu): the menu pointer, and
+// finishing a key capture.
+void PcSettingsTick(PPCRegister& r3)
+{
+    const uint32_t menu = r3.u32;
+    {
+        bool capturing;
+        { std::lock_guard lock(gPageMutex); capturing = gCaptureAction >= 0; }
+        if (!capturing) MenuPointer(menu);
+        else InputKeepPointerMode();
+    }
+    bool changed = false;
+    {
+        std::lock_guard lock(gPageMutex);
+        if (gPcMenu != menu || gPage != Page::Keys || gCaptureAction < 0) return;
+        uint32_t record = menu + kRecords;
+        for (uint32_t i = 0; i < kRecordCount; i++)
+            if (R32(menu + kRecords + i * kRecordSize + 40) == kItemKey + uint32_t(gCaptureAction)) record = menu + kRecords + i * kRecordSize;
+        const bool moved = R32(menu + kScroll) + R32(menu + kCursorRow) != gCaptureRow;
+        const int key = moved ? VK_BACK : InputPollNewKey();   // Backspace cancels (Esc can be bound)
+        if (!key) return;
+        if (key != VK_BACK)
+        {
+            InputSetKey(gCaptureAction, key);
+            Log("[settings] %s bound to %s\n", InputKeyAction(gCaptureAction).label, InputKeyName(key).c_str());
+            changed = true;
+        }
+        W8(record + 1, 0);
+        EndCapture();
+    }
+    if (changed) SettingsSave();
+    LayOutPage(menu);
 }

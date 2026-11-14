@@ -601,6 +601,54 @@ xbox (Series), ps4, ps5, keyboard, chosen by the last device used. `NIER_GLYPHS=
 forces one. Still to do: mouse input (and mouse glyphs), rebinding, DualSense extras, a PC Settings
 entry to pick the icon set.
 
+### Key bindings
+
+PC Settings has "Key Bindings: Buttons" and "Key Bindings: Movement" (12 rows each: a page holds
+24 records). Each control has one key (input.cpp `kActions`, saved as `key_<id>` in settings.ini).
+A row is a two-way record whose value text is the key's name; pressing Left / Right changes it,
+the game then asks for its value text (sub_82416C20), which starts a capture ("Press a key...").
+`PcSettingsTick` (hook at the menu handler's entry, every frame) takes the next key pressed once
+all keys are released, binds it (swapping with a control that already had it), saves and lays the
+page out again; Esc or moving the cursor cancels. Keys don't act as the pad during a capture.
+Our action rows (item ids 70-72) are handled by `PcSettingsAction` at 0x8241C778.
+`NIER_FAKE_KEY=<frame>:<vk>` presses a key for tests. The keyboard glyph set is drawn at run time from
+the bindings (keyglyphs.cpp, GDI+): a keycap per control with the key's short label, rebuilt when a
+key is rebound; NIER_DUMP_GLYPHS=1 writes it to captures/keyboard_atlas.rgba. Rows are named by
+action (Jump / Confirm (A), Attack (X), Ability Slot (LB), Map (Back), Reset Camera (R3), Item /
+1H Sword / 2H Sword / Spear Menu on the D-pad); L3 does nothing in the game and is hidden. Mouse: raw
+mouse movement (WM_INPUT in present.cpp, while the window is focused and Mouse Sensitivity > 0;
+the cursor is hidden and clipped to the window) becomes right-stick deflection in input.cpp
+(speed-based, lifted over the dead zone; untested by hand so the scale may need tuning). Mouse
+buttons are bindable like keys (VK 1, 2, 4, 5, 6) and have their own icons; defaults: Attack =
+left, Heavy Attack = right, Reset Camera = middle. Menu pointer (first
+screens: the settings pages, kinds 4-7): PcSettingsTick calls MenuPointer each frame the page is
+open; it keeps "pointer mode" on (cursor shown, no camera, mouse buttons not game controls),
+maps the cursor to a row (rows 38 px apart from y 172, x 240-905 in 1280x720 space, 9 visible),
+writes the cursor row (+3576) and lays the page out again on hover, and injects pad presses for
+clicks (A on action rows, d-pad left/right by click side on values, B on right click, d-pad up/down
+on the wheel). NIER_FAKE_MOUSE=<frame>,<x>,<y>[,<click frame>] simulates it. Still to do for the
+pointer: top Options page, title menu, save list, pause tabs, shops, dialogue choices.
+Next: Steam Deck / Steam Controller glyph set.
+
+### Direct mouse camera (in progress)
+
+Goal: turn the camera by the mouse delta instead of emulating the right stick. Found so far:
+- Global camera at 0x826B40A0, updated by sub_821A6C10 <- sub_821A7D00(camera, dt) <- sub_82193538 /
+  821935C8 / 821963C8 (manager 0x82691E70) <- sub_82191D60. It holds only results: rotation rows at
+  +0xE0 / +0xF0 / +0x100, eye at +0x110, and a copy at +0x120.. (+0x150 eye).
+- Heap object 0x432DB0A0 (vtable 0x8200F3F8, effects module) has the same matrices and eye (+0xD0..);
+  also derived.
+- Holding the right stick fully for 60 frames turns exactly 1.6 rad (0.02667 rad per frame at 60 fps);
+  initial pitch is 0.3 rad. No plain yaw / pitch float found yet in 0x82691E70-0x826B4500 or the
+  globals 0x82680000-0x826D0000, so the angles live in a controller object elsewhere (heap).
+- Pad: XamInputGetState fills 0x85F4FCAC (rx at +12), read by sub_8258CE90 <- sub_8258D400 <-
+  sub_8258D658 (the XInput wrapper) from the main loop sub_82496D00; the game's pad object at
+  0x827CE7A0 (sub_8210A3B0) showed no stick floats in its first 8 KB.
+- Tools added for this: NIER_AUTO_STICK=<frame>,<frames>,<rx>,<ry>, NIER_SCAN_F32=<value>,<tol>,
+  NIER_LOG_PAD=1.
+Next: follow sub_8210A3B0 (it calls 0x8258DB38 / DB90 / DBA8 with floats) to where the processed
+right stick is stored, watch reads of that, and find the yaw / pitch update in the camera code.
+
 ### Downloadable content
 
 The user's DLC ("15 Nightmares", "Extra outfit and battle quest pack": `media/DLC01.cpk` plus

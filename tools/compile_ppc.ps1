@@ -27,7 +27,7 @@ $ninja = @(
     "  description = `$in",
     "",
     "rule link",
-    "  command = lld-link /nologo /OUT:`$out /SUBSYSTEM:CONSOLE /STACK:0x10000000,0x100000 @`$out.rsp $libs gdi32.lib user32.lib winmm.lib ole32.lib xinput.lib d3d12.lib dxgi.lib d3dcompiler.lib dxguid.lib dbghelp.lib /DEBUG:FULL",
+    "  command = lld-link /nologo /OUT:`$out /SUBSYSTEM:CONSOLE /STACK:0x10000000,0x100000 @`$out.rsp $libs gdi32.lib gdiplus.lib user32.lib winmm.lib ole32.lib xinput.lib d3d12.lib dxgi.lib d3dcompiler.lib dxguid.lib dbghelp.lib /DEBUG:FULL",
     "  rspfile = `$out.rsp",
     "  rspfile_content = `$in",
     "  description = linking `$out",
