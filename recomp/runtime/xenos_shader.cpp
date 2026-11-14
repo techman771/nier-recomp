@@ -12,7 +12,7 @@ cbuffer Constants : register(b0) { float4 c[512]; };
 cbuffer System : register(b1)
 {
     float2 ndcScale; float2 ndcOffset;
-    uint bypassViewport; uint3 systemPadding;
+    uint bypassViewport; uint alphaFunc; float alphaRef; uint systemPadding;
     uint4 vbBase[24];
     uint4 samplerIndex[8];   // per texture slot: filter * 25 + address U * 5 + address V
     float4 texScale[32];
@@ -609,6 +609,12 @@ float3 CubeDirection(float3 c)
                         hlsl += "    oC[0] = " + entry.substr(split + 1) + ";\n";
                     start = end + 1;
                 }
+                // Alpha test: the console drops a pixel whose alpha fails a comparison with a reference
+                // value (sprites with soft corners rely on it; without it their whole quad shows).
+                hlsl += "    if (alphaFunc != 7u)" + std::string("\n    {\n        float a_ = oC[0].a;\n") +
+                        "        bool pass_ = alphaFunc == 1u ? a_ < alphaRef : alphaFunc == 2u ? a_ == alphaRef : alphaFunc == 3u ? a_ <= alphaRef :\n"
+                        "                     alphaFunc == 4u ? a_ > alphaRef : alphaFunc == 5u ? a_ != alphaRef : alphaFunc == 6u ? a_ >= alphaRef : false;\n"
+                        "        if (!pass_) discard;\n    }\n";
                 hlsl += exportsDepth ? "    PixelOutput output_;\n    output_.color = oC[0];\n    output_.depth = oDepth.x;\n    return output_;\n}\n"
                                      : "    return oC[0];\n}\n";
             }
@@ -627,6 +633,68 @@ float3 CubeDirection(float3 c)
     return output;
 }
 )";
+            }
+            // Built-in improvements to particular shaders of the game (NIER_ORIGINAL_EFFECTS=1 leaves
+            // them out). Depth of field: the game blurs by reading a chain of shrunken copies of the
+            // picture (512, 256, ... texels a side) at a level chosen from the depth.
+            //  - C42C4BC07882DC33 makes the first copy with one sample for each texel, 2.5 picture
+            //    pixels apart: detail between samples aliases. It now averages 4x4 samples over
+            //    the texel's footprint.
+            //  - AE4637CCAACCEBD4 reads the chain with plain linear filtering, so a 64-texel copy
+            //    stretched over the screen shows its texels as blocks. It now reads each level
+            //    with a bicubic (B-spline) filter.
+            {
+                static const bool original = std::getenv("NIER_ORIGINAL_EFFECTS") != nullptr;
+                auto replaceOnce = [&](const std::string& find, const std::string& replace) {
+                    const size_t at = hlsl.find(find);
+                    if (at != std::string::npos) hlsl.replace(at, find.size(), replace);
+                    return at != std::string::npos;
+                };
+                const std::string mainStart = "float4 main(Interpolated input)";
+                if (!original && pixel && result.hash == 0xC42C4BC07882DC33ull)
+                {
+                    if (replaceOnce("t0.Sample(samplers[samplerIndex[0][0]], r[0].xy * texScale[0].xy)", "BoxSample_(t0, r[0].xy * texScale[0].xy)"))
+                        replaceOnce(mainStart, R"(float4 BoxSample_(Texture2D<float4> t, float2 uv)
+{
+    float2 dx = ddx(uv), dy = ddy(uv);
+    float4 sum = (float4)0;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            sum += t.SampleLevel(linearSampler, uv + ((i + 0.5) / 4.0 - 0.5) * dx + ((j + 0.5) / 4.0 - 0.5) * dy, 0);
+    return sum / 16.0;
+}
+)" + mainStart);
+                }
+                if (!original && pixel && result.hash == 0xAE4637CCAACCEBD4ull)
+                {
+                    if (replaceOnce("t1.SampleLevel(samplers[samplerIndex[0][1]], r[0].xy * texScale[1].xy, lod_)", "SmoothLevel_(t1, r[0].xy * texScale[1].xy, lod_)"))
+                        replaceOnce(mainStart, R"(float4 BicubicLevel_(Texture2D<float4> t, float2 uv, float level)
+{
+    uint w_, h_, n_;
+    t.GetDimensions(0, w_, h_, n_);
+    level = min(level, float(n_) - 1.0);
+    t.GetDimensions(uint(level), w_, h_, n_);
+    float2 size = float2(w_, h_);
+    float2 p = uv * size - 0.5;
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+    float2 w1 = (3.0 * f * f * f - 6.0 * f * f + 4.0) / 6.0;
+    float2 w2 = (-3.0 * f * f * f + 3.0 * f * f + 3.0 * f + 1.0) / 6.0;
+    float2 w3 = f * f * f / 6.0;
+    float2 g0 = w0 + w1, g1 = w2 + w3;
+    float2 p0 = (i + 0.5 + w1 / g0 - 1.0) / size, p1 = (i + 0.5 + w3 / g1 + 1.0) / size;
+    return g0.y * (g0.x * t.SampleLevel(linearSampler, float2(p0.x, p0.y), level) + g1.x * t.SampleLevel(linearSampler, float2(p1.x, p0.y), level)) +
+           g1.y * (g0.x * t.SampleLevel(linearSampler, float2(p0.x, p1.y), level) + g1.x * t.SampleLevel(linearSampler, float2(p1.x, p1.y), level));
+}
+float4 SmoothLevel_(Texture2D<float4> t, float2 uv, float lod)
+{
+    lod = max(lod, 0.0);
+    float base = floor(lod);
+    return lerp(BicubicLevel_(t, uv, base), BicubicLevel_(t, uv, base + 1.0), lod - base);
+}
+)" + mainStart);
+                }
             }
             // NIER_SHADER_PATCH=<hash>|<find>|<replace>[;;...] edits a translated shader's HLSL before it
             // is compiled (debugging: e.g. zero one term to see what it contributes).

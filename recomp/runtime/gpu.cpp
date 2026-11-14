@@ -962,6 +962,14 @@ namespace
         draw.vs = vs->shader;
         draw.ps = ps->shader;
         draw.blendControl = r[0x2201];
+        memcpy(draw.blendConstant, &r[0x2105], sizeof(draw.blendConstant));   // RB_BLEND_RED, GREEN, BLUE, ALPHA (floats)
+        draw.alphaFunc = (r[0x2202] & 8) ? uint8_t(r[0x2202] & 7) : 7;        // RB_COLORCONTROL: function in bits 0-2, enable in bit 3
+        memcpy(&draw.alphaRef, &r[0x210E], 4);                                // RB_ALPHA_REF (float)
+        {
+            static std::set<uint32_t> seen;   // which alpha tests the game uses (debugging)
+            if (draw.alphaFunc != 7 && seen.size() < 8 && seen.insert(uint32_t(draw.alphaFunc) << 24 ^ r[0x210E]).second)
+                Log("[gpu] alpha test: function %u, reference %.4f\n", draw.alphaFunc, draw.alphaRef);
+        }
         draw.writeMask = r[0x2104] & 0xF;
 
         draw.hasColor = hasColor;

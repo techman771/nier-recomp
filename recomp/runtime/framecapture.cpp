@@ -34,7 +34,7 @@
 
 namespace
 {
-    constexpr uint32_t kMagic = 0x4D52464E, kVersion = 2;   // "NFRM"; version 2 added the cull state
+    constexpr uint32_t kMagic = 0x4D52464E, kVersion = 3;   // "NFRM"; version 2 added the cull state, 3 the blend constant and alpha test
 
     struct Writer
     {
@@ -144,7 +144,7 @@ void FrameCaptureSave(const RendererFrame& frame, const std::string& path,
             w.Put(shaderIndex.count(d->ps.get()) ? shaderIndex[d->ps.get()] : -1);
             w.Key(d->target); w.Put(uint8_t(d->hasColor)); w.Put(uint8_t(d->depthBound)); w.Key(d->depth);
             w.Put(d->depthControl); w.Put(d->stencilRefMask); w.Put(d->blendControl); w.Put(d->writeMask);
-            w.Put(uint8_t(d->rectList)); w.Put(d->cull); w.Put(uint8_t(d->frontCounterClockwise)); w.Put(d->vertexCount);
+            w.Put(uint8_t(d->rectList)); w.Put(d->cull); w.Put(uint8_t(d->frontCounterClockwise)); w.Bytes(d->blendConstant, sizeof(d->blendConstant)); w.Put(d->alphaFunc); w.Put(d->alphaRef); w.Put(d->vertexCount);
             w.Put(uint32_t(d->indices.size())); w.Bytes(d->indices.data(), d->indices.size() * 4);
             w.Put(uint32_t(d->vertexData.size())); w.Bytes(d->vertexData.data(), d->vertexData.size());
             w.Bytes(d->vertexBase.data(), sizeof(d->vertexBase));
@@ -234,6 +234,7 @@ namespace
                 d.depthControl = r.Get<uint32_t>(); d.stencilRefMask = r.Get<uint32_t>(); d.blendControl = r.Get<uint32_t>(); d.writeMask = r.Get<uint32_t>();
                 d.rectList = r.Get<uint8_t>() != 0;
                 if (version >= 2) { d.cull = r.Get<uint8_t>(); d.frontCounterClockwise = r.Get<uint8_t>() != 0; }
+                if (version >= 3) { r.Bytes(d.blendConstant, sizeof(d.blendConstant)); d.alphaFunc = r.Get<uint8_t>(); d.alphaRef = r.Get<float>(); }
                 d.vertexCount = r.Get<uint32_t>();
                 d.indices.resize(r.Get<uint32_t>()); r.Bytes(d.indices.data(), d.indices.size() * 4);
                 d.vertexData.resize(r.Get<uint32_t>()); r.Bytes(d.vertexData.data(), d.vertexData.size());
@@ -319,7 +320,7 @@ namespace
 // capture but with block indices in place of data), 'E' end. Records precede their first use.
 namespace
 {
-    constexpr uint32_t kSequenceMagic = 0x5145534E, kSequenceVersion = 1;   // "NSEQ"
+    constexpr uint32_t kSequenceMagic = 0x5145534E, kSequenceVersion = 2;   // "NSEQ"; version 2 added the blend constant and alpha test
     constexpr uint32_t kNoBlock = 0xFFFFFFFF;
     constexpr size_t kConstantPieces = 8, kPieceBytes = 2048 * 4 / kConstantPieces;
 
@@ -474,7 +475,7 @@ void FrameSequenceAdd(const RendererFrame& frame)
             b.Put(ShaderOf(r, d->vs)); b.Put(ShaderOf(r, d->ps));
             b.Key(d->target); b.Put(uint8_t(d->hasColor)); b.Put(uint8_t(d->depthBound)); b.Key(d->depth);
             b.Put(d->depthControl); b.Put(d->stencilRefMask); b.Put(d->blendControl); b.Put(d->writeMask);
-            b.Put(uint8_t(d->rectList)); b.Put(d->cull); b.Put(uint8_t(d->frontCounterClockwise)); b.Put(d->vertexCount);
+            b.Put(uint8_t(d->rectList)); b.Put(d->cull); b.Put(uint8_t(d->frontCounterClockwise)); b.Bytes(d->blendConstant, sizeof(d->blendConstant)); b.Put(d->alphaFunc); b.Put(d->alphaRef); b.Put(d->vertexCount);
             b.Put(uint32_t(d->indices.size())); b.Put(BlockOf(r, d->indices.data(), d->indices.size() * 4));
             b.Put(uint32_t(d->vertexData.size())); b.Put(BlockOf(r, d->vertexData.data(), d->vertexData.size()));
             b.Bytes(d->vertexBase.data(), sizeof(d->vertexBase));
@@ -530,6 +531,7 @@ namespace
         std::vector<std::shared_ptr<DecodedTexture>> textures;
         struct Frame { std::vector<uint8_t> payload; };
         std::vector<Frame> frames;
+        uint32_t version = kSequenceVersion;
     };
 
     bool LoadSequence(const char* path, Sequence& s)
@@ -537,7 +539,9 @@ namespace
         FILE* file = fopen(path, "rb");
         if (!file) return false;
         Reader r{ file };
-        if (r.Get<uint32_t>() != kSequenceMagic || r.Get<uint32_t>() != kSequenceVersion) { fclose(file); return false; }
+        if (r.Get<uint32_t>() != kSequenceMagic) { fclose(file); return false; }
+        s.version = r.Get<uint32_t>();
+        if (s.version < 1 || s.version > kSequenceVersion) { fclose(file); return false; }
         while (r.ok)
         {
             const uint8_t kind = r.Get<uint8_t>();
@@ -608,7 +612,9 @@ namespace
                 if (ps >= 0 && size_t(ps) < s.shaders.size()) d.ps = s.shaders[ps].shader;
                 d.target = r.Key(); d.hasColor = r.Get<uint8_t>() != 0; d.depthBound = r.Get<uint8_t>() != 0; d.depth = r.Key();
                 d.depthControl = r.Get<uint32_t>(); d.stencilRefMask = r.Get<uint32_t>(); d.blendControl = r.Get<uint32_t>(); d.writeMask = r.Get<uint32_t>();
-                d.rectList = r.Get<uint8_t>() != 0; d.cull = r.Get<uint8_t>(); d.frontCounterClockwise = r.Get<uint8_t>() != 0; d.vertexCount = r.Get<uint32_t>();
+                d.rectList = r.Get<uint8_t>() != 0; d.cull = r.Get<uint8_t>(); d.frontCounterClockwise = r.Get<uint8_t>() != 0;
+                if (s.version >= 2) { r.Bytes(d.blendConstant, sizeof(d.blendConstant)); d.alphaFunc = r.Get<uint8_t>(); d.alphaRef = r.Get<float>(); }
+                d.vertexCount = r.Get<uint32_t>();
                 const uint32_t indexCount = r.Get<uint32_t>();
                 if (const auto* data = block(r.Get<uint32_t>())) { d.indices.resize((std::min)(size_t(indexCount), data->size() / 4)); memcpy(d.indices.data(), data->data(), d.indices.size() * 4); }
                 r.Get<uint32_t>();   // vertex data size (the block has it)
@@ -676,6 +682,11 @@ namespace
         size_t stop = ~size_t(0);
         float zoom = 1.0f, zoomX = 0.5f, zoomY = 0.5f;
         int forcedCull = -1, forcedCcw = 1;
+        bool forceBlend = false;
+        uint64_t alphaShader = 0;   // NIER_REPLAY_ALPHA
+        int alphaFunc = 7;
+        float alphaRef = 0;
+        float blend[4] = { 0, 0, 0, 0 };
         ReplayOptions()
         {
             skip = ParseList("NIER_REPLAY_SKIP");
@@ -683,6 +694,16 @@ namespace
             if (GetEnvironmentVariableA("NIER_REPLAY_STOP", value, sizeof(value))) stop = strtoull(value, nullptr, 10);
             if (GetEnvironmentVariableA("NIER_REPLAY_ZOOM", value, sizeof(value))) sscanf(value, "%f,%f,%f", &zoom, &zoomX, &zoomY);
             if (GetEnvironmentVariableA("NIER_REPLAY_CULL", value, sizeof(value))) sscanf(value, "%d,%d", &forcedCull, &forcedCcw);
+            // NIER_REPLAY_BLEND=<r>,<g>,<b>,<a>: the blend constant of every draw (captures made before
+            // it was recorded hold none).
+            // NIER_REPLAY_ALPHA=<pixel shader hash>,<function>,<reference>: the alpha test of the draws
+            // with that pixel shader (captures made before it was recorded have none).
+            if (GetEnvironmentVariableA("NIER_REPLAY_ALPHA", value, sizeof(value)))
+            {
+                alphaShader = strtoull(value, nullptr, 16);
+                if (const char* comma = strchr(value, ',')) sscanf(comma + 1, "%d,%f", &alphaFunc, &alphaRef);
+            }
+            if (GetEnvironmentVariableA("NIER_REPLAY_BLEND", value, sizeof(value))) forceBlend = sscanf(value, "%f,%f,%f,%f", &blend[0], &blend[1], &blend[2], &blend[3]) == 4;
         }
     };
 
@@ -704,6 +725,8 @@ namespace
             if (!isDraw) continue;
             RendererDraw& d = std::get<RendererDraw>(prepared.commands.back());
             if (o.forcedCull >= 0 && !d.rectList) { d.cull = uint8_t(o.forcedCull); d.frontCounterClockwise = o.forcedCcw != 0; }
+            if (o.forceBlend) memcpy(d.blendConstant, o.blend, sizeof(d.blendConstant));
+            if (o.alphaShader && d.ps && d.ps->hash == o.alphaShader) { d.alphaFunc = uint8_t(o.alphaFunc); d.alphaRef = o.alphaRef; }
             if (o.zoom == 1.0f) continue;
             // The scene's own geometry: depth-tested draws through a viewport with the screen's
             // shape, at full size or a fraction of it (the half-size shadow mask and particle
@@ -748,7 +771,12 @@ void FrameReplayRunIfRequested()
         Log("[replay] %s: a recording of %zu frames, %zu shaders, %zu textures, %zu data blocks\n", path, sequence.frames.size(),
             sequence.shaders.size(), sequence.textures.size(), sequence.blocks.size());
         Retranslate(sequence.shaders);
-        ListCommands(BuildFrame(sequence, 0));
+        {
+            // NIER_REPLAY_LIST=<n>: the recorded frame (from 1) whose commands are listed; NIER_REPLAY_ONLY=<n>
+            // plays that one frame over and over, like a single capture.
+            const size_t listed = GetEnvironmentVariableA("NIER_REPLAY_LIST", value, sizeof(value)) ? strtoull(value, nullptr, 10) : 1;
+            ListCommands(BuildFrame(sequence, (std::min)((std::max)(listed, size_t(1)), sequence.frames.size()) - 1));
+        }
         double before = 0;
         for (size_t i = 0; i < sequence.frames.size(); i++)
         {
@@ -760,6 +788,19 @@ void FrameReplayRunIfRequested()
         while (!RendererReady()) Sleep(10);
         for (const StoredShader& stored : sequence.shaders) RendererPrepareShader(stored.shader);
         const bool once = GetEnvironmentVariableA("NIER_REPLAY_ONCE", nullptr, 0) > 0;
+        if (GetEnvironmentVariableA("NIER_REPLAY_ONLY", value, sizeof(value)))
+        {
+            const size_t only = (std::min)((std::max)(size_t(strtoull(value, nullptr, 10)), size_t(1)), sequence.frames.size()) - 1;
+            const RendererFrame prepared = Prepare(BuildFrame(sequence, only), options);
+            for (uint64_t n = 1; n <= limit; n++)
+            {
+                RendererFrame next = prepared;
+                next.frame = n;
+                RendererSubmitFrame(std::move(next));
+                Sleep(16);
+            }
+            EndReplay();
+        }
         uint64_t number = 0;
         do
         {

@@ -711,9 +711,33 @@ From the user's playthrough (open unless marked):
   sub_8257AB38 (looks like a spin wait in the D3D library; not examined). Next: cut the command
   thread's work (memoise small texture hashes per frame, a bulk path for plain triangle lists,
   share vertex data between a mesh's passes) and see what makes the late frames heavier.
-- "Magic orbs show a square outline" (user, possibly since the resolution change): no capture
-  of it exists yet (the newest on disk, f8452 / f8519, show none). The user will capture it in
-  the Aerie boss fight.
+- FIXED in replays of the user's recording (not yet seen in play): the Aerie boss's red orbs
+  showed their whole quad as a square. Not the resolution work (it shows at 1x with the 2D pass
+  off): the renderer had no alpha test. The orbs are 19 quads drawn with the 2D shader (vs
+  E51E77673993E73F, ps A87A2B7182F92D9D, an RGBA8 2048x128 sprite strip, blend 000E0706: colour
+  by source alpha, alpha by the CONSTANT alpha factor); outside the orb their alpha is almost
+  zero, so the colour is untouched but the target's alpha is rewritten over the whole quad, and
+  the passes after it that read that alpha show the quad. The console drops those pixels with
+  the alpha test. Now: `RendererDraw::alphaFunc` / `alphaRef` from RB_COLORCONTROL (0x2202:
+  function bits 0-2, enable bit 3) and RB_ALPHA_REF (0x210E, float), handed to pixel shaders
+  in the System constants and applied at the end of every translated pixel shader (so every
+  pixel shader recompiles once). The only test seen so far: function 6 (greater or equal),
+  reference 2/255. Also new: the blend constant (RB_BLEND_RED..ALPHA, 0x2105-0x2108) is passed
+  to the card (`OMSetBlendFactor`); it was left at zero. Captures are now NFRM version 3 /
+  NSEQ version 2 (both fields); `replay_frame.ps1 -Alpha '<ps hash>,<function>,<reference>'`
+  and `-Blend 'r,g,b,a'` force them on older captures, `-Only <n>` takes one frame of a
+  recording as a single capture.
+- Depth of field "a bit low res" (user, cutscene with Kaine; recording seq_f17594). The game's
+  depth of field is a mip blur: C42C4BC07882DC33 copies the picture to 512x512 (07184000) with
+  one sample a texel, C2DA0F3502D52B51 builds each smaller level from the one before (four
+  taps; the same chain feeds the exposure read-back), and AE4637CCAACCEBD4 picks a level from
+  the depth (log2 of the circle of confusion) and blends it with the sharp picture. Two built-in
+  shader improvements (xenos_shader.cpp, by shader hash; NIER_ORIGINAL_EFFECTS=1 leaves them
+  out): the first copy averages 4x4 samples over each texel's footprint, and the chain is read
+  with a bicubic B-spline filter at the two nearest levels. In the replay the blurred figure's
+  edges lose their stair steps and the mean brightness is unchanged (103.1 before and after).
+  Awaiting the user's check. Fine texture detail still shows through weakly blurred areas; that
+  is the sharp picture in the blend, not the blur.
 - DLC notice on Continue ("The quest "Recycled World" is now available." and where to find it:
   info-window messages 2481 / 2482, two pages to confirm on every load) is skipped: sub_8219B0D0
   shows it through sub_823C5140 while a flag at its object +0x20C00 is set, then clears the flag;

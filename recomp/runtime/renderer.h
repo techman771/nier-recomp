@@ -70,6 +70,12 @@ struct RendererDraw
     RenderTargetKey depth;
     uint32_t depthControl = 0, stencilRefMask = 0;
     uint32_t blendControl = 0, writeMask = 0xF;
+    float blendConstant[4] = { 0, 0, 0, 0 };   // RB_BLEND_RED..ALPHA: what the constant blend factors (12-15) stand for
+    // Alpha test (RB_COLORCONTROL, RB_ALPHA_REF): a pixel is kept only if its alpha passes this
+    // comparison with the reference. 0 never, 1 less, 2 equal, 3 less or equal, 4 greater, 5 not
+    // equal, 6 greater or equal, 7 always (also when the test is off).
+    uint8_t alphaFunc = 7;
+    float alphaRef = 0.0f;
     bool rectList = false;
     // Face culling (PA_SU_SC_MODE_CNTL): 0 none, 1 front faces, 2 back faces; which winding is the
     // front. Double-sided cloth, fur and hair are modelled as two coincident layers with opposite

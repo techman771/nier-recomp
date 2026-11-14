@@ -7,13 +7,15 @@
 # -Show leaves the window open until it is closed instead of saving a picture and exiting.
 # A recording (seq_f<N>.nseq, F9 in the game: every frame for 10 seconds) is played once and every
 # -Every'th frame saved as .ppm into <capture>_frames\ or -Out (-Every 1 for all); -Show loops it.
+# -Only <n> takes recorded frame n (from 1) as if it were a single capture: its commands are listed
+# in replay.log and its picture saved as a PNG.
 param([Parameter(Mandatory)][string]$Capture, [string]$Out = '', [int]$Frames = 40, [string]$Zoom = '', [string]$Skip = '',
       [int]$Stop = -1, [string]$PsDebug = '', [string]$Patch = '', [switch]$KeepHlsl, [switch]$Show, [string]$Monitor = 'secondary',
-      [string]$Cull = '', [int]$Every = 6, [string]$Surface = '')
+      [string]$Cull = '', [int]$Every = 6, [string]$Surface = '', [int]$Only = 0, [string]$Alpha = '', [string]$Blend = '')
 $root = Split-Path $PSScriptRoot -Parent
 if (-not (Test-Path $Capture)) { $Capture = Join-Path $root "recomp\captures\$Capture" }
 $Capture = (Resolve-Path $Capture).Path
-$names = 'NIER_REPLAY_FRAME', 'NIER_REPLAY_FRAMES', 'NIER_REPLAY_ONCE', 'NIER_REPLAY_ZOOM', 'NIER_REPLAY_SKIP', 'NIER_REPLAY_STOP', 'NIER_REPLAY_KEEP_HLSL',
+$names = 'NIER_REPLAY_ALPHA', 'NIER_REPLAY_BLEND', 'NIER_REPLAY_ONLY', 'NIER_REPLAY_LIST', 'NIER_REPLAY_FRAME', 'NIER_REPLAY_FRAMES', 'NIER_REPLAY_ONCE', 'NIER_REPLAY_ZOOM', 'NIER_REPLAY_SKIP', 'NIER_REPLAY_STOP', 'NIER_REPLAY_KEEP_HLSL',
          'NIER_REPLAY_CULL', 'NIER_SHOW_SURFACE', 'NIER_PS_DEBUG', 'NIER_SHADER_PATCH', 'NIER_SAVE_FRAMES', 'NIER_AUTO_PRESS', 'NIER_REPLAY_INPUT', 'NIER_RECORD_INPUT'
 foreach ($n in $names) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 $env:NIER_REPLAY_FRAME = $Capture
@@ -21,7 +23,8 @@ $env:NIER_MUTE = '1'
 $env:NIER_FULLSCREEN = '0'
 $env:NIER_MONITOR = $Monitor
 $env:NIER_SETTINGS_FILE = Join-Path $root 'recomp\test_settings.ini'
-$sequence = $Capture -like '*.nseq'
+$sequence = ($Capture -like '*.nseq') -and $Only -le 0
+if ($Only -gt 0) { $env:NIER_REPLAY_ONLY = "$Only"; $env:NIER_REPLAY_LIST = "$Only" }
 $saved = @($Frames)
 if ($sequence) {
     # The recording's summary (.txt beside it) ends with its frame count.
@@ -41,12 +44,14 @@ if ($Stop -ge 0) { $env:NIER_REPLAY_STOP = "$Stop" }
 if ($KeepHlsl) { $env:NIER_REPLAY_KEEP_HLSL = '1' }
 if ($Cull) { $env:NIER_REPLAY_CULL = $Cull }
 if ($Surface) { $env:NIER_SHOW_SURFACE = $Surface }
+if ($Alpha) { $env:NIER_REPLAY_ALPHA = $Alpha }   # '<pixel shader hash>,<function 0-7>,<reference>': force an alpha test
+if ($Blend) { $env:NIER_REPLAY_BLEND = $Blend }   # 'r,g,b,a': force the blend constant
 if ($PsDebug) { $env:NIER_PS_DEBUG = $PsDebug }
 if ($Patch) { $env:NIER_SHADER_PATCH = $Patch }
 $exe = Join-Path $root 'recomp\build\nier.exe'
 $log = Join-Path $root 'recomp\replay.log'
 $frameDir = Join-Path $root 'recomp\frames'
-$files = $saved | ForEach-Object { Join-Path $frameDir "f$_.ppm" }
+$files = @($saved | ForEach-Object { Join-Path $frameDir "f$_.ppm" })
 if (-not $Show) { $files | ForEach-Object { Remove-Item $_ -ErrorAction SilentlyContinue } }
 $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -RedirectStandardOutput $log -RedirectStandardError "$log.err" -NoNewWindow -PassThru
 $null = $p.Handle

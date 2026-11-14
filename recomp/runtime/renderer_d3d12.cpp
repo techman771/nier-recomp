@@ -314,7 +314,9 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     struct SystemConstants
     {
         float ndcScale[2], ndcOffset[2];
-        uint32_t bypassViewport, padding[3];
+        uint32_t bypassViewport, alphaFunc;
+        float alphaRef;
+        uint32_t padding;
         uint32_t vertexBase[96];
         uint32_t samplerPoint[32];   // per slot: sampler index (shader name samplerIndex)
         float texScale[32][4];
@@ -1150,6 +1152,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         memcpy(s->ndcScale, draw.ndcScale, sizeof(s->ndcScale));
         memcpy(s->ndcOffset, draw.ndcOffset, sizeof(s->ndcOffset));
         s->bypassViewport = draw.bypassViewport ? 1 : 0;
+        s->alphaFunc = draw.alphaFunc;
+        s->alphaRef = draw.alphaRef;
         memcpy(s->vertexBase, draw.vertexBase.data(), sizeof(s->vertexBase));
         memcpy(s->boolConstants, draw.boolConstants.data(), sizeof(s->boolConstants));
 
@@ -1185,6 +1189,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (depth) dsv = DepthView(*depth);
         gList->OMSetRenderTargets(target ? 1 : 0, target ? &rtv : nullptr, FALSE, depth ? &dsv : nullptr);
         if (depth) gList->OMSetStencilRef(draw.stencilRefMask & 0xFF);
+        // The constant blend factors. Left unset they are zero: a draw that scales its alpha by the
+        // constant alpha (the Aerie boss's orbs) then wiped the target's alpha over its whole quad,
+        // and the passes after it that read that alpha showed the quad as a square.
+        gList->OMSetBlendFactor(draw.blendConstant);
         const float rs = gActiveTwelfths / 12.0f;
         D3D12_VIEWPORT viewport{ draw.viewport[0] * rs, draw.viewport[1] * rs, draw.viewport[2] * rs, draw.viewport[3] * rs, 0.0f, 1.0f };
         D3D12_RECT scissor{ ScaledInt(draw.scissor[0]), ScaledInt(draw.scissor[1]), ScaledInt(draw.scissor[2]), ScaledInt(draw.scissor[3]) };
