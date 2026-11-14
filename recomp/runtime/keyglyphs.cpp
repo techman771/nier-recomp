@@ -1,6 +1,8 @@
 // Keyboard glyphs: the keyboard icon set is drawn at run time from the current key bindings, so any
 // key the player binds gets its own keycap (GDI+; Windows only, like the rest of the windowing code).
 // Same grid as the other sets (glyphs.cpp): 4 columns x 6 rows of 64-pixel cells, 256x384 RGBA.
+#include <memory>
+#include <algorithm>
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -196,7 +198,7 @@ bool DrawKeyboardAtlas(uint8_t* rgba, uint32_t width, uint32_t height)
 
 // The title prompt in the style of the game's own: a bold serif, widely spaced, with a soft glow.
 // Centred in the box and shrunk to fit it; white on black, one byte per pixel.
-bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int height, float scale, bool glow, float iconWidth, float* iconLeft)
+bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int height, float scale, bool glow, float iconWidth, float* iconLeft, const float* band)
 {
     if (!StartGdiplus()) return false;
     const std::wstring wide(text.begin(), text.end());
@@ -208,7 +210,12 @@ bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int heigh
         g.Clear(Color(255, 0, 0, 0));
         FontFamily family(L"Times New Roman");
         StringFormat format(StringFormat::GenericTypographic());
+        // With a band (top and bottom rows) the capitals start at its top and the descenders, drawn
+        // at 60% of their depth, end at its bottom: the text of an image too short for descenders.
+        constexpr float kCapHeight = 0.662f, kDescent = 0.217f, kDescentScale = 0.6f;
+        const float ascent = float(family.GetCellAscent(FontStyleBold)) / float(family.GetEmHeight(FontStyleBold));
         float size = 19.0f * scale, total = 0;
+        if (band) size = (std::min)(size, (band[1] - band[0]) / (kCapHeight + kDescent * kDescentScale));
         std::vector<float> advances;
         for (int pass = 0; pass < 2; pass++)   // the second pass at a smaller size if the text is too wide
         {
@@ -229,14 +236,28 @@ bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int heigh
             if (total <= room) break;
             size *= room / total;
         }
-        GraphicsPath path;
+        GraphicsPath drawn;
+        GraphicsPath* shape = &drawn;
+        const float top = band ? band[0] - (ascent - kCapHeight) * size : (float(height) - size * 1.15f) / 2;
         float x = (float(width) - total) / 2;
         for (size_t i = 0; i < wide.size(); i++)
         {
             if (wide[i] == L'*') { if (iconLeft) *iconLeft = x; }
-            else if (wide[i] != L' ') path.AddString(&wide[i], 1, &family, FontStyleBold, size, PointF(x, (float(height) - size * 1.15f) / 2), &format);
+            else if (wide[i] != L' ') drawn.AddString(&wide[i], 1, &family, FontStyleBold, size, PointF(x, top), &format);
             x += advances[i];
         }
+        std::unique_ptr<GraphicsPath> squashed;
+        if (band && drawn.GetPointCount() > 0)
+        {
+            PathData points;
+            drawn.GetPathData(&points);
+            const float baseline = top + ascent * size;
+            for (INT i = 0; i < points.Count; i++)
+                if (points.Points[i].Y > baseline) points.Points[i].Y = baseline + (points.Points[i].Y - baseline) * kDescentScale;
+            squashed = std::make_unique<GraphicsPath>(points.Points, points.Types, points.Count, drawn.GetFillMode());
+            shape = squashed.get();
+        }
+        GraphicsPath& path = *shape;
         if (glow) for (float spread : { 5.0f, 3.5f, 2.0f })
         {
             Pen pen(Color(26, 255, 255, 255), spread * scale);

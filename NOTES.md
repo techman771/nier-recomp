@@ -656,7 +656,7 @@ of `save/` made every run, so they can load the playthrough (Game 1) without wri
 routes load Game 1 by default rather than start a new game, unless the user says otherwise.
 
 From the user's playthrough (open unless marked):
-- Blocky shadows: see "Shadow quality" (a setting; awaiting the user's check).
+- Blocky shadows: see "Shadow quality" (a setting; the user is happy with the result).
 - FIXED (confirmed by the user in play): square patches on the sheep's
   legs and beards, Yonah's dress and hair, Nier's waist cloth, AND the dust that filled the screen
   in the cutscene after the Lost Shrine boss. One cause: no face culling. Cloth, fur and hair are
@@ -695,7 +695,7 @@ From the user's playthrough (open unless marked):
   Next step: log the guest call chain at those legend lookups to find each menu's object and its
   per-frame handler (as sub_8241C020 is for the settings pages), then hook that.
 - Shadows "still flicker" at higher Shadow Quality (user, at 3840x2160 with shadow maps x3 / x4):
-  NOT reproduced. Standing still (Game 3) the shadow mask is identical frame to frame (955 +/- 1
+  CLOSED by the user ("we can ignore the shadows, they are pretty good now"). Never reproduced. Standing still (Game 3) the shadow mask is identical frame to frame (955 +/- 1
   dark pixels over 10 frames); in a 3-second recording of running, the mask follows the stride
   smoothly with no dropouts. Guess, untested: the nine-tap filter is one texel wide, so at a
   larger map the edge is harder and its stair steps crawl as the light's projection moves; a
@@ -762,6 +762,19 @@ From the user's playthrough (open unless marked):
   the hook `SkipDlcNotice` at 0x8219B300 clears the flag and jumps past (xam.cpp;
   NIER_DLC_NOTICE=1 keeps the notice). The load route in loadsave_args.txt still works; its
   extra A presses now land after the save has loaded.
+- Quit to Desktop replaces the title menu's fourth entry, "Downloadable Content" (it only opened
+  the Xbox Live store, and was selectable only when signed in to Live). The title object's flag
+  at +3043 means "offer the entry"; `TitleEnableQuit` at 0x82197498 (its setter, r4 = 1) and
+  `TitleKeepQuitEnabled` at 0x8219B0B4 (r11 = 0, so sub_8219AF70 doesn't clear it) keep it on.
+  Confirming the entry (sub_82199788, cursor +3020 == 3) reaches `TitleQuitToDesktop` at
+  0x82199B20: settings are saved and the process ends, as closing the window does
+  (pcsettings.cpp). The label is two DXT3 images (letters 213x14, glow 225x26), redrawn as
+  "Quit to Desktop" by `TitleLabelFor` (glyphs.cpp) in the image's own colour and peak alpha. The letters image is too short for descenders (the
+  original wording had none; anything below it was lit by the glow alone, so Q and p looked half
+  lit): `DrawPromptMask` takes a row band, fits capitals plus descenders at 60% depth into it
+  (the text comes out about 7% smaller).
+  NIER_TITLE_DLC=1 keeps the original entry and label. Checked in a test run (entry
+  highlights, confirm exits with code 0); not yet tried in a playtest.
 - "Press START to Skip" in cutscenes: text 11202000 now returns "Press <ICON=13> to Skip"
   (confirmed by the user). `<ICON=n>` in game text draws cell n of
   the button atlas (0 A, 1 B, 2 X, 3 Y, 4-7 LT RT LB RB, 8 L, 9 R, 11 R3, 12 Back, 13 Start,

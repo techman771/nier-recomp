@@ -320,8 +320,85 @@ static std::shared_ptr<DecodedTexture> TitlePromptFor(const std::shared_ptr<Deco
     return texture;
 }
 
+// The title menu's fourth entry, "Downloadable Content", is likewise two DXT3 images (letters
+// 213x14, glow 225x26). The entry is Quit to Desktop in this port (pcsettings.cpp), so both are
+// redrawn with that wording, in the image's own colour and peak opacity, at twice the size.
+constexpr uint32_t kDlcLabelWidth = 225, kDlcLabelHeight = 26, kDlcLabelTextWidth = 213, kDlcLabelTextHeight = 14;
+
+static std::shared_ptr<DecodedTexture> TitleLabelFor(const std::shared_ptr<DecodedTexture>& original, bool letters, const std::string& text,
+                                                     uint32_t glowWidth, uint32_t glowHeight, uint32_t textWidth, uint32_t textHeight)
+{
+    if (original->format != GuestTextureFormat::BC2 || original->subresources.empty()) return original;
+    static const bool keep = GetEnvironmentVariableA("NIER_TITLE_DLC", nullptr, 0) > 0;
+    if (keep) return original;
+    struct Label { uint64_t sourceHash = 0; std::shared_ptr<DecodedTexture> texture; };
+    static std::mutex mutex;
+    static std::map<uint64_t, Label> labels;
+    std::lock_guard lock(mutex);
+    Label& label = labels[original->key];
+    if (label.texture && label.sourceHash == original->contentHash) return label.texture;
+
+    // The image's colour (alpha-weighted mean) and its strongest alpha.
+    const DecodedTexture::Subresource& sub = original->subresources[0];
+    uint64_t sum[3] = {}, weight = 0;
+    uint32_t peak = 0;
+    for (uint32_t by = 0; by < sub.rows; by++)
+        for (uint32_t bx = 0; bx < sub.rowPitch / 16; bx++)
+        {
+            const uint8_t* block = original->data.data() + sub.offset + size_t(by) * sub.rowPitch + size_t(bx) * 16;
+            const uint16_t c0 = uint16_t(block[8] | block[9] << 8), c1 = uint16_t(block[10] | block[11] << 8);
+            uint32_t colors[4][3];
+            auto expand = [](uint16_t c, uint32_t* rgb) { rgb[0] = ((c >> 11) & 31) * 255 / 31; rgb[1] = ((c >> 5) & 63) * 255 / 63; rgb[2] = (c & 31) * 255 / 31; };
+            expand(c0, colors[0]); expand(c1, colors[1]);
+            for (int k = 0; k < 3; k++) { colors[2][k] = (2 * colors[0][k] + colors[1][k]) / 3; colors[3][k] = (colors[0][k] + 2 * colors[1][k]) / 3; }
+            const uint32_t bits = uint32_t(block[12]) | block[13] << 8 | block[14] << 16 | uint32_t(block[15]) << 24;
+            for (int i = 0; i < 16; i++)
+            {
+                const uint32_t alpha = ((block[i / 2] >> ((i & 1) * 4)) & 15) * 17;
+                const uint32_t* color = colors[(bits >> (2 * i)) & 3];
+                for (int k = 0; k < 3; k++) sum[k] += uint64_t(color[k]) * alpha;
+                weight += alpha;
+                peak = alpha > peak ? alpha : peak;
+            }
+        }
+    if (!weight) return original;
+
+    const uint32_t width = original->width * 2, height = original->height * 2;   // block-padded, like the original
+    std::vector<uint8_t> mask(size_t(glowWidth * 2) * (glowHeight * 2));
+    // The letters image is the middle of the glow image's box, and too short for descenders at the
+    // usual size: the text is fitted to its rows, so that no part of a letter is left to the glow alone.
+    const float band[2] = { float(glowHeight - textHeight), float(glowHeight + textHeight) };
+    if (!DrawPromptMask(text, mask.data(), int(glowWidth * 2), int(glowHeight * 2), 2.0f, !letters, 0.0f, nullptr, band)) return original;
+    const uint32_t boxWidth = (letters ? textWidth : glowWidth) * 2, boxHeight = (letters ? textHeight : glowHeight) * 2;
+    const uint32_t offsetX = (glowWidth * 2 - boxWidth) / 2, offsetY = (glowHeight * 2 - boxHeight) / 2;
+    auto texture = std::make_shared<DecodedTexture>();
+    texture->data.assign(size_t(width) * height * 4, 0);
+    for (uint32_t y = 0; y < boxHeight && y < height; y++)
+        for (uint32_t x = 0; x < boxWidth && x < width; x++)
+        {
+            uint8_t* texel = &texture->data[(size_t(y) * width + x) * 4];
+            for (int k = 0; k < 3; k++) texel[k] = uint8_t(sum[k] / weight);
+            texel[3] = uint8_t(mask[size_t(y + offsetY) * glowWidth * 2 + x + offsetX] * peak / 255);
+        }
+    texture->key = original->key ^ 0x717569746C626C00ull ^ uint64_t(letters);
+    texture->contentHash = original->contentHash ^ 0x5175697454784474ull;
+    texture->format = GuestTextureFormat::RGBA8;
+    texture->width = width;
+    texture->height = height;
+    texture->rowPitch = width * 4;
+    texture->subresources.push_back({ 0, width * 4, height });
+    if (!letters) Log("[glyphs] title menu: \"%s\" in place of the Downloadable Content label (colour %u %u %u, alpha %u)\n", text.c_str(),
+        unsigned(sum[0] / weight), unsigned(sum[1] / weight), unsigned(sum[2] / weight), peak);
+    label = { original->contentHash, texture };
+    return texture;
+}
+
 std::shared_ptr<DecodedTexture> GlyphAtlasFor(const std::shared_ptr<DecodedTexture>& original, uint32_t guestFormat, uint32_t width, uint32_t height)
 {
+    if (original && guestFormat == kPromptFormat && width == kDlcLabelWidth && height == kDlcLabelHeight)
+        return TitleLabelFor(original, false, "Quit to Desktop", kDlcLabelWidth, kDlcLabelHeight, kDlcLabelTextWidth, kDlcLabelTextHeight);
+    if (original && guestFormat == kPromptFormat && width == kDlcLabelTextWidth && height == kDlcLabelTextHeight)
+        return TitleLabelFor(original, true, "Quit to Desktop", kDlcLabelWidth, kDlcLabelHeight, kDlcLabelTextWidth, kDlcLabelTextHeight);
     if (original && guestFormat == kPromptFormat && width == kPromptWidth && height == kPromptHeight) return TitlePromptFor(original, false);
     if (original && guestFormat == kPromptFormat && width == kPromptTextWidth && height == kPromptTextHeight) return TitlePromptFor(original, true);
     if (guestFormat != 20 || width != kAtlasWidth || height != kAtlasHeight || !original) return original;

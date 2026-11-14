@@ -76,3 +76,24 @@ name = "SkipDlcNotice"
 address = 0x8219B300
 registers = ["r30"]
 jump_address_on_true = 0x8219B368
+
+# Quit to Desktop in place of the title menu's "Downloadable Content" (it only opened the store).
+# The game offers the entry while NO DLC is installed and greys it out otherwise: the flag at
+# +3043 of the title object is set through sub_82197498 (r4: the flag, "DLC count == 0") and
+# cleared at 0x8219B0BC when the count (tested at 0x8219B0B4) is above zero. Here it is always
+# set. Confirming the entry (sub_82199788, cursor +3020 == 3, at 0x82199B20) quits the game
+# instead of opening the store (runtime: pcsettings.cpp; the label images: glyphs.cpp).
+[[midasm_hook]]
+name = "TitleEnableQuit"
+address = 0x82197498
+registers = ["r4"]
+
+[[midasm_hook]]
+name = "TitleKeepQuitEnabled"
+address = 0x8219B0B4
+registers = ["r11"]
+
+[[midasm_hook]]
+name = "TitleQuitToDesktop"
+address = 0x82199B20
+registers = ["r31"]

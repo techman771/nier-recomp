@@ -17,6 +17,6 @@ std::string StartPromptWording(bool capital);
 // keyglyphs.cpp: the title prompt's wording as white text, with a glow if asked, one byte per pixel;
 // scale 2 draws it twice as large, smaller if it doesn't fit. A '*' in the text leaves iconWidth
 // pixels free for an icon; *iconLeft is where that room starts.
-bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int height, float scale, bool glow, float iconWidth, float* iconLeft);
+bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int height, float scale, bool glow, float iconWidth, float* iconLeft, const float* band = nullptr);
 int GlyphSetInUse();   // the icons shown now: -1 the game's own (Xbox 360), 0 Xbox Series, 1 PS4, 2 PS5, 3 keyboard, 4 Steam
 uint64_t KeyBindingsStamp();   // changes when a key is rebound

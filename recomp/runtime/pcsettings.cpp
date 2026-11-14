@@ -396,6 +396,29 @@ void PcSettingsPageBuilt(PPCRegister& r31)
 }
 
 // sub_8241C020, action item 27 (r31 the menu): open the PC page instead of the device selector.
+// Quit to Desktop on the title menu (see nier_hooks.toml). NIER_TITLE_DLC=1 keeps the game's
+// "Downloadable Content" entry.
+static bool KeepTitleDlc() { static const bool keep = GetEnvironmentVariableA("NIER_TITLE_DLC", nullptr, 0) > 0; return keep; }
+
+void TitleEnableQuit(PPCRegister& r4)
+{
+    if (!KeepTitleDlc()) r4.u64 = 1;   // the fourth entry can be chosen
+}
+
+void TitleKeepQuitEnabled(PPCRegister& r11)
+{
+    if (!KeepTitleDlc()) r11.u64 = 0;   // "no DLC": the entry isn't greyed out again
+}
+
+void TitleQuitToDesktop(PPCRegister& r31)
+{
+    if (KeepTitleDlc()) return;
+    Log("[settings] Quit to Desktop chosen on the title menu\n");
+    SettingsSave();
+    fflush(stdout);
+    TerminateProcess(GetCurrentProcess(), 0);   // as closing the window does
+}
+
 bool PcSettingsOpen(PPCRegister& r31)
 {
     if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return false;
