@@ -597,9 +597,13 @@ right left up down / L left-right, L up-down, the game emblem, empty). glyphs.cp
 shape and content (empty last cell, opaque A cell) at the end of `DecodeTexture` and hands the
 renderer one of our atlases instead (256x384 RGBA, drawn by `tools/make_glyphs.ps1` into
 `recomp/build/glyphs/*.rgba` at build time; the emblem cell is copied from the game's atlas):
-xbox (Series), ps4, ps5, keyboard, chosen by the last device used. `NIER_GLYPHS=<set>|original`
-forces one. Still to do: mouse input (and mouse glyphs), rebinding, DualSense extras, a PC Settings
-entry to pick the icon set.
+xbox (Series), ps4, ps5, steam (Steam Deck / Steam Controller: Valve vendor id 0x28DE or SDL's
+STEAM type), keyboard, chosen by the last device used. `NIER_GLYPHS=<set>|original`
+forces one. PC Settings > Button Icons (`button_icons` in settings.ini: 0 Auto, 1 Xbox Series,
+2 PlayStation 4, 3 PlayStation 5, 4 Steam Deck, 5 Xbox 360 = the game's own) picks the controller
+set; keyboard and mouse always switch to the keyboard set on their own. Help texts longer than
+about 60 characters run off the help box: break them with a newline (the box holds three lines).
+Still to do: DualSense extras.
 
 ### Key bindings
 
@@ -628,7 +632,6 @@ writes the cursor row (+3576) and lays the page out again on hover, and injects 
 clicks (A on action rows, d-pad left/right by click side on values, B on right click, d-pad up/down
 on the wheel). NIER_FAKE_MOUSE=<frame>,<x>,<y>[,<click frame>] simulates it. Still to do for the
 pointer: top Options page, title menu, save list, pause tabs, shops, dialogue choices.
-Next: Steam Deck / Steam Controller glyph set.
 
 ### Direct mouse camera (in progress)
 

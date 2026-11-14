@@ -1,5 +1,6 @@
 # Draws the replacement button-glyph atlases (our own art) used when a PlayStation pad, an Xbox
-# Series pad or the keyboard is the active input device. Layout matches the game's atlas (4 columns
+# Series pad, a Steam Deck / Steam Controller or the keyboard is the active input device (the
+# keyboard set here is only a preview; the game draws its own from the key bindings). Layout matches the game's atlas (4 columns
 # x 6 rows; see recomp/runtime/glyphs.cpp), at twice its resolution: 64-pixel cells, 256x384.
 #   row 0: A B X Y            row 3: Back, Start, D-pad, Guide
 #   row 1: LT RT LB RB        row 4: D-pad right, left, up, down
@@ -88,7 +89,11 @@ function Lines($g, $c, $r) { foreach ($dy in -6, 0, 6) { $g.DrawLine((Pen $ink 3
 
 function DrawPad($g, $set) {
     $dark = Rgb 34 34 38
-    if ($set -eq 'xbox') {
+    if ($set -eq 'steam') {
+        # Steam Deck / Steam Controller: dark buttons with white letters; L1 R1 bumpers, L2 R2 triggers.
+        $i = 0; foreach ($letter in 'A', 'B', 'X', 'Y') { Disc $g $i 0 $dark; Text $g $letter (Cx $i) (Cy 0) 34 $paper; $i++ }
+        $names = 'L2', 'R2', 'L1', 'R1'
+    } elseif ($set -eq 'xbox') {
         $letters = @(@('A', (Rgb 120 200 80)), @('B', (Rgb 230 80 70)), @('X', (Rgb 80 150 235)), @('Y', (Rgb 245 200 50)))
         for ($i = 0; $i -lt 4; $i++) { Disc $g $i 0 $dark; Text $g $letters[$i][0] (Cx $i) (Cy 0) 34 $letters[$i][1] }
         $names = 'LT', 'RT', 'LB', 'RB'
@@ -110,7 +115,7 @@ function DrawPad($g, $set) {
     $l3 = 'L'; $r3 = 'R'; if ($set -ne 'xbox') { $l3 = 'L3'; $r3 = 'R3' }
     Stick $g 0 2 'L' '' $false; Stick $g 1 2 'R' '' $false; Stick $g 2 2 $l3 '' $true; Stick $g 3 2 $r3 '' $true
     # Back and Start.
-    if ($set -eq 'xbox') {
+    if ($set -eq 'xbox' -or $set -eq 'steam') {
         Disc $g 0 3 $paper 20; $g.DrawRectangle((Pen $ink 3), (Cx 0) - 9, (Cy 3) - 8, 12, 10); $g.FillRectangle((Brush $paper), (Cx 0) - 3, (Cy 3) - 2, 12, 10); $g.DrawRectangle((Pen $ink 3), (Cx 0) - 3, (Cy 3) - 2, 12, 10)
         Disc $g 1 3 $paper 20; Lines $g 1 3
     } elseif ($set -eq 'ps4') {
@@ -123,7 +128,10 @@ function DrawPad($g, $set) {
     $body = Rgb 70 70 76; if ($set -eq 'ps5') { $body = $paper }
     Dpad $g 2 3 '' $body $body
     Disc $g 3 3 $dark 24
-    if ($set -eq 'xbox') { $g.DrawLine((Pen $paper 5), (Cx 3) - 10, (Cy 3) - 10, (Cx 3) + 10, (Cy 3) + 10); $g.DrawLine((Pen $paper 5), (Cx 3) + 10, (Cy 3) - 10, (Cx 3) - 10, (Cy 3) + 10) } else { Text $g 'PS' (Cx 3) (Cy 3) 24 $paper }
+    if ($set -eq 'steam') {
+        # The STEAM button: a ring with a dot, read as the Steam mark at this size.
+        $g.DrawEllipse((Pen $paper 4), (Cx 3) - 11, (Cy 3) - 11, 22, 22); $g.FillEllipse((Brush $paper), (Cx 3) - 4, (Cy 3) - 4, 8, 8)
+    } elseif ($set -eq 'xbox') { $g.DrawLine((Pen $paper 5), (Cx 3) - 10, (Cy 3) - 10, (Cx 3) + 10, (Cy 3) + 10); $g.DrawLine((Pen $paper 5), (Cx 3) + 10, (Cy 3) - 10, (Cx 3) - 10, (Cy 3) + 10) } else { Text $g 'PS' (Cx 3) (Cy 3) 24 $paper }
     $glow = Rgb 255 208 80
     $i = 0; foreach ($dir in 'right', 'left', 'up', 'down') { Dpad $g $i 4 $dir $body $glow; $i++ }
     Stick $g 0 5 'L' 'h' $false; Stick $g 1 5 'L' 'v' $false
@@ -151,7 +159,7 @@ function DrawKeyboard($g) {
     & $cluster 1 5 @('W', 'A', 'S', 'D') @(0, 2)        # L up/down
 }
 
-foreach ($set in 'xbox', 'ps4', 'ps5', 'keyboard') {
+foreach ($set in 'xbox', 'ps4', 'ps5', 'steam', 'keyboard') {
     $bmp = New-Object System.Drawing.Bitmap $W, $H, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'; $g.PixelOffsetMode = 'HighQuality'

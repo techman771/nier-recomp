@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-enum class InputStyle { Xbox, PS4, PS5, Nintendo, Keyboard };
+enum class InputStyle { Xbox, PS4, PS5, Nintendo, Keyboard, Steam };
 InputStyle InputLastStyle();
 
 // Keyboard bindings: one key (a Windows virtual-key code, 0 for none) per pad control.

@@ -57,6 +57,7 @@ namespace
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
             { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },
+            { "button_icons", &gSettings.buttonIcons, 0, 5 },
         };
     }
 
@@ -72,11 +73,12 @@ namespace
         T_QuitToDesktop,
         T_KeysButtons, T_KeysButtonsHelp, T_KeysMove, T_KeysMoveHelp, T_KeysDefaults, T_KeysDefaultsHelp, T_KeyHelp, T_KeysReturnHelp, T_PressKey,
         T_MouseSensitivity, T_MouseSensitivityHelp,
+        T_Icons, T_IconsHelp, T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
         "PC Settings", "Adjust display, frame rate and audio settings for PC.",
-        "Display Mode", "Play in a window or in borderless fullscreen (also Alt+Enter).",
+        "Display Mode", "Play in a window or in borderless fullscreen\n(also Alt+Enter).",
         "Frame Rate", "Choose 60 fps, or the original 30 fps cap.",
         "VSync", "Synchronize frames with the display to prevent tearing.",
         "Master Volume", "Adjust the overall volume.",
@@ -84,13 +86,15 @@ namespace
         "Save PC settings and return to Game Settings.",
         "Windowed", "Borderless", "30 fps", "60 fps", "On", "Off",
         "Quit to Desktop",
-        "Key Bindings: Actions", "Choose the keys and mouse buttons for attacks, abilities and menus.",
+        "Key Bindings: Actions", "Choose the keys and mouse buttons for attacks,\nabilities and menus.",
         "Key Bindings: Movement", "Choose the keyboard keys for movement and the camera.",
         "Restore Default Keys", "Put every key binding back to its default.",
-        "Press Left or Right, then the new key or mouse button. Backspace cancels.",
+        "Press Left or Right, then the new key or mouse button.\nBackspace cancels.",
         "Save the key bindings and return to PC Settings.",
         "Press a key...",
-        "Mouse Sensitivity", "Adjust how fast the mouse turns the camera. The lowest setting turns it off.",
+        "Mouse Sensitivity", "Adjust how fast the mouse turns the camera.\nThe lowest setting turns it off.",
+        "Button Icons", "Choose the controller button icons.\nKeyboard and mouse always show their own.",
+        "Auto", "Xbox Series", "PlayStation 4", "PlayStation 5", "Steam Deck", "Xbox 360",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -129,7 +133,7 @@ namespace
     constexpr uint32_t kItemKeysButtons = 70, kItemKeysMove = 71, kItemKeysDefaults = 72, kItemKey = 100;   // kItemKey + action index
     constexpr int kKeysPerPage = 12;
 
-    struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[2]; };
+    struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[7]; };   // types 2 and 4 name their values
     const Item kItems[] = {
         { 60, 2, &gSettings.borderless, 1, T_DisplayMode, T_DisplayModeHelp, { T_Windowed, T_Borderless } },
         { 61, 2, &gSettings.frameRate60, 1, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps } },
@@ -137,6 +141,7 @@ namespace
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },
         { 65, 6, &gSettings.mouseSensitivity, 10, T_MouseSensitivity, T_MouseSensitivityHelp, {} },
+        { 66, 4, &gSettings.buttonIcons, 5, T_Icons, T_IconsHelp, { T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal } },
     };
     const Item* FindItem(uint32_t id)
     {
@@ -176,7 +181,7 @@ namespace
         const uint32_t first = menu + kRecords;
         uint32_t n = 0;
         for (const Item& item : kItems)
-            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t(item.value->load()), 0, item.max, item.type == 2 ? 1 : 0, item.id, item.label, item.help);
+            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t(item.value->load()), 0, item.max, (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, item.help);
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysButtons, T_KeysButtons, T_KeysButtonsHelp);
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysMove, T_KeysMove, T_KeysMoveHelp);
         WriteRecord(first + n++ * kRecordSize, 8, 0, 0, 0, 0, kItemSpacer, 0xFFFFFFFF, 0xFFFFFFFF);
@@ -331,8 +336,8 @@ bool PcSettingsValueText(PPCRegister& r3)
         return true;
     }
     const Item* item = FindItem(id);
-    if (!item || item->type != 2) return false;
-    const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, 1);
+    if (!item || (item->type != 2 && item->type != 4)) return false;
+    const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, int(item->max));
     r3.u64 = GuestText(item->values[value]);
     return true;
 }

@@ -3,7 +3,7 @@
 // left up down / L left-right, L up-down, the game's emblem, empty). When the device used last isn't
 // an Xbox 360 pad, the renderer is handed one of our atlases instead (tools/make_glyphs.ps1 draws
 // them into glyphs\<set>.rgba beside the executable: 256x384 RGBA, same grid), with the emblem cell
-// copied from the game's atlas. NIER_GLYPHS=xbox|ps4|ps5|keyboard|original forces a set.
+// copied from the game's atlas. NIER_GLYPHS=xbox|ps4|ps5|steam|keyboard|original forces a set.
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -13,13 +13,14 @@
 #include "guest.h"
 #include "renderer.h"
 #include "input.h"
+#include "settings.h"
 #include "glyphs.h"
 
 namespace
 {
     constexpr uint32_t kAtlasWidth = 128, kAtlasHeight = 192, kCell = 32, kScale = 2;
-    enum Set { Original = -1, XboxSeries, Ps4, Ps5, Keyboard, SetCount };
-    const char* kSetFiles[SetCount] = { "xbox", "ps4", "ps5", "keyboard" };
+    enum Set { Original = -1, XboxSeries, Ps4, Ps5, Keyboard, Steam, SetCount };
+    const char* kSetFiles[SetCount] = { "xbox", "ps4", "ps5", "keyboard", "steam" };
 
     Set CurrentSet()
     {
@@ -30,11 +31,23 @@ namespace
             return _stricmp(value, "original") == 0 ? -1 : -2;
         }();
         if (forced != -2) return Set(forced);
+        // Keyboard and mouse always get their own icons; PC Settings > Button Icons picks the
+        // controller icons (0 is Auto: by the controller used last).
+        if (InputLastStyle() == InputStyle::Keyboard) return Keyboard;
+        switch (Settings().buttonIcons)
+        {
+        case 1: return XboxSeries;
+        case 2: return Ps4;
+        case 3: return Ps5;
+        case 4: return Steam;
+        case 5: return Original;
+        }
         switch (InputLastStyle())
         {
         case InputStyle::PS4: return Ps4;
         case InputStyle::PS5: return Ps5;
         case InputStyle::Keyboard: return Keyboard;
+        case InputStyle::Steam: return Steam;
         default: return XboxSeries;
         }
     }

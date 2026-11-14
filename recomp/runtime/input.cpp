@@ -96,6 +96,7 @@ namespace
         {
         case InputStyle::PS4: return "DualShock 4";
         case InputStyle::PS5: return "DualSense";
+        case InputStyle::Steam: return "Steam";
         case InputStyle::Nintendo: return "Nintendo";
         case InputStyle::Keyboard: return "keyboard";
         default: return "Xbox";
@@ -119,6 +120,8 @@ namespace
             if (!slot.pad) { Log("[input] couldn't open controller: %s\n", SDL_GetError()); return; }
             slot.id = id;
             slot.style = StyleOf(SDL_GetGamepadType(slot.pad));
+            // Valve hardware (Steam Deck, Steam Controller), whatever layout SDL reports for it.
+            if (SDL_GetGamepadVendor(slot.pad) == 0x28DE || SDL_GetGamepadType(slot.pad) == SDL_GAMEPAD_TYPE_STEAM) slot.style = InputStyle::Steam;
             slot.rumbleLow = slot.rumbleHigh = 0;
             gLastStyle = int(slot.style);   // show its glyphs straight away
             Log("[input] controller %u connected: %s (%s layout)\n", user, SDL_GetGamepadName(slot.pad), StyleName(slot.style));

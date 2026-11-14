@@ -11,6 +11,7 @@ struct PcSettings
     std::atomic<int> masterVolume{ 10 };       // 0-10
     std::atomic<int> muteInBackground{ 1 };    // silence while the window isn't focused
     std::atomic<int> mouseSensitivity{ 5 };    // 0-10; 0 turns the mouse camera off
+    std::atomic<int> buttonIcons{ 0 };         // controller icons: 0 auto (last controller used), 1 Xbox Series, 2 PS4, 3 PS5, 4 Steam, 5 the game's own (Xbox 360)
 };
 
 PcSettings& Settings();
