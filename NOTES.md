@@ -527,6 +527,64 @@ read pointer writeback, memory and scratch writes, fences, `WAIT_REG_MEM`, CP in
   silent. The title movie's audio doesn't need it.
 - Movie smoothness: see below.
 
+### Resolution
+
+PC Settings > Resolution chooses the size the game is drawn at, any of ten 16:9 sizes
+(`resolution_scale` in settings.ini, an index: 0 640x360, 1 854x480, 2 960x540, 3 1280x720 = the
+original and the default, 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160,
+9 5120x2880; `NIER_RES_SCALE=<0.5-4>` overrides with a scale). A change applies between frames
+(`ApplyResolutionSetting` at the start of `RenderFrame`, when the GPU is idle): every scaled
+surface is dropped and the next frame creates what it uses at the new size, so surfaces resolved
+in the frame before are missing for one frame (a brief dip in exposure). The menu stores the
+value when the PC Settings page is left. `NIER_RES_AT=<frame>,<index>` changes it in a test run.
+All of it is in renderer_d3d12.cpp: the scale is
+kept in twelfths (`gResTwelfths`, 12 = 1x) so every size is exact, and `Scaled()` converts guest
+lengths. Every colour target, depth target, resolved surface and resolved mip chain is created
+at the scaled size, and draw viewports, scissors and the resolve copy rectangles are scaled to
+match (copies are clamped to both textures, since rounding can add a pixel at fractional
+scales). Everything the guest sees (target keys, sizes, rectangles) stays in guest pixels, and
+shaders use normalized texture coordinates, so nothing else changes; shadow maps and
+reduced-size passes scale too. Resolve write-back still hands the game pixels at its
+own size: the read-back is averaged down (or up) to the guest size first. The game reads its
+luminance reduction that way to set exposure; skipping it at other scales (an early version did)
+left the exposure on a stale value, and the scene went nearly black at low sizes after a high
+one (`NIER_NO_SCALED_WRITEBACK=1` reproduces that). New render targets and resolve textures are
+also cleared when created, not left holding old memory. The window shows the result with one linear-filtered copy, so a size far above the
+window's is not properly downsampled.
+Checked on frame captures at 0.5, 0.667, 0.75, 1, 1.25, 1.5, 2, 2.5 and 3 (all draws run, the
+picture is the same, softer or sharper) and in live runs at 1.25 and 2 (title, save list,
+village). At 2x the single-pixel highlights on characters go from 46 to 3 in the Nier area of
+capture f7338. Not measured: frame rate at any size. Not done: sizes that aren't 16:9 (16:10
+for the Steam Deck is wanted later), choosing the size from the display, modern upscalers.
+
+### 2D at the display's resolution
+
+The Resolution setting sizes the 3D scene; the HUD, menus, text and the title screen are drawn at
+the display's own size whatever it is set to (renderer_d3d12.cpp; `NIER_NATIVE_2D=0` turns this
+off). A frame ends with the copy that produces the picture shown (the scanout). Before it the
+game draws, into the same target and with no depth test, the final full-screen composite of the
+scene and then every 2D element. `FindFlatPhase` finds that run by walking back from the scanout
+copy: draws into that target that aren't depth-tested (depth test off, or one that always passes)
+belong to it; it stops at the first depth-tested draw or at a copy out of that target (the
+scene being captured); passes into other targets in between are left alone. In the village frame
+it starts at the full-screen copy of the finished scene, then the bloom composite, then the HUD.
+Those draws, and the scanout copy, run at the display's scale (`gDisplayTwelfths`: the largest
+16:9 picture that fits the window against 1280x720, in twelfths) instead of the render scale:
+`gActiveTwelfths` is the scale in force for the command being executed and is part of the key
+of render and depth targets, so the display-sized target is a separate object from the
+render-sized one with the same guest address. When the pass begins, the render-sized target's
+picture is copied (scaled) into the display-sized one, unless nothing drew to it this frame
+(menus drawn over the last picture); the pass has its own depth and stencil surface, cleared
+once a frame (the minimap's stencil mask works); a clear that ends the frame is applied to
+both targets. The composite then scales the scene texture to the display as it draws, so no
+separate upscale pass exists. A window resize changes the display scale and drops every
+surface, like a resolution change.
+Checked: captures at render scale 0.5 and 2 in a 1280x720 window (HUD and markers sharp, scene
+soft or sharp, stencil-masked minimap right); a live run at 640x360 (title, menu, save list,
+gameplay HUD, pause menu) and switching to 2560x1440 while paused. Not checked: shops, dialogue
+windows, movies with subtitles, loading screens, and 2D that is depth-tested (it would stay at
+the render size). 3D-looking UI is unaffected by design.
+
 ### Frame captures (the fastest way to work on a graphics bug)
 
 F12 in the game (or `NIER_CAPTURE_AT=<frame>` in a test run) saves that frame's renderer commands
@@ -579,6 +637,20 @@ From the user's playthrough (open unless marked):
   loads Game 2 (Lost Shrine: Roof) and walks through the boss door to the altar where Yonah
   lies, about 5,000 frames; Examine there only says a force blocks the way.
 - DLC ("The World of Recycled Vessel"): works, confirmed by the user after getting Grimoire Weiss.
+- Sparkles on Nier (single bright pixels on skin, hair and armour, e.g. capture f7338 in his
+  house): NOT a bug; the user checked reference footage of the original and it shows them too.
+  They are specular highlights of the character shaders at normal size (gone when zoomed in;
+  the same count with and without face culling; they vanish when D461B8752A20D67B and
+  EDAC9A9A457EFED6 are painted flat).
+- Mouse on the menus other than the settings pages (title, pause tabs, save list, shops): the
+  user reports the cursor stuck at the screen edge there while the game has focus. That is the
+  camera capture (hidden, confined cursor), not a fault: no pointer exists for those menus yet.
+  It needs to know when such a menu is on screen, and three cheap signals don't work: the legend
+  texts "Select" 11100000 / "Confirm" 11100100 are looked up once when a menu opens (frame 854
+  save list, 3300 pause menu in the load route), not every frame; a paused frame still draws the
+  whole 3D scene (316 depth-tested draws against 201 in play); nothing marks a menu closing.
+  Next step: log the guest call chain at those legend lookups to find each menu's object and its
+  per-frame handler (as sub_8241C020 is for the settings pages), then hook that.
 - DLC notice on Continue ("The quest "Recycled World" is now available." and where to find it:
   info-window messages 2481 / 2482, two pages to confirm on every load) is skipped: sub_8219B0D0
   shows it through sub_823C5140 while a flag at its object +0x20C00 is set, then clears the flag;

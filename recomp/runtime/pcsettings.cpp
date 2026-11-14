@@ -55,6 +55,7 @@ namespace
             { "borderless", &gSettings.borderless, 0, 1 },
             { "frame_rate_60", &gSettings.frameRate60, 0, 1 },
             { "vsync", &gSettings.vsync, 0, 1 },
+            { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
             { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },
@@ -75,6 +76,7 @@ namespace
         T_KeysButtons, T_KeysButtonsHelp, T_KeysMove, T_KeysMoveHelp, T_KeysDefaults, T_KeysDefaultsHelp, T_KeyHelp, T_KeysReturnHelp, T_PressKey,
         T_MouseSensitivity, T_MouseSensitivityHelp,
         T_Icons, T_IconsHelp, T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal,
+        T_Resolution, T_ResolutionHelp, T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
@@ -96,6 +98,8 @@ namespace
         "Mouse Sensitivity", "Adjust how fast the mouse turns the camera.\nThe lowest setting turns it off.",
         "Button Icons", "Choose the controller button icons.\nKeyboard and mouse always show their own.",
         "Auto", "Xbox Series", "PlayStation 4", "PlayStation 5", "Steam Deck", "Xbox 360",
+        "Resolution", "Choose the resolution the game is drawn at.\nHigher is sharper but asks more of the graphics card.",
+        "640 x 360", "854 x 480", "960 x 540", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3200 x 1800", "3840 x 2160", "5120 x 2880",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -134,11 +138,12 @@ namespace
     constexpr uint32_t kItemKeysButtons = 70, kItemKeysMove = 71, kItemKeysDefaults = 72, kItemKey = 100;   // kItemKey + action index
     constexpr int kKeysPerPage = 12;
 
-    struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[7]; };   // types 2 and 4 name their values
+    struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[10]; };   // types 2 and 4 name their values
     const Item kItems[] = {
         { 60, 2, &gSettings.borderless, 1, T_DisplayMode, T_DisplayModeHelp, { T_Windowed, T_Borderless } },
         { 61, 2, &gSettings.frameRate60, 1, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps } },
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
+        { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },
         { 65, 6, &gSettings.mouseSensitivity, 10, T_MouseSensitivity, T_MouseSensitivityHelp, {} },

@@ -101,7 +101,7 @@ float4 PSMain(Interpolated input) : SV_Target
     constexpr UINT64 kWriteBackBytes = 8u << 20;
     ComPtr<ID3D12Resource> gWriteBack;
     UINT64 gWriteBackUsed = 0;
-    struct PendingWriteBack { RendererResolve resolve; UINT64 offset; UINT rowPitch; };
+    struct PendingWriteBack { RendererResolve resolve; UINT64 offset; UINT rowPitch; UINT hostWidth, hostHeight; };
     std::vector<PendingWriteBack> gPendingWriteBacks;
     UINT64 gUploadCapacity = 0, gReadbackCapacity = 0;
     UINT gRtvStep = 0;
@@ -261,7 +261,24 @@ Interpolated VSMain(uint id : SV_VertexID)
     return output;
 }
 float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(linearClamp, input.uv).rgb, 1.0); }
+float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp, input.uv); }
 )";
+
+    // Internal resolution scale: every render target, depth target and resolved surface is this many
+    // times the guest's size along each axis, and viewports, scissors and copy rectangles are scaled
+    // to match. The guest's own numbers (sizes, keys, rectangles) stay in guest pixels everywhere;
+    // shaders address textures by normalized coordinates, so they need no change. Applied between frames
+    // (PC Settings > Resolution, or NIER_RES_SCALE). It is kept in twelfths so that every size
+    // offered is exact (854x480 is 8/12, 1600x900 is 15/12, 1920x1080 is 18/12); Scaled() converts
+    // a guest length or coordinate, rounding to the nearest pixel and never to nothing.
+    uint32_t gResTwelfths = 12;
+    bool gResolutionLogged = false;
+    // The display's own scale (the window against 1280x720) and the scale in force for the command
+    // being executed: the render scale, or the display's for the frame's closing 2D pass (see
+    // FindFlatPhase). Surfaces of the two scales are separate objects.
+    uint32_t gDisplayTwelfths = 12, gActiveTwelfths = 12;
+    inline uint32_t Scaled(uint32_t guest) { return guest ? (std::max)((guest * gActiveTwelfths + 6) / 12, 1u) : 0; }
+    inline int ScaledInt(int guest) { return guest >= 0 ? int((uint32_t(guest) * gActiveTwelfths + 6) / 12) : -int((uint32_t(-guest) * gActiveTwelfths + 6) / 12); }
 
     struct TargetResource
     {
@@ -277,12 +294,14 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
         bool swapRedBlue = false;
         bool depth = false;   // R32_FLOAT depth copy rather than a color copy
         uint64_t version = 0; // bumped by every resolve into it
+        uint32_t twelfths = 0;   // the scale it was created at
     };
     // A resolved base plus resolved levels, combined into one mipmapped texture.
     struct ResolvedChain
     {
         ComPtr<ID3D12Resource> texture;
         uint32_t width = 0, height = 0, levels = 0;
+        uint32_t hostWidth = 0, hostHeight = 0;
         std::vector<std::pair<ID3D12Resource*, uint64_t>> copied;   // per level: source and version last copied
     };
     std::unordered_map<uint32_t, ResolvedChain> gResolvedChains;
@@ -299,7 +318,7 @@ float4 PSMain(Interpolated input) : SV_Target { return float4(source.Sample(line
     struct ArenaBlock { uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu; UINT64 offset; };
 
     ComPtr<ID3D12RootSignature> gDrawRoot;
-    ComPtr<ID3D12PipelineState> gBlitPipeline;
+    ComPtr<ID3D12PipelineState> gBlitPipeline, gTargetCopyPipeline;
     ComPtr<ID3D12DescriptorHeap> gDrawSrvHeap, gTargetRtvHeap, gSamplerHeap;
 
     // The draw root signature plus its sampler table (root parameter 4).
@@ -450,6 +469,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
         desc.RTVFormats[0] = kBackBufferFormat;
         desc.SampleDesc.Count = 1;
         if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gBlitPipeline)), "blit pipeline")) return false;
+        {
+            // The same triangle into a render target, all four channels (the 2D pass's starting picture).
+            ComPtr<ID3DBlob> copy;
+            if (FAILED(D3DCompile(kBlitShader, sizeof(kBlitShader) - 1, "blit", nullptr, nullptr, "PSCopy", "ps_5_1", 0, 0, &copy, &shaderErrors))) return false;
+            desc.PS = { copy->GetBufferPointer(), copy->GetBufferSize() };
+            desc.RTVFormats[0] = kTargetFormat;
+            if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gTargetCopyPipeline)), "target copy pipeline")) return false;
+        }
 
         ComPtr<ID3DBlob> copyVs, copyPs;
         if (FAILED(D3DCompile(kDepthCopyShader, sizeof(kDepthCopyShader) - 1, "depthcopy", nullptr, nullptr, "VSMain", "vs_5_1", 0, 0, &copyVs, &shaderErrors)) ||
@@ -772,7 +799,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     TargetResource* GetTarget(const RenderTargetKey& key)
     {
         if (!key.width || !key.height) return nullptr;
-        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40);
+        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40) | (uint64_t(gActiveTwelfths) << 56);
         auto found = gTargets.find(mapKey);
         if (found != gTargets.end()) return &found->second;
 
@@ -785,8 +812,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = key.width;
-        desc.Height = key.height;
+        desc.Width = Scaled(key.width);
+        desc.Height = Scaled(key.height);
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.Format = kTargetFormat;
@@ -798,6 +825,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = gTargetRtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += SIZE_T(created.rtvIndex) * gTargetRtvStep;
         gDevice->CreateRenderTargetView(created.texture.Get(), nullptr, rtv);
+        // A new texture holds whatever was in that memory. Passes that feed on their own last result
+        // (the exposure adaptation) would take it for a picture: after a resolution change the scene
+        // could stay nearly black. Start from zero instead.
+        const FLOAT zero[4] = { 0, 0, 0, 0 };
+        static const bool keepGarbage = GetEnvironmentVariableA("NIER_NO_TARGET_CLEAR", nullptr, 0) > 0;   // debugging: as before the fix
+        if (!keepGarbage) gList->ClearRenderTargetView(rtv, zero, 0, nullptr);
         Log("[d3d12] render target at EDRAM 0x%X: %ux%u\n", key.edramBase, key.width, key.height);
         return &(gTargets[mapKey] = std::move(created));
     }
@@ -813,7 +846,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     DepthResource* GetDepth(const RenderTargetKey& key)
     {
         if (!key.width || !key.height) return nullptr;
-        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40);
+        const uint64_t mapKey = uint64_t(key.edramBase) | (uint64_t(key.width) << 16) | (uint64_t(key.height) << 40) | (uint64_t(gActiveTwelfths) << 56);
         auto found = gDepths.find(mapKey);
         if (found != gDepths.end()) return &found->second;
         if (gDepthsCreated >= kTargetSlots) return nullptr;
@@ -824,8 +857,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = key.width;
-        desc.Height = key.height;
+        desc.Width = Scaled(key.width);
+        desc.Height = Scaled(key.height);
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.Format = kDepthResourceFormat;
@@ -948,15 +981,16 @@ float PSMain(float4 position : SV_Position) : SV_Target
         const UINT levels = UINT(sources.size());
         if (levels < 2) return nullptr;
         ResolvedChain& chain = gResolvedChains[binding.resolvedBase];
-        if (!chain.texture || chain.width != base.width || chain.height != base.height || chain.levels != levels)
+        const D3D12_RESOURCE_DESC baseDesc = base.texture->GetDesc();
+        if (!chain.texture || chain.width != base.width || chain.height != base.height || chain.levels != levels || chain.hostWidth != baseDesc.Width || chain.hostHeight != baseDesc.Height)
         {
             if (chain.texture) gRetired.push_back(std::move(chain.texture));
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = base.width;
-            desc.Height = base.height;
+            desc.Width = baseDesc.Width;
+            desc.Height = baseDesc.Height;
             desc.DepthOrArraySize = 1;
             desc.MipLevels = UINT16(levels);
             desc.Format = kTargetFormat;
@@ -964,6 +998,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, kShaderRead, nullptr, IID_PPV_ARGS(&chain.texture)), "resolved mip chain")) return nullptr;
             chain.width = base.width;
             chain.height = base.height;
+            chain.hostWidth = UINT(baseDesc.Width);
+            chain.hostHeight = UINT(baseDesc.Height);
             chain.levels = levels;
             chain.copied.assign(levels, { nullptr, 0 });
         }
@@ -979,7 +1015,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 started = true;
             }
             const UINT levelWidth = std::max(chain.width >> level, 1u), levelHeight = std::max(chain.height >> level, 1u);
-            D3D12_BOX box{ 0, 0, 0, std::min(levelWidth, source.width), std::min(levelHeight, source.height), 1 };
+            // In host pixels: the chain's level and the resolved surface can differ by a pixel when the
+            // scale isn't whole.
+            const D3D12_RESOURCE_DESC sourceDesc = source.texture->GetDesc();
+            const UINT hostLevelWidth = std::max(chain.hostWidth >> level, 1u), hostLevelHeight = std::max(chain.hostHeight >> level, 1u);
+            D3D12_BOX box{ 0, 0, 0, std::min(hostLevelWidth, UINT(sourceDesc.Width)), std::min(hostLevelHeight, UINT(sourceDesc.Height)), 1 };
             auto toSource = Transition(source.texture.Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gList->ResourceBarrier(1, &toSource);
             D3D12_TEXTURE_COPY_LOCATION to{}, from{};
@@ -1054,6 +1094,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gDevice->CreateShaderResourceView(resource, &view, handle);
     }
 
+    std::set<const DepthResource*> gFlatDepthsCleared;   // per frame
+
     void ExecuteDraw(const RendererDraw& draw)
     {
         ID3D12PipelineState* pipeline = PipelineFor(draw);
@@ -1061,6 +1103,9 @@ float PSMain(float4 position : SV_Position) : SV_Target
         DepthResource* depth = draw.depthBound ? GetDepth(draw.depth) : nullptr;
         if (!pipeline || (draw.hasColor && !target) || (draw.depthBound && !depth) || !draw.vertexCount) { gDrawsFailed++; return; }
         if (target) SetTargetState(*target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        // The 2D pass has its own depth and stencil surface (the display's size); it starts clean.
+        if (depth && gActiveTwelfths != gResTwelfths && gFlatDepthsCleared.insert(depth).second)
+            gList->ClearDepthStencilView(DepthView(*depth), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
         ArenaBlock constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
         memcpy(constants.cpu, draw.constants.data(), draw.constants.size() * 4);
@@ -1106,8 +1151,9 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (depth) dsv = DepthView(*depth);
         gList->OMSetRenderTargets(target ? 1 : 0, target ? &rtv : nullptr, FALSE, depth ? &dsv : nullptr);
         if (depth) gList->OMSetStencilRef(draw.stencilRefMask & 0xFF);
-        D3D12_VIEWPORT viewport{ draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], 0.0f, 1.0f };
-        D3D12_RECT scissor{ draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3] };
+        const float rs = gActiveTwelfths / 12.0f;
+        D3D12_VIEWPORT viewport{ draw.viewport[0] * rs, draw.viewport[1] * rs, draw.viewport[2] * rs, draw.viewport[3] * rs, 0.0f, 1.0f };
+        D3D12_RECT scissor{ ScaledInt(draw.scissor[0]), ScaledInt(draw.scissor[1]), ScaledInt(draw.scissor[2]), ScaledInt(draw.scissor[3]) };
         gList->RSSetViewports(1, &viewport);
         gList->RSSetScissorRects(1, &scissor);
         BindDrawRoot();
@@ -1162,14 +1208,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (!source || !resolve.width || !resolve.height) return;
         ResolvedResource& destination = gResolved[resolve.destBase];
         bool created = false;
-        if (!destination.texture || !destination.depth || destination.width != resolve.width || destination.height != resolve.height)
+        if (!destination.texture || !destination.depth || destination.width != resolve.width || destination.height != resolve.height || destination.twelfths != gActiveTwelfths)
         {
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = resolve.width;
-            desc.Height = resolve.height;
+            desc.Width = Scaled(resolve.width);
+            desc.Height = Scaled(resolve.height);
             desc.DepthOrArraySize = 1;
             desc.MipLevels = 1;
             desc.Format = kDepthCopyFormat;
@@ -1182,6 +1228,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&destination.texture)), "depth resolve texture")) return;
             destination.width = resolve.width;
             destination.height = resolve.height;
+            destination.twelfths = gActiveTwelfths;
             destination.depth = true;
             destination.version++;
             destination.swapRedBlue = false;
@@ -1209,8 +1256,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (sourceX < 0) { destX -= sourceX / scale; copyWidth += sourceX / scale; sourceX = 0; }
         if (sourceY < 0) { destY -= sourceY / scale; copyHeight += sourceY / scale; sourceY = 0; }
         D3D12_RESOURCE_DESC sourceDesc = source->texture->GetDesc();
-        copyWidth = std::min({ copyWidth, (int(sourceDesc.Width) - sourceX) / scale, int(resolve.width) - destX });
-        copyHeight = std::min({ copyHeight, (int(sourceDesc.Height) - sourceY) / scale, int(resolve.height) - destY });
+        // The rectangles are in guest pixels; the surfaces are larger by the resolution scale.
+        const int guestSourceWidth = int(sourceDesc.Width) * 12 / int(gActiveTwelfths), guestSourceHeight = int(sourceDesc.Height) * 12 / int(gActiveTwelfths);
+        copyWidth = std::min({ copyWidth, (guestSourceWidth - sourceX) / scale, int(resolve.width) - destX });
+        copyHeight = std::min({ copyHeight, (guestSourceHeight - sourceY) / scale, int(resolve.height) - destY });
         if (copyWidth > 0 && copyHeight > 0)
         {
             const UINT slot = gDrawSrvUsed;
@@ -1229,10 +1278,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gDevice->CreateShaderResourceView(source->texture.Get(), &view, cpu);
 
                 ArenaBlock constants = ArenaAlloc(256, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-                const int32_t values[8] = { destX, destY, sourceX, sourceY, scale, 0, 0, 0 };
+                const int32_t values[8] = { ScaledInt(destX), ScaledInt(destY), ScaledInt(sourceX), ScaledInt(sourceY), scale, 0, 0, 0 };
                 memcpy(constants.cpu, values, sizeof(values));
-                D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(resolve.width), float(resolve.height), 0.0f, 1.0f };
-                D3D12_RECT scissor{ destX, destY, destX + copyWidth, destY + copyHeight };
+                D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(Scaled(resolve.width)), float(Scaled(resolve.height)), 0.0f, 1.0f };
+                D3D12_RECT scissor{ ScaledInt(destX), ScaledInt(destY), ScaledInt(destX + copyWidth), ScaledInt(destY + copyHeight) };
                 gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 gList->RSSetViewports(1, &viewport);
                 gList->RSSetScissorRects(1, &scissor);
@@ -1262,22 +1311,35 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
         ResolvedResource& destination = gResolved[resolve.destBase];
         bool created = false;
-        if (!destination.texture || destination.depth || destination.width != width || destination.height != height)
+        if (!destination.texture || destination.depth || destination.width != width || destination.height != height || destination.twelfths != gActiveTwelfths)
         {
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = width;
-            desc.Height = height;
+            desc.Width = Scaled(width);
+            desc.Height = Scaled(height);
             desc.DepthOrArraySize = 1;
             desc.MipLevels = 1;
             desc.Format = kTargetFormat;
             desc.SampleDesc.Count = 1;
             if (destination.texture) gRetired.push_back(std::move(destination.texture));
-            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination.texture)), "resolve texture")) return;
+            // Created as a render target only so it can start cleared: a copy may cover part of it
+            // (tiles, or an edge pixel at fractional scales), and the rest must not be leftover memory.
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE zeroClear{};
+            zeroClear.Format = kTargetFormat;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &zeroClear, IID_PPV_ARGS(&destination.texture)), "resolve texture")) return;
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE rtv = gDepthCopyRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                gDevice->CreateRenderTargetView(destination.texture.Get(), nullptr, rtv);
+                gList->ClearRenderTargetView(rtv, zeroClear.Color, 0, nullptr);
+                auto toCopy = Transition(destination.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                gList->ResourceBarrier(1, &toCopy);
+            }
             destination.width = width;
             destination.height = height;
+            destination.twelfths = gActiveTwelfths;
             destination.depth = false;
             created = true;
         }
@@ -1304,11 +1366,19 @@ float PSMain(float4 position : SV_Position) : SV_Target
         copyHeight = std::min({ copyHeight, int(source->height) - sourceY, int(height) - destY });
         if (copyWidth > 0 && copyHeight > 0)
         {
-            D3D12_BOX box{ UINT(sourceX), UINT(sourceY), 0, UINT(sourceX + copyWidth), UINT(sourceY + copyHeight), 1 };
-            gList->CopyTextureRegion(&to, UINT(destX), UINT(destY), 0, &from, &box);
+            // In host pixels, kept inside both textures (rounding can add a pixel when the scale isn't whole).
+            const D3D12_RESOURCE_DESC fromDesc = source->texture->GetDesc(), toDesc = destination.texture->GetDesc();
+            const UINT hostSourceX = Scaled(UINT(sourceX)), hostSourceY = Scaled(UINT(sourceY)), hostDestX = Scaled(UINT(destX)), hostDestY = Scaled(UINT(destY));
+            const UINT hostWidth = std::min({ Scaled(UINT(sourceX + copyWidth)) - hostSourceX, UINT(fromDesc.Width) - hostSourceX, UINT(toDesc.Width) - hostDestX });
+            const UINT hostHeight = std::min({ Scaled(UINT(sourceY + copyHeight)) - hostSourceY, UINT(fromDesc.Height) - hostSourceY, UINT(toDesc.Height) - hostDestY });
+            D3D12_BOX box{ hostSourceX, hostSourceY, 0, hostSourceX + hostWidth, hostSourceY + hostHeight, 1 };
+            if (hostWidth && hostHeight) gList->CopyTextureRegion(&to, hostDestX, hostDestY, 0, &from, &box);
         }
         D3D12_RESOURCE_STATES finalCopyState = D3D12_RESOURCE_STATE_COPY_DEST;
-        if (resolve.writeBack)
+        // NIER_NO_SCALED_WRITEBACK=1 (debugging) skips the read-back unless the scale is 1, as an early
+        // version did: the exposure then keeps a stale value and the scene can go dark.
+        static const bool skipScaled = GetEnvironmentVariableA("NIER_NO_SCALED_WRITEBACK", nullptr, 0) > 0;
+        if (resolve.writeBack && !(skipScaled && gActiveTwelfths != 12))
         {
             if (!gWriteBack) gWriteBack = MakeBuffer(kWriteBackBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             D3D12_RESOURCE_DESC desc = destination.texture->GetDesc();
@@ -1329,7 +1399,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 readFrom.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 gList->CopyTextureRegion(&readTo, 0, 0, 0, &readFrom, nullptr);
                 gWriteBackUsed = offset + size;
-                gPendingWriteBacks.push_back({ resolve, offset, footprint.Footprint.RowPitch });
+                gPendingWriteBacks.push_back({ resolve, offset, footprint.Footprint.RowPitch, UINT(desc.Width), UINT(desc.Height) });
                 finalCopyState = D3D12_RESOURCE_STATE_COPY_SOURCE;
             }
         }
@@ -1369,6 +1439,82 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gList->SetGraphicsRootDescriptorTable(4, gSamplerHeap->GetGPUDescriptorHandleForHeapStart());
     }
 
+    bool SameTarget(const RenderTargetKey& a, const RenderTargetKey& b) { return a.edramBase == b.edramBase && a.width == b.width && a.height == b.height; }
+
+    // The frame's closing 2D pass. A frame ends with the copy that produces the picture shown (the
+    // scanout); before it the game draws the final full-screen composite of the 3D scene and then
+    // the HUD, menus and text into the same target, none of it depth-tested. That run of draws is
+    // rendered at the display's resolution instead of the render resolution, so the 2D stays sharp
+    // when the scene is drawn smaller (or isn't oversized when it is drawn larger): the composite
+    // scales the scene texture to the display as it draws, and everything after lands on display
+    // pixels. Returns the index of the first command of the pass (commands.size() if there is none)
+    // and the target it draws to. NIER_NATIVE_2D=0 turns it off.
+    size_t FindFlatPhase(const RendererFrame& frame, RenderTargetKey& target)
+    {
+        const size_t none = frame.commands.size();
+        static const bool enabled = [] {
+            char value[8];
+            return !(GetEnvironmentVariableA("NIER_NATIVE_2D", value, sizeof(value)) && value[0] == '0');
+        }();
+        if (!enabled || !frame.scanoutBase || gDisplayTwelfths == gResTwelfths) return none;
+        size_t end = none;
+        for (size_t i = frame.commands.size(); i-- > 0;)
+            if (const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]))
+                if (resolve->copyColor && resolve->destBase == frame.scanoutBase) { end = i; target = resolve->source; break; }
+        if (end == none) return none;
+        size_t start = end;
+        for (size_t i = end; i-- > 0;)
+        {
+            if (const RendererDraw* draw = std::get_if<RendererDraw>(&frame.commands[i]))
+            {
+                if (!SameTarget(draw->target, target)) continue;   // a pass into another surface: left as it is
+                const bool depthTested = (draw->depthControl & 2) && ((draw->depthControl >> 4) & 7) != 7;
+                if (!draw->hasColor || depthTested) break;          // the 3D scene
+                start = i;
+            }
+            else if (SameTarget(std::get<RendererResolve>(frame.commands[i]).source, target)) break;   // the scene is copied out here
+        }
+        return start == end ? none : start;
+    }
+
+    // Starts the 2D pass: the display-sized target takes over the picture the render-sized one holds.
+    void BeginFlatPhase(const RenderTargetKey& key, bool drawnThisFrame)
+    {
+        gActiveTwelfths = gResTwelfths;
+        TargetResource* from = GetTarget(key);
+        gActiveTwelfths = gDisplayTwelfths;
+        TargetResource* to = GetTarget(key);
+        if (!from || !to || !drawnThisFrame) return;   // nothing new at render size: the display-sized picture carries on
+        const UINT slot = gDrawSrvUsed;
+        if (slot + kTextureSlots > kDrawDescriptors) return;
+        gDrawSrvUsed += kTextureSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(slot) * gSrvStep;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(slot) * gSrvStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = kTargetFormat;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(from->texture.Get(), &view, cpu);
+        SetTargetState(*from, kShaderRead);
+        SetTargetState(*to, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = gTargetRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(to->rtvIndex) * gTargetRtvStep;
+        const D3D12_RESOURCE_DESC toDesc = to->texture->GetDesc();
+        D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(toDesc.Width), float(toDesc.Height), 0.0f, 1.0f };
+        D3D12_RECT scissor{ 0, 0, LONG(toDesc.Width), LONG(toDesc.Height) };
+        gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        gList->RSSetViewports(1, &viewport);
+        gList->RSSetScissorRects(1, &scissor);
+        BindDrawRoot();
+        gList->SetPipelineState(gTargetCopyPipeline.Get());
+        gList->SetGraphicsRootDescriptorTable(3, gpu);
+        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->DrawInstanced(3, 1, 0, 0);
+    }
+
     void ExecuteGuestCommands(const RendererFrame& frame)
     {
         uint32_t shownCopies = 0;
@@ -1377,12 +1523,37 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gDrawSrvUsed = 0;
         ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
         gList->SetDescriptorHeaps(2, heaps);
-        for (const auto& command : frame.commands)
+        gFlatDepthsCleared.clear();
+        RenderTargetKey flatTarget;
+        const size_t flatStart = FindFlatPhase(frame, flatTarget);
+        const bool hasFlat = flatStart < frame.commands.size();
+        bool flatBegun = false, drawnThisFrame = false;
+        for (size_t index = 0; index < frame.commands.size(); index++)
         {
-            if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
+            const auto& command = frame.commands[index];
+            gActiveTwelfths = gResTwelfths;
+            if (auto* draw = std::get_if<RendererDraw>(&command))
+            {
+                const bool onTarget = hasFlat && draw->hasColor && SameTarget(draw->target, flatTarget);
+                if (onTarget && index >= flatStart)
+                {
+                    if (!flatBegun) { BeginFlatPhase(flatTarget, drawnThisFrame); flatBegun = true; }
+                    gActiveTwelfths = gDisplayTwelfths;
+                }
+                else if (onTarget) drawnThisFrame = true;
+                ExecuteDraw(*draw);
+            }
             else
             {
                 const RendererResolve& resolve = std::get<RendererResolve>(command);
+                const bool onTarget = hasFlat && SameTarget(resolve.source, flatTarget);
+                const bool flat = onTarget && index >= flatStart;
+                if (flat)
+                {
+                    if (!flatBegun) { BeginFlatPhase(flatTarget, drawnThisFrame); flatBegun = true; }
+                    gActiveTwelfths = gDisplayTwelfths;
+                }
+                else if (onTarget && resolve.clearColor) drawnThisFrame = true;
                 if (Shown().occurrence && (resolve.copyColor || resolve.copyDepth) && resolve.destBase == Shown().base && ++shownCopies == Shown().occurrence)
                 {
                     RendererResolve snapshot = resolve;
@@ -1391,8 +1562,15 @@ float PSMain(float4 position : SV_Position) : SV_Target
                     ExecuteResolve(snapshot);
                 }
                 ExecuteResolve(resolve);
+                if (flat && (resolve.clearColor || resolve.clearDepth))
+                {
+                    // The clear that ends the frame is meant for the next frame's scene too.
+                    gActiveTwelfths = gResTwelfths;
+                    ApplyResolveClears(resolve);
+                }
             }
         }
+        gActiveTwelfths = gResTwelfths;
     }
 
     // Shows the scanout surface in the back buffer. It's in render target channel order, so no swap.
@@ -1608,9 +1786,51 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gReadback->Unmap(0, nullptr);
     }
 
+    // The resolution asked for, in twelfths: the setting is an index into this list of scales;
+    // NIER_RES_SCALE=<scale> (0.5 to 4) overrides it.
+    uint32_t ResolutionWanted()
+    {
+        static const double forced = [] {
+            char value[16];
+            return GetEnvironmentVariableA("NIER_RES_SCALE", value, sizeof(value)) ? atof(value) : 0.0;
+        }();
+        static const uint32_t kSettingTwelfths[] = { 6, 8, 9, 12, 15, 18, 24, 30, 36, 48 };   // 360p 480p 540p 720p 900p 1080p 1440p 1800p 2160p 2880p
+        const double asked = forced > 0.0 ? forced : kSettingTwelfths[std::clamp(Settings().resolutionScale.load(), 0, 9)] / 12.0;
+        return uint32_t(std::clamp(int(asked * 12.0 + 0.5), 6, 48));
+    }
+
+    // Applies a changed resolution between frames (the GPU is idle: the last frame waited for it).
+    // Every surface whose size depends on the scale is dropped; the frame about to be drawn creates
+    // what it uses at the new size. Surfaces the game resolved in the frame before are missing for
+    // that one frame.
+    void ApplyResolutionSetting()
+    {
+        const uint32_t wanted = ResolutionWanted();
+        // The display's scale: the largest 16:9 picture that fits the window, against 1280x720.
+        const double fit = (std::min)(gWidth / 1280.0, gHeight / 720.0);
+        const uint32_t display = uint32_t(std::clamp(int(fit * 12.0 + 0.5), 6, 48));
+        if (wanted == gResTwelfths && display == gDisplayTwelfths && gResolutionLogged) return;
+        if (wanted != gResTwelfths || display != gDisplayTwelfths)
+        {
+            gTargets.clear();
+            gDepths.clear();
+            gResolved.clear();
+            gResolvedChains.clear();
+            gTargetsCreated = 0;
+            gDepthsCreated = 0;
+            gResTwelfths = wanted;
+            gDisplayTwelfths = display;
+        }
+        gActiveTwelfths = gResTwelfths;
+        gResolutionLogged = true;
+        Log("[d3d12] internal resolution %ux%u (scale %.3f), 2D at %ux%u\n", Scaled(1280), Scaled(720), gResTwelfths / 12.0,
+            (1280 * gDisplayTwelfths + 6) / 12, (720 * gDisplayTwelfths + 6) / 12);
+    }
+
     void RenderFrame(const MailboxPlane planes[3], bool movie, uint64_t frame, const RendererFrame* guest)
     {
         WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+        ApplyResolutionSetting();
 
         gAllocator->Reset();
         gList->Reset(gAllocator.Get(), nullptr);
@@ -1749,7 +1969,33 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (SUCCEEDED(gWriteBack->Map(0, &range, &mapped)))
             {
                 for (const PendingWriteBack& pending : gPendingWriteBacks)
-                    GpuWriteResolvedPixels(pending.resolve, static_cast<const uint8_t*>(mapped) + pending.offset, pending.rowPitch);
+                {
+                    const uint8_t* host = static_cast<const uint8_t*>(mapped) + pending.offset;
+                    const uint32_t width = pending.resolve.width, height = pending.resolve.height;
+                    const uint32_t hostWidth = pending.hostWidth, hostHeight = pending.hostHeight;
+                    if (hostWidth == width && hostHeight == height) { GpuWriteResolvedPixels(pending.resolve, host, pending.rowPitch); continue; }
+                    // The game expects its own size (it reads the luminance reduction to set exposure):
+                    // each guest pixel is the average of the host pixels it covers.
+                    std::vector<uint8_t> guest(size_t(width) * height * 4);
+                    for (uint32_t y = 0; y < height; y++)
+                    {
+                        const uint32_t y0 = y * hostHeight / height, y1 = (std::min)((std::max)((y + 1) * hostHeight / height, y0 + 1), hostHeight);
+                        for (uint32_t x = 0; x < width; x++)
+                        {
+                            const uint32_t x0 = x * hostWidth / width, x1 = (std::min)((std::max)((x + 1) * hostWidth / width, x0 + 1), hostWidth);
+                            uint32_t sum[4] = {}, count = 0;
+                            for (uint32_t sy = (std::min)(y0, hostHeight - 1); sy < (std::max)(y1, (std::min)(y0, hostHeight - 1) + 1); sy++)
+                                for (uint32_t sx = (std::min)(x0, hostWidth - 1); sx < (std::max)(x1, (std::min)(x0, hostWidth - 1) + 1); sx++)
+                                {
+                                    const uint8_t* texel = host + size_t(sy) * pending.rowPitch + size_t(sx) * 4;
+                                    for (int k = 0; k < 4; k++) sum[k] += texel[k];
+                                    count++;
+                                }
+                            for (int k = 0; k < 4; k++) guest[(size_t(y) * width + x) * 4 + k] = uint8_t((sum[k] + count / 2) / count);
+                        }
+                    }
+                    GpuWriteResolvedPixels(pending.resolve, guest.data(), width * 4);
+                }
                 D3D12_RANGE none{ 0, 0 };
                 gWriteBack->Unmap(0, &none);
             }

@@ -1394,6 +1394,17 @@ namespace
                     return GetEnvironmentVariableA("NIER_CAPTURE_AT", value, sizeof(value)) ? strtoull(value, nullptr, 10) : ~0ull;
                 }();
                 if (frame == captureAt) gCaptureRequested = true;
+                // NIER_RES_AT=<frame>,<index>[;...]: sets the Resolution setting at those frames, as the
+                // menu would (test runs).
+                static const std::map<uint64_t, int> resolutionAt = [] {
+                    char value[256];
+                    std::map<uint64_t, int> at;
+                    if (GetEnvironmentVariableA("NIER_RES_AT", value, sizeof(value)))
+                        for (char* item = strtok(value, ";"); item; item = strtok(nullptr, ";"))
+                            if (const char* comma = strchr(item, ',')) at[strtoull(item, nullptr, 10)] = atoi(comma + 1);
+                    return at;
+                }();
+                if (auto change = resolutionAt.find(frame); change != resolutionAt.end()) Settings().resolutionScale = change->second;
             }
             if (gCaptureRequested.exchange(false))
             {
