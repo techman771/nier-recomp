@@ -27,6 +27,7 @@
 #include "guest.h"
 #include "settings.h"
 #include "input.h"
+#include "glyphs.h"
 
 extern "C" PPC_FUNC(__imp__sub_824197A8);
 extern "C" PPC_FUNC(__imp__sub_824178D0);
@@ -303,8 +304,46 @@ void SettingsPollPage()
 // ---- mid-asm hooks (nier_hooks.toml) -------------------------------------------------------------
 
 // sub_823CB8C8 (text table, id): our ids return our strings.
+// "Press the START Button" (title screen; a second copy has a small b) names the control that is
+// Start on the device in use.
+// The id is found by its text in the game's text table (r3).
+static bool StartPromptText(PPCRegister& r3, PPCRegister& r4)
+{
+    static uint32_t promptIds[2] = {}, scannedCount = 0, buffers[2] = {};   // [0] "...Button", [1] "...button"
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    // Two lists of { id, string } pairs: up to 2935 at +0 (count at +23480) and up to 64 at +23484
+    // (count at +23996).
+    const uint32_t counts[2] = { R32(r3.u32 + 23480), R32(r3.u32 + 23996) };
+    if (!(promptIds[0] && promptIds[1]) && counts[0] + counts[1] != scannedCount && counts[0] <= 2935 && counts[1] <= 64)
+    {
+        scannedCount = counts[0] + counts[1];
+        for (int list = 0; list < 2; list++)
+            for (uint32_t i = 0; i < counts[list]; i++)
+            {
+                const uint32_t entry = r3.u32 + (list ? 23484 : 0) + i * 8, text = R32(entry + 4);
+                if (!text) continue;
+                const char* string = reinterpret_cast<const char*>(g_base + text);
+                if (strcmp(string, "Press the START Button") == 0) promptIds[0] = R32(entry);
+                else if (strcmp(string, "Press the START button") == 0) promptIds[1] = R32(entry);
+            }
+        Log("[settings] the Start prompts are texts %u and %u\n", promptIds[0], promptIds[1]);
+    }
+    const int which = r4.u32 == 0 ? -1 : r4.u32 == promptIds[0] ? 0 : r4.u32 == promptIds[1] ? 1 : -1;
+    if (which < 0) return false;
+    const std::string text = StartPromptWording(which == 0);
+    if (text.empty()) return false;   // the game's own icons: its own wording
+    uint32_t& buffer = buffers[which];
+    if (!buffer) buffer = GuestAlloc(64, 4, Region::Heap);
+    strncpy(reinterpret_cast<char*>(g_base + buffer), text.c_str(), 63);
+    W8(buffer + 63, 0);
+    r3.u64 = buffer;
+    return true;
+}
+
 bool PcSettingsText(PPCRegister& r3, PPCRegister& r4)
 {
+    if (StartPromptText(r3, r4)) return true;
     if (r4.u32 >= kKeyLabelText && r4.u32 < kKeyLabelText + kKeyActions)
     {
         r3.u64 = DynamicText(r4.u32 - kKeyLabelText, InputKeyAction(int(r4.u32 - kKeyLabelText)).label);

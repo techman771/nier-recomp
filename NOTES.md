@@ -605,6 +605,24 @@ set; keyboard and mouse always switch to the keyboard set on their own. Help tex
 about 60 characters run off the help box: break them with a newline (the box holds three lines).
 Still to do: DualSense extras.
 
+Title prompt: "Press the START Button" on the title screen is not text and not part of the movie
+(TITLE_NIER_ALL.SFD is the intro that plays before the title; its length in frames varies run to
+run, so tests skip it with one Start press, e.g. `-AutoPress 1750:10`, and capture ~400 frames
+later). It is two DXT3 images of the title layout (2d	itle), one colour with the shape in the
+alpha: the letters (255x14) and their glow (265x26), centred on the same point; the game fades
+and pulses them. `GlyphAtlasFor` recognises them by format and size and returns "Press the
+(icon) Button" ("Key" on keyboard; GDI+, keyglyphs.cpp `DrawPromptMask`, in the image's own
+colour) with the Start icon of the icon set in use (atlas cell column 1, row 3, cropped to what is drawn and scaled to the prompt's
+height), at twice the size: Options on PS4 / PS5, the menu button on Xbox Series / Steam, the
+keycap of the key bound to Pause Menu on keyboard; the original images with the Xbox 360 icons.
+The letters go in both images, the icon only in the glow image (the letters image is 14 pixels
+high), so the icon pulses with the glow. Two text-table strings "Press the START Button" /
+"...button" (ids 1112500 and 1500400, found by text in `PcSettingsText`) are reworded instead
+("Press the OPTIONS Button", "Press the MENU Button", "Press the Esc Key"); where the game shows
+those is not known.
+The table (r3 of sub_823CB8C8) holds { id, string } pairs: up to 2935 at +0 (count at +23480) and
+up to 64 at +23484 (count at +23996).
+
 ### Key bindings
 
 PC Settings has "Key Bindings: Buttons" and "Key Bindings: Movement" (12 rows each: a page holds

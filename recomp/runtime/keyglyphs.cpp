@@ -7,6 +7,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 #include "guest.h"
 #include "input.h"
 #include "glyphs.h"
@@ -16,6 +17,14 @@ namespace
     using namespace Gdiplus;
     constexpr int S = 64;
     const Color kInk(255, 26, 26, 30), kPaper(255, 245, 245, 240), kShade(255, 170, 170, 165), kLit(255, 255, 208, 80);
+
+    bool StartGdiplus()
+    {
+        static std::once_flag once;
+        static ULONG_PTR token = 0;
+        std::call_once(once, [] { GdiplusStartupInput input; GdiplusStartup(&token, &input, nullptr); });
+        return token != 0;
+    }
 
     // What goes on a keycap: short enough to fit, clear enough to find on a keyboard.
     std::wstring KeyLabel(int key)
@@ -146,10 +155,7 @@ uint64_t KeyBindingsStamp()
 
 bool DrawKeyboardAtlas(uint8_t* rgba, uint32_t width, uint32_t height)
 {
-    static std::once_flag once;
-    static ULONG_PTR token = 0;
-    std::call_once(once, [] { GdiplusStartupInput input; GdiplusStartup(&token, &input, nullptr); });
-    if (!token) return false;
+    if (!StartGdiplus()) return false;
 
     Bitmap bitmap(INT(width), INT(height), PixelFormat32bppARGB);
     {
@@ -183,6 +189,70 @@ bool DrawKeyboardAtlas(uint8_t* rgba, uint32_t width, uint32_t height)
         const uint8_t* source = static_cast<const uint8_t*>(data.Scan0) + size_t(y) * data.Stride;
         uint8_t* out = rgba + size_t(y) * width * 4;
         for (uint32_t x = 0; x < width; x++) { out[x * 4] = source[x * 4 + 2]; out[x * 4 + 1] = source[x * 4 + 1]; out[x * 4 + 2] = source[x * 4]; out[x * 4 + 3] = source[x * 4 + 3]; }   // BGRA -> RGBA
+    }
+    bitmap.UnlockBits(&data);
+    return true;
+}
+
+// The title prompt in the style of the game's own: a bold serif, widely spaced, with a soft glow.
+// Centred in the box and shrunk to fit it; white on black, one byte per pixel.
+bool DrawPromptMask(const std::string& text, uint8_t* mask, int width, int height, float scale, bool glow, float iconWidth, float* iconLeft)
+{
+    if (!StartGdiplus()) return false;
+    const std::wstring wide(text.begin(), text.end());
+    Bitmap bitmap(width, height, PixelFormat32bppARGB);
+    {
+        Graphics g(&bitmap);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.Clear(Color(255, 0, 0, 0));
+        FontFamily family(L"Times New Roman");
+        StringFormat format(StringFormat::GenericTypographic());
+        float size = 19.0f * scale, total = 0;
+        std::vector<float> advances;
+        for (int pass = 0; pass < 2; pass++)   // the second pass at a smaller size if the text is too wide
+        {
+            const float tracking = size * 0.115f, space = size * 0.62f;
+            Font font(&family, size, FontStyleBold, UnitPixel);
+            advances.clear();
+            total = 0;
+            for (wchar_t c : wide)
+            {
+                float advance = space;
+                if (c == L'*') advance = iconWidth;
+                else if (c != L' ') { RectF box; g.MeasureString(&c, 1, &font, PointF(0, 0), &format, &box); advance = box.Width + tracking; }
+                advances.push_back(advance);
+                total += advance;
+            }
+            total -= tracking;
+            const float room = float(width) - 10.0f * scale;   // leaves the glow inside the box
+            if (total <= room) break;
+            size *= room / total;
+        }
+        GraphicsPath path;
+        float x = (float(width) - total) / 2;
+        for (size_t i = 0; i < wide.size(); i++)
+        {
+            if (wide[i] == L'*') { if (iconLeft) *iconLeft = x; }
+            else if (wide[i] != L' ') path.AddString(&wide[i], 1, &family, FontStyleBold, size, PointF(x, (float(height) - size * 1.15f) / 2), &format);
+            x += advances[i];
+        }
+        if (glow) for (float spread : { 5.0f, 3.5f, 2.0f })
+        {
+            Pen pen(Color(26, 255, 255, 255), spread * scale);
+            pen.SetLineJoin(LineJoinRound);
+            g.DrawPath(&pen, &path);
+        }
+        SolidBrush fill(Color(255, 255, 255, 255));
+        g.FillPath(&fill, &path);
+    }
+    BitmapData data;
+    Rect all(0, 0, width, height);
+    if (bitmap.LockBits(&all, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return false;
+    for (int y = 0; y < height; y++)
+    {
+        const uint8_t* source = static_cast<const uint8_t*>(data.Scan0) + size_t(y) * data.Stride;
+        for (int x = 0; x < width; x++) mask[size_t(y) * width + x] = source[x * 4 + 1];
     }
     bitmap.UnlockBits(&data);
     return true;

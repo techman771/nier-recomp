@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <algorithm>
+#include <atomic>
 #include <mutex>
+#include <vector>
 #include <string>
 #include "guest.h"
 #include "renderer.h"
@@ -156,8 +159,171 @@ namespace
     }
 }
 
+int GlyphSetInUse() { return int(CurrentSet()); }
+
+std::string StartPromptWording(bool capital)
+{
+    const char* button = capital ? " Button" : " button";
+    switch (CurrentSet())
+    {
+    case XboxSeries: case Steam: return std::string("Press the MENU") + button;
+    case Ps4: case Ps5: return std::string("Press the OPTIONS") + button;
+    case Keyboard:
+    {
+        const int key = InputGetKey(8);   // the Pause Menu (Start) binding
+        if (key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2) return "Press " + InputKeyName(key);
+        return "Press the " + InputKeyName(key) + (capital ? " Key" : " key");
+    }
+    default: return {};
+    }
+}
+
+// The title screen's "Press the START Button" is two images of the title layout, both DXT3 with one
+// colour and the shape in the alpha: the letters (255x14) and their glow (265x26), centred on the
+// same point. Both are replaced by "Press the (Start icon of the icon set in use) Button", drawn at
+// twice the size: the letters image gets the letters (in the image's own colour and peak opacity),
+// the glow image the letters with their glow and the icon (too tall for the letters image). The
+// game's fade and pulse still apply.
+constexpr uint32_t kPromptIconHeight = 48, kPromptIconWidth = 110;   // most the icon may take, in the doubled image
+
+// The 256x384 RGBA atlas of an icon set (as Build uses them).
+static bool LoadSetAtlas(Set set, std::vector<uint8_t>& rgba)
+{
+    const uint32_t width = kAtlasWidth * kScale, height = kAtlasHeight * kScale;
+    rgba.assign(size_t(width) * height * 4, 0);
+    if (set == Keyboard) return DrawKeyboardAtlas(rgba.data(), width, height);
+    char exe[MAX_PATH];
+    GetModuleFileNameA(nullptr, exe, sizeof(exe));
+    std::string path = exe;
+    path = path.substr(0, path.find_last_of("\\/") + 1) + "glyphs\\" + kSetFiles[set] + ".rgba";
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file) return false;
+    uint32_t header[3] = {};
+    const bool ok = fread(header, 4, 3, file) == 3 && memcmp(header, "NGLY", 4) == 0 && header[1] == width && header[2] == height &&
+        fread(rgba.data(), 1, rgba.size(), file) == rgba.size();
+    fclose(file);
+    return ok;
+}
+constexpr uint32_t kPromptFormat = 19, kPromptWidth = 265, kPromptHeight = 26, kPromptTextWidth = 255, kPromptTextHeight = 14;
+
+static std::shared_ptr<DecodedTexture> TitlePromptFor(const std::shared_ptr<DecodedTexture>& original, bool letters)
+{
+    if (original->format != GuestTextureFormat::BC2 || original->subresources.empty()) return original;
+    const Set set = CurrentSet();
+    if (set == Original) return original;   // the game's own icons: its own wording
+    const std::string text = set == Keyboard ? "Press the * Key" : "Press the * Button";   // * is the icon
+    const uint64_t variant = uint64_t(set + 1) * 0x9E3779B97F4A7C15ull ^ (set == Keyboard ? KeyBindingsStamp() : 0);
+    struct Prompt { uint64_t sourceHash = 0, variant = 0; std::shared_ptr<DecodedTexture> texture; };
+    static std::mutex mutex;
+    static std::map<uint64_t, Prompt> prompts;
+    std::lock_guard lock(mutex);
+    Prompt& prompt = prompts[original->key];
+    if (prompt.texture && prompt.sourceHash == original->contentHash && prompt.variant == variant) return prompt.texture;
+
+    // The image's colour (alpha-weighted mean) and its strongest alpha.
+    const DecodedTexture::Subresource& sub = original->subresources[0];
+    uint64_t sum[3] = {}, weight = 0;
+    uint32_t peak = 0;
+    for (uint32_t by = 0; by < sub.rows; by++)
+        for (uint32_t bx = 0; bx < sub.rowPitch / 16; bx++)
+        {
+            const uint8_t* block = original->data.data() + sub.offset + size_t(by) * sub.rowPitch + size_t(bx) * 16;
+            const uint16_t c0 = uint16_t(block[8] | block[9] << 8), c1 = uint16_t(block[10] | block[11] << 8);
+            uint32_t colors[4][3];
+            auto expand = [](uint16_t c, uint32_t* rgb) { rgb[0] = ((c >> 11) & 31) * 255 / 31; rgb[1] = ((c >> 5) & 63) * 255 / 63; rgb[2] = (c & 31) * 255 / 31; };
+            expand(c0, colors[0]); expand(c1, colors[1]);
+            for (int k = 0; k < 3; k++) { colors[2][k] = (2 * colors[0][k] + colors[1][k]) / 3; colors[3][k] = (colors[0][k] + 2 * colors[1][k]) / 3; }
+            const uint32_t bits = uint32_t(block[12]) | block[13] << 8 | block[14] << 16 | uint32_t(block[15]) << 24;
+            for (int i = 0; i < 16; i++)
+            {
+                const uint32_t alpha = ((block[i / 2] >> ((i & 1) * 4)) & 15) * 17;
+                const uint32_t* color = colors[(bits >> (2 * i)) & 3];
+                for (int k = 0; k < 3; k++) sum[k] += uint64_t(color[k]) * alpha;
+                weight += alpha;
+                peak = alpha > peak ? alpha : peak;
+            }
+        }
+    if (!weight) return original;
+
+    const uint32_t width = original->width * 2, height = original->height * 2;   // block-padded, like the original
+    std::vector<uint8_t> mask(size_t(kPromptWidth * 2) * (kPromptHeight * 2));
+    // The Start icon (column 1, row 3 of the atlas): the part of its cell that is drawn on, scaled
+    // to fill the prompt's height (a wide, low icon: its width).
+    const uint32_t cell = kCell * kScale, atlasWidth = kAtlasWidth * kScale;
+    std::vector<uint8_t> atlas;
+    if (!LoadSetAtlas(set, atlas)) return original;
+    uint32_t x0 = cell, y0 = cell, x1 = 0, y1 = 0;
+    for (uint32_t y = 0; y < cell; y++)
+        for (uint32_t x = 0; x < cell; x++)
+            if (atlas[(size_t(3 * cell + y) * atlasWidth + cell + x) * 4 + 3] > 24)
+            {
+                x0 = x < x0 ? x : x0; y0 = y < y0 ? y : y0;
+                x1 = x > x1 ? x : x1; y1 = y > y1 ? y : y1;
+            }
+    if (x1 < x0) return original;
+    const float sourceWidth = float(x1 - x0 + 1), sourceHeight = float(y1 - y0 + 1);
+    const float zoom = (std::min)(float(kPromptIconHeight) / sourceHeight, float(kPromptIconWidth) / sourceWidth);
+    const uint32_t iconWidth = uint32_t(sourceWidth * zoom + 0.5f), iconHeight = uint32_t(sourceHeight * zoom + 0.5f);
+    float iconLeft = 0;
+    if (!DrawPromptMask(text, mask.data(), int(kPromptWidth * 2), int(kPromptHeight * 2), 2.0f, !letters, float(iconWidth), &iconLeft)) return original;
+    // The letters image is the middle of the glow image's box.
+    const uint32_t boxWidth = (letters ? kPromptTextWidth : kPromptWidth) * 2, boxHeight = (letters ? kPromptTextHeight : kPromptHeight) * 2;
+    const uint32_t offsetX = (kPromptWidth * 2 - boxWidth) / 2, offsetY = (kPromptHeight * 2 - boxHeight) / 2;
+    auto texture = std::make_shared<DecodedTexture>();
+    texture->data.assign(size_t(width) * height * 4, 0);
+    for (uint32_t y = 0; y < boxHeight && y < height; y++)
+        for (uint32_t x = 0; x < boxWidth && x < width; x++)
+        {
+            uint8_t* texel = &texture->data[(size_t(y) * width + x) * 4];
+            for (int k = 0; k < 3; k++) texel[k] = uint8_t(sum[k] / weight);
+            texel[3] = uint8_t(mask[size_t(y + offsetY) * kPromptWidth * 2 + x + offsetX] * peak / 255);
+        }
+    if (!letters)
+    {
+        // The icon laid over the glow.
+        const uint32_t left = uint32_t(iconLeft + 0.5f), top = (kPromptHeight * 2 - iconHeight) / 2;
+        for (uint32_t y = 0; y < iconHeight; y++)
+            for (uint32_t x = 0; x < iconWidth && left + x < width; x++)
+            {
+                // Bilinear sample of the cell.
+                const float sx = x0 + (x + 0.5f) / zoom - 0.5f, sy = y0 + (y + 0.5f) / zoom - 0.5f;
+                const int ix = (std::min)(int(sx < 0 ? 0 : sx), int(cell) - 1), iy = (std::min)(int(sy < 0 ? 0 : sy), int(cell) - 1);
+                const int jx = (std::min)(ix + 1, int(cell) - 1), jy = (std::min)(iy + 1, int(cell) - 1);
+                const float fx = sx < 0 ? 0 : sx - ix, fy = sy < 0 ? 0 : sy - iy;
+                float sample[4] = {};
+                const int corners[4][2] = { { ix, iy }, { jx, iy }, { ix, jy }, { jx, jy } };
+                const float weights[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
+                for (int c = 0; c < 4; c++)
+                {
+                    const uint8_t* source = &atlas[(size_t(3 * cell + corners[c][1]) * atlasWidth + cell + corners[c][0]) * 4];
+                    const float alpha = source[3] / 255.0f * weights[c];
+                    for (int k = 0; k < 3; k++) sample[k] += source[k] * alpha;   // premultiplied
+                    sample[3] += alpha;
+                }
+                if (sample[3] <= 0.004f) continue;
+                uint8_t* texel = &texture->data[(size_t(top + y) * width + left + x) * 4];
+                const float under = texel[3] / 255.0f * (1 - sample[3]), alpha = sample[3] + under;
+                for (int k = 0; k < 3; k++) texel[k] = uint8_t((sample[k] + texel[k] * under) / alpha + 0.5f);
+                texel[3] = uint8_t((std::min)(alpha, 1.0f) * 255.0f + 0.5f);
+            }
+    }
+    const uint64_t textHash = variant;
+    texture->key = original->key ^ 0x7469746C65707274ull ^ uint64_t(letters);
+    texture->contentHash = original->contentHash ^ textHash;
+    texture->format = GuestTextureFormat::RGBA8;
+    texture->width = width;
+    texture->height = height;
+    texture->rowPitch = width * 4;
+    texture->subresources.push_back({ 0, width * 4, height });
+    if (!letters) Log("[glyphs] title prompt with the %s Start icon (colour %u %u %u, alpha %u)\n", kSetFiles[set], unsigned(sum[0] / weight), unsigned(sum[1] / weight), unsigned(sum[2] / weight), peak);
+    prompt = { original->contentHash, variant, texture };
+    return texture;
+}
+
 std::shared_ptr<DecodedTexture> GlyphAtlasFor(const std::shared_ptr<DecodedTexture>& original, uint32_t guestFormat, uint32_t width, uint32_t height)
 {
+    if (original && guestFormat == kPromptFormat && width == kPromptWidth && height == kPromptHeight) return TitlePromptFor(original, false);
+    if (original && guestFormat == kPromptFormat && width == kPromptTextWidth && height == kPromptTextHeight) return TitlePromptFor(original, true);
     if (guestFormat != 20 || width != kAtlasWidth || height != kAtlasHeight || !original) return original;
     const Set set = CurrentSet();
     if (set == Original) return original;
