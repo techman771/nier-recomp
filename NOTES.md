@@ -711,7 +711,7 @@ From the user's playthrough (open unless marked):
   sub_8257AB38 (looks like a spin wait in the D3D library; not examined). Next: cut the command
   thread's work (memoise small texture hashes per frame, a bulk path for plain triangle lists,
   share vertex data between a mesh's passes) and see what makes the late frames heavier.
-- FIXED in replays of the user's recording (not yet seen in play): the Aerie boss's red orbs
+- FIXED (confirmed by the user in play): the Aerie boss's red orbs
   showed their whole quad as a square. Not the resolution work (it shows at 1x with the 2D pass
   off): the renderer had no alpha test. The orbs are 19 quads drawn with the 2D shader (vs
   E51E77673993E73F, ps A87A2B7182F92D9D, an RGBA8 2048x128 sprite strip, blend 000E0706: colour
@@ -738,6 +738,24 @@ From the user's playthrough (open unless marked):
   edges lose their stair steps and the mean brightness is unchanged (103.1 before and after).
   Awaiting the user's check. Fine texture detail still shows through weakly blurred areas; that
   is the sharp picture in the blend, not the blur.
+- FIXED (confirmed by the user in play): the sphere
+  around Kaine was a solid bright disc; in the original (the user's screen recording) it is a
+  glowing red rim with a see-through centre. Cause: no generated pixel parameter. With
+  SQ_PROGRAM_CNTL (0x2180) bit 18 set, the console replaces the interpolator numbered in
+  SQ_CONTEXT_MISC (0x2181) bits 8-15 with the pixel's position (xy, whole pixels) and the sign
+  bit of x set on a back face. The game's two-sided materials read it as `1 / x >= 0` and flip
+  the normal for back faces; the sphere's layers (ps 977F5D4A37D9C39A, 4EEE96B916E520A0, the
+  dark shell DCFB0D9513F263B2; no culling, additive) then light only the rim (fresnel to the
+  fourth power). Without it every face counted as a front face and the far half of the sphere
+  glowed at full strength. Now `RendererDraw::paramGen`, `paramGen` / `systemExtra.x` in the
+  System constants, an SV_IsFrontFace input and a prologue in every pixel shader
+  (xenos_shader.cpp). Seen live: interpolator 4 (B6D8EB27C0AE69CC), 5 (D461B8752A20D67B, the
+  character material: its two-sided parts were lit as front faces too), 6 (46155F8651382D13).
+  The point-sprite part of the parameter (zw) is zero. Captures: NFRM version 4 / NSEQ
+  version 3; `replay_frame.ps1 -ParamGen '<interpolator>,<ps hash>[,...]'` for older ones.
+  To look at a video reference without ffmpeg: copy it beside a one-line HTML page, serve the
+  folder with `python -m http.server`, open it in the built-in browser, load the file into a
+  blob (the plain server can't seek), set `currentTime` and take screenshots.
 - DLC notice on Continue ("The quest "Recycled World" is now available." and where to find it:
   info-window messages 2481 / 2482, two pages to confirm on every load) is skipped: sub_8219B0D0
   shows it through sub_823C5140 while a flag at its object +0x20C00 is set, then clears the flag;

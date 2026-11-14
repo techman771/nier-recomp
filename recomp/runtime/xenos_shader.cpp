@@ -12,12 +12,13 @@ cbuffer Constants : register(b0) { float4 c[512]; };
 cbuffer System : register(b1)
 {
     float2 ndcScale; float2 ndcOffset;
-    uint bypassViewport; uint alphaFunc; float alphaRef; uint systemPadding;
+    uint bypassViewport; uint alphaFunc; float alphaRef; uint paramGen;
     uint4 vbBase[24];
     uint4 samplerIndex[8];   // per texture slot: filter * 25 + address U * 5 + address V
     float4 texScale[32];
     uint4 boolConstants[2];
     uint4 texSign[8];
+    float4 systemExtra;   // x: guest pixels for each host pixel (1 / resolution scale)
 };
 ByteAddressBuffer vb : register(t16);
 SamplerState samplers[50] : register(s0);
@@ -579,7 +580,7 @@ float3 CubeDirection(float3 c)
             for (uint32_t slot : result.textureSlots)
                 hlsl += std::string(result.cubeSlots.count(slot) ? "TextureCube" : "Texture2D") + Format("<float4> t%d : register(t%d, space1);\n", int(slot), int(slot));
             if (pixel && exportsDepth) hlsl += "struct PixelOutput { float4 color : SV_Target0; float depth : SV_Depth; };\n";
-            hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input)" + (exportsDepth ? "" : " : SV_Target0") +
+            hlsl += pixel ? std::string(exportsDepth ? "PixelOutput" : "float4") + " main(Interpolated input, bool frontFace_ : SV_IsFrontFace)" + (exportsDepth ? "" : " : SV_Target0") +
                                 "\n{\n    float4 oC[4] = { (float4)0, (float4)0, (float4)0, (float4)0 }; float4 oDepth = (float4)0;\n"
                           : "Interpolated main(uint vertexId : SV_VertexID)\n{\n    float4 oPos = float4(0, 0, 0, 1); float4 oPointSize = (float4)0;\n    float4 oT[16];\n    for (int i_ = 0; i_ < 16; i_++) oT[i_] = (float4)0;\n";
             // Registers are written as r[N] while translating and become separate variables (rN) at the
@@ -589,6 +590,17 @@ float3 CubeDirection(float3 c)
                 hlsl += Format(pixel && i < 16 ? "    float4 r%d = input.t[%d];\n" : "    float4 r%d = (float4)0;\n", i, i);
             hlsl += "    float4 pv = (float4)0; float ps = 0.0; bool p0 = false; int a0 = 0; float lod_ = 0.0;\n";
             if (!pixel) hlsl += "    r[0].x = float(vertexId);\n";
+            if (pixel)
+            {
+                // The generated parameter: the console can hand the pixel shader, in an interpolator of
+                // its choice, the pixel's position (xy, whole pixels) with the sign bit of x set on a
+                // back face. The game's two-sided materials read it as 1 / x >= 0 to flip the normal.
+                hlsl += "    if (paramGen < 16u)\n    {\n        float4 g_ = float4(floor(input.position.xy * systemExtra.x), 0.0, 0.0);\n"
+                        "        if (!frontFace_) g_.x = asfloat(asuint(g_.x) | 0x80000000u);\n";
+                for (int i = 0; i < maxRegister && i < 16; i++)
+                    hlsl += std::string(i ? "        else " : "        ") + Format("if (paramGen == %du) r[%d] = g_;\n", i, i);
+                hlsl += "    }\n";
+            }
             hlsl += body;
             if (pixel)
             {
@@ -650,7 +662,7 @@ float3 CubeDirection(float3 c)
                     if (at != std::string::npos) hlsl.replace(at, find.size(), replace);
                     return at != std::string::npos;
                 };
-                const std::string mainStart = "float4 main(Interpolated input)";
+                const std::string mainStart = "float4 main(Interpolated input, bool frontFace_ : SV_IsFrontFace)";
                 if (!original && pixel && result.hash == 0xC42C4BC07882DC33ull)
                 {
                     if (replaceOnce("t0.Sample(samplers[samplerIndex[0][0]], r[0].xy * texScale[0].xy)", "BoxSample_(t0, r[0].xy * texScale[0].xy)"))

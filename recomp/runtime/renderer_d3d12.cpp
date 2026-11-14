@@ -316,12 +316,13 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
         float ndcScale[2], ndcOffset[2];
         uint32_t bypassViewport, alphaFunc;
         float alphaRef;
-        uint32_t padding;
+        uint32_t paramGen;
         uint32_t vertexBase[96];
         uint32_t samplerPoint[32];   // per slot: sampler index (shader name samplerIndex)
         float texScale[32][4];
         uint32_t boolConstants[8];
         uint32_t texSign[32];
+        float extra[4];   // x: guest pixels for each host pixel
     };
     struct ArenaBlock { uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu; UINT64 offset; };
 
@@ -1154,6 +1155,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         s->bypassViewport = draw.bypassViewport ? 1 : 0;
         s->alphaFunc = draw.alphaFunc;
         s->alphaRef = draw.alphaRef;
+        s->paramGen = draw.paramGen;
+        s->extra[0] = 12.0f / float(gActiveTwelfths);
         memcpy(s->vertexBase, draw.vertexBase.data(), sizeof(s->vertexBase));
         memcpy(s->boolConstants, draw.boolConstants.data(), sizeof(s->boolConstants));
 

@@ -11,11 +11,11 @@
 # in replay.log and its picture saved as a PNG.
 param([Parameter(Mandatory)][string]$Capture, [string]$Out = '', [int]$Frames = 40, [string]$Zoom = '', [string]$Skip = '',
       [int]$Stop = -1, [string]$PsDebug = '', [string]$Patch = '', [switch]$KeepHlsl, [switch]$Show, [string]$Monitor = 'secondary',
-      [string]$Cull = '', [int]$Every = 6, [string]$Surface = '', [int]$Only = 0, [string]$Alpha = '', [string]$Blend = '')
+      [string]$Cull = '', [int]$Every = 6, [string]$Surface = '', [int]$Only = 0, [string]$Alpha = '', [string]$Blend = '', [string]$ParamGen = '')
 $root = Split-Path $PSScriptRoot -Parent
 if (-not (Test-Path $Capture)) { $Capture = Join-Path $root "recomp\captures\$Capture" }
 $Capture = (Resolve-Path $Capture).Path
-$names = 'NIER_REPLAY_ALPHA', 'NIER_REPLAY_BLEND', 'NIER_REPLAY_ONLY', 'NIER_REPLAY_LIST', 'NIER_REPLAY_FRAME', 'NIER_REPLAY_FRAMES', 'NIER_REPLAY_ONCE', 'NIER_REPLAY_ZOOM', 'NIER_REPLAY_SKIP', 'NIER_REPLAY_STOP', 'NIER_REPLAY_KEEP_HLSL',
+$names = 'NIER_REPLAY_PARAMGEN', 'NIER_REPLAY_ALPHA', 'NIER_REPLAY_BLEND', 'NIER_REPLAY_ONLY', 'NIER_REPLAY_LIST', 'NIER_REPLAY_FRAME', 'NIER_REPLAY_FRAMES', 'NIER_REPLAY_ONCE', 'NIER_REPLAY_ZOOM', 'NIER_REPLAY_SKIP', 'NIER_REPLAY_STOP', 'NIER_REPLAY_KEEP_HLSL',
          'NIER_REPLAY_CULL', 'NIER_SHOW_SURFACE', 'NIER_PS_DEBUG', 'NIER_SHADER_PATCH', 'NIER_SAVE_FRAMES', 'NIER_AUTO_PRESS', 'NIER_REPLAY_INPUT', 'NIER_RECORD_INPUT'
 foreach ($n in $names) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 $env:NIER_REPLAY_FRAME = $Capture
@@ -45,6 +45,7 @@ if ($KeepHlsl) { $env:NIER_REPLAY_KEEP_HLSL = '1' }
 if ($Cull) { $env:NIER_REPLAY_CULL = $Cull }
 if ($Surface) { $env:NIER_SHOW_SURFACE = $Surface }
 if ($Alpha) { $env:NIER_REPLAY_ALPHA = $Alpha }   # '<pixel shader hash>,<function 0-7>,<reference>': force an alpha test
+if ($ParamGen) { $env:NIER_REPLAY_PARAMGEN = $ParamGen }   # '<interpolator>,<pixel shader hash>[,...]': force the generated pixel parameter
 if ($Blend) { $env:NIER_REPLAY_BLEND = $Blend }   # 'r,g,b,a': force the blend constant
 if ($PsDebug) { $env:NIER_PS_DEBUG = $PsDebug }
 if ($Patch) { $env:NIER_SHADER_PATCH = $Patch }

@@ -965,6 +965,12 @@ namespace
         memcpy(draw.blendConstant, &r[0x2105], sizeof(draw.blendConstant));   // RB_BLEND_RED, GREEN, BLUE, ALPHA (floats)
         draw.alphaFunc = (r[0x2202] & 8) ? uint8_t(r[0x2202] & 7) : 7;        // RB_COLORCONTROL: function in bits 0-2, enable in bit 3
         memcpy(&draw.alphaRef, &r[0x210E], 4);                                // RB_ALPHA_REF (float)
+        draw.paramGen = (r[0x2180] >> 18) & 1 ? uint8_t((r[0x2181] >> 8) & 0xFF) : 255;   // SQ_PROGRAM_CNTL bit 18, SQ_CONTEXT_MISC bits 8-15
+        {
+            static std::set<uint32_t> seenGen;   // which interpolators the game uses for it (debugging)
+            if (draw.paramGen != 255 && seenGen.size() < 8 && seenGen.insert(draw.paramGen).second)
+                Log("[gpu] generated pixel parameter in interpolator %u (first with pixel shader %016llX)\n", draw.paramGen, ps->shader->hash);
+        }
         {
             static std::set<uint32_t> seen;   // which alpha tests the game uses (debugging)
             if (draw.alphaFunc != 7 && seen.size() < 8 && seen.insert(uint32_t(draw.alphaFunc) << 24 ^ r[0x210E]).second)

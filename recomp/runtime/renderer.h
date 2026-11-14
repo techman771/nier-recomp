@@ -76,6 +76,10 @@ struct RendererDraw
     // equal, 6 greater or equal, 7 always (also when the test is off).
     uint8_t alphaFunc = 7;
     float alphaRef = 0.0f;
+    // Generated pixel shader parameter (SQ_PROGRAM_CNTL param_gen, SQ_CONTEXT_MISC param_gen_pos): the
+    // interpolator the pixel shader receives the pixel position and facing in, in place of what the
+    // vertex shader wrote there; 255 for none.
+    uint8_t paramGen = 255;
     bool rectList = false;
     // Face culling (PA_SU_SC_MODE_CNTL): 0 none, 1 front faces, 2 back faces; which winding is the
     // front. Double-sided cloth, fur and hair are modelled as two coincident layers with opposite
