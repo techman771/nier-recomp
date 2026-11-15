@@ -338,6 +338,57 @@ speed. Measured with the sampling profiler (`NIER_PROFILE`), 20 s of the first f
   index are copied (fetch constants often cover a whole level's geometry): 30 fps.
 The command thread is now about 60% busy; the game's main thread is always busy.
 `NIER_HASH_EVERY_USE=1` and `NIER_NO_VERTEX_TRIM=1` turn the two shortcuts off for comparison.
+Frame Rate above 60 (setting `frame_rate_60`: 0 30 fps cap, 1 60, 2 Uncapped, experimental). The
+user tried 120, 240 and Unlocked in a playtest and asked for 120 and 240 to be dropped; fixed rates
+above 60 now exist only through NIER_GUEST_HZ. What follows describes all of them, except that
+Uncapped no longer follows the display's refreshes with VSync on: the user found that it behaved
+like double-buffered vsync (a late frame cost a whole refresh), where a G-Sync display shows a late
+frame when it is ready. Uncapped now always raises the vblank when a flip is queued, no sooner after the last than one
+display refresh with VSync on (a limiter; presenting alone didn't hold it: a menu ran at 665 fps on
+a 120 Hz display, with half the frames dropped) or 1 ms with it off. What paces the game is its vblank, which the runtime raises itself
+(`VblankThread`); `GuestRefreshHz()` gives its rate (NIER_GUEST_HZ=<rate>, or -1 for unlocked, for
+tests). 120 and 240 simply raise it; where the display's rate is a multiple, the vblank follows the
+display's refreshes as at 60 and each frame is held for that many. Unlocked: with VSync on, a vblank
+for every refresh of whatever display the window is on (so 144 or 165 Hz displays get their own
+rate); with VSync off, a vblank as soon as the game queues a flip (`gVblankKick`), at least 1 ms
+apart (left free, a menu ran at 2,700 frames a second). The video mode still reports 60 Hz to the
+game. Speed check (Game 1's opening camera cuts, 60 against 120 Hz with the scripted presses' frame
+numbers doubled): the shots pass at the same real-time pace, so the game is timed by the clock, not
+by frames. At The Aerie the game doesn't reach 120: 97 fps in the opening shots, about 70 in the
+ones after, every frame still one vblank long; the vblank thread itself only gets that many through
+(the interrupt it delivers appears to wait for the frame's work), with the command thread at about
+8.7 ms a frame. Not tried: 240, Unlocked without VSync, the menu row, anything but that scene, and
+whether physics or scripted events misbehave at high rates.
+
+Frame rate counter (PC Settings > Frame Rate Counter, `show_fps`; NIER_SHOW_FPS=1 forces it on):
+`DrawFpsCounter` counts the game frames presented and twice a second redraws "NN fps" on a dark
+plate (`DrawSmallLabel` in osk.cpp, GDI+), shown in the top left corner of the picture through the
+overlay pipeline. Checked in a test run ("60 fps"); the menu row hasn't been looked at.
+
+Dark picture at 1600x900 (user's capture seq_f32624: dark while at 900p, normal after switching
+to 720p; the darkness is in the recorded constants, i.e. the game's own exposure). Reproduced with
+no upscaler: mean picture brightness 37 at scale 1.25 against 84 at 1. The game reads the end of
+its luminance reduction back (512x512 ... 32x2) to set the exposure; at a fractional scale the
+smallest surfaces have a fractional viewport (32x2 -> 40x3 with 2.5 rows drawn), part of the last
+row is never written and the average is too low. `DataPasses` now finds every colour copy that
+doesn't have the screen's shape (and isn't the picture) with the commands leading to it, and those
+passes run at `DataTwelfths()`, the whole multiple of the game's size at or below the render scale
+(4K, 3x, is unchanged; 900p and 1080p use 1x). The chain has to go together: its surfaces are
+levels of one texture (running only the surfaces of 64 pixels and less at 1x blew the exposure out
+at 1.5x and 3x). Brightness at frame 3000 of Game 3 now: 83.7, 83.6, 83.8, 83.9, 83.8, 83.3, 83.7
+at 0.5, 0.667, 1, 1.25, 1.5, 2.5 and 3x. Awaiting the user's check. The blur buffers depth of
+field and bloom use are part of that chain, so at fractional scales they are now the game's size.
+
+Variable refresh rate (G-Sync / FreeSync): nothing to add for it to engage. It needs a flip-model
+swap chain presenting with sync interval 0 and DXGI_PRESENT_ALLOW_TEARING in a window covering the
+display, which is what VSync Off already does (FLIP_DISCARD, the tearing flag when DXGI supports
+it), and with VSync off the game's vblank runs from its own timer (or follows each flip, in
+Unlocked) instead of the display's refreshes. So: VSync Off + Borderless + a Frame Rate at or
+below the display's maximum. Whether it engages can't be read back from DXGI; the display's own
+refresh readout shows it. Possible refinement: in Unlocked without VSync, hold the rate a few
+frames under the display's maximum so it stays inside the variable range instead of tearing above
+it.
+
 60 fps: the original runs 3D scenes at 30 fps (menus at 60). D3D queues each flip from the swap
 interrupt (`sub_8257A4B0`, reached only through the indirect call table); its swap word carries the
 present interval in bits 8-11 (2 in 3D scenes, 3 somewhere at boot), the flip waits that many vblanks

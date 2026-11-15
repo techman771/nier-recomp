@@ -1680,6 +1680,10 @@ namespace
         }
     }
 
+    // Uncapped frame rate: there is no fixed vblank; one is raised as soon as the game queues a flip
+    // (QueueFlipEveryVblank sets this), and at least 60 a second otherwise.
+    HANDLE gVblankKick = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
     void VblankThread()
     {
         PPCContext ctx;
@@ -1689,9 +1693,33 @@ namespace
         QueryPerformanceCounter(&next);
         // 60 Hz exactly, as the console's HD video modes are (not NTSC's 59.94): on a PC display the
         // game then keeps step with the refresh instead of falling a frame behind every 17 seconds.
-        const int64_t period = frequency.QuadPart / 60;
         while (true)
         {
+            const int rate = GuestRefreshHz();   // 60 Hz, or the Frame Rate setting's; 0 unlocked
+            if (rate == 0)
+            {
+                // Uncapped: a vblank as soon as a flip is queued, but no sooner after the last one than
+                // one refresh of the display with VSync on (a limiter at the display's rate), or a
+                // millisecond with it off (menus would run at thousands of frames a second). Nothing
+                // here waits for the display's own refreshes: that made every late frame cost a whole
+                // refresh (240, 120, 80...), where a variable refresh display shows it when it is ready.
+                const int64_t gap = Settings().vsync ? frequency.QuadPart / std::max<int64_t>(RendererDisplayHz(), 30) : frequency.QuadPart / 1000;
+                const int64_t earliest = next.QuadPart + gap;   // `next` holds the last vblank's time here
+                for (LARGE_INTEGER now;;)
+                {
+                    QueryPerformanceCounter(&now);
+                    if (now.QuadPart >= earliest) break;
+                    if (earliest - now.QuadPart > frequency.QuadPart * 2 / 1000) Sleep(1);
+                    else SwitchToThread();
+                }
+                WaitForSingleObject(gVblankKick, 16);
+                QueryPerformanceCounter(&next);
+                W32(MMIO_BASE + REG_VBLANK_STATUS * 4, 1);
+                gVblanks++;
+                DispatchInterrupt(ctx, pcr, 0, 2);
+                continue;
+            }
+            const int64_t period = frequency.QuadPart / rate;
             // Sleep until about 2 ms before the vblank, then yield until it: Sleep(1) alone made
             // vblanks up to a millisecond late, and late vblanks delay 60 fps flips.
             next.QuadPart += period;
@@ -1712,7 +1740,9 @@ namespace
 
     void WriteVideoMode(uint32_t mode)
     {
-        float refresh = 60.0f;
+        // NIER_VIDEO_HZ=<rate> reports another refresh rate to the game (testing how it times itself).
+        static const float forcedRefresh = [] { char v[16]; return GetEnvironmentVariableA("NIER_VIDEO_HZ", v, sizeof(v)) ? float(atof(v)) : 0.0f; }();
+        float refresh = forcedRefresh > 0.0f ? forcedRefresh : 60.0f;
         uint32_t refreshBits;
         memcpy(&refreshBits, &refresh, 4);
         W32(mode + 0x00, 1280);
@@ -1755,13 +1785,15 @@ namespace
             ctx.r3.u64 = (word & ~0xF00u) | 0x100u;
         }
         __imp__sub_8257A4B0(ctx, base);
+        if (GuestRefreshHz() == 0) SetEvent(gVblankKick);   // unlocked: the flip's vblank comes at once
     }
 }
 
 void GpuInstallHooks()
 {
     PPC_LOOKUP_FUNC(g_base, 0x8257A4B0) = QueueFlipEveryVblank;   // checks the Frame Rate setting on every flip
-    Log("[gpu] frame rate: %s\n", Settings().frameRate60 ? "60 fps" : "30 fps cap");
+    static const char* const kNames[] = { "30 fps cap", "60 fps", "uncapped" };
+    Log("[gpu] frame rate: %s\n", kNames[std::clamp(Settings().frameRate60.load(), 0, 2)]);
 }
 
 void GpuDumpStats()

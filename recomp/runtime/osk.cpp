@@ -213,6 +213,41 @@ namespace
     }
 }
 
+bool DrawSmallLabel(const std::string& text, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
+{
+    if (!StartGdiplus()) return false;
+    width = 240;
+    height = 64;
+    Bitmap bitmap(INT(width), INT(height), PixelFormat32bppARGB);
+    {
+        Graphics g(&bitmap);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+        g.Clear(Color(0, 0, 0, 0));
+        SolidBrush plate(Color(150, 0, 0, 0)), ink(Color(255, 240, 240, 235));
+        g.FillRectangle(&plate, 0, 0, INT(width), INT(height));
+        FontFamily family(L"Consolas");
+        Font font(&family, 44, FontStyleBold, UnitPixel);
+        StringFormat centred;
+        centred.SetAlignment(StringAlignmentCenter);
+        centred.SetLineAlignment(StringAlignmentCenter);
+        const std::wstring wide(text.begin(), text.end());
+        g.DrawString(wide.c_str(), -1, &font, RectF(0, 2, float(width), float(height)), &centred, &ink);
+    }
+    BitmapData data;
+    Rect all(0, 0, INT(width), INT(height));
+    rgba.resize(size_t(width) * height * 4);
+    if (bitmap.LockBits(&all, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return false;
+    for (uint32_t y = 0; y < height; y++)
+    {
+        const uint8_t* source = static_cast<const uint8_t*>(data.Scan0) + size_t(y) * data.Stride;
+        uint8_t* out = rgba.data() + size_t(y) * width * 4;
+        for (uint32_t x = 0; x < width; x++) { out[x * 4] = source[x * 4 + 2]; out[x * 4 + 1] = source[x * 4 + 1]; out[x * 4 + 2] = source[x * 4]; out[x * 4 + 3] = source[x * 4 + 3]; }
+    }
+    bitmap.UnlockBits(&data);
+    return true;
+}
+
 bool OskActive() { return gActive.load(); }
 
 void OskChar(wchar_t c)

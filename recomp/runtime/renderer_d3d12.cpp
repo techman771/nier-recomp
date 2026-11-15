@@ -116,6 +116,7 @@ float4 PSMain(Interpolated input) : SV_Target
     std::atomic<uint64_t> gRequestedSave{ 0 };   // from other threads; picked up by the render thread
     std::atomic<uint64_t> gSubmitted{ 0 }, gPresented{ 0 }, gMovieImages{ 0 }, gLateImages{ 0 };
     uint64_t gGapBins[8];
+    std::atomic<UINT> gDisplayHz{ 60 };   // the refresh rate of the display the window is on
     std::atomic<UINT> gVblankDivider{ 0 };   // display refreshes in a 60 Hz period when the display's rate is a multiple of 60 (and vsync is on); else 0
     uint64_t gLastHash = 0;
     LARGE_INTEGER gLastImage{};
@@ -1622,6 +1623,38 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return passes;
     }
 
+    // Passes that make data surfaces, as [first command, last command] ranges: a colour copy that
+    // doesn't have the screen's shape (the blur and luminance reduction chain: 512x512 down to
+    // 32x2, whose end the game reads back to set the exposure), with the commands before it back to
+    // the previous copy. They run at a whole multiple of the game's size (DataTwelfths): at a
+    // fractional scale a 32x2 surface is 40x3 at 1600x900 with a viewport 2.5 pixels high, its last
+    // row is half covered, the average the game reads is too dark and so is the whole picture.
+    // The whole chain goes together: its surfaces are levels of one texture and must agree.
+    uint32_t DataTwelfths() { return std::max(1u, gResTwelfths / 12) * 12; }
+    std::vector<std::pair<size_t, size_t>> DataPasses(const RendererFrame& frame)
+    {
+        std::vector<std::pair<size_t, size_t>> passes;
+        if (gResTwelfths == DataTwelfths()) return passes;
+        for (size_t i = 0; i < frame.commands.size(); i++)
+        {
+            const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]);
+            if (!resolve || !resolve->copyColor || !resolve->width || !resolve->height) continue;
+            if (resolve->width * 9 == resolve->height * 16 || resolve->destBase == frame.scanoutBase) continue;
+            size_t start = i;
+            while (start > 0)
+            {
+                const RendererResolve* earlier = std::get_if<RendererResolve>(&frame.commands[start - 1]);
+                if (earlier && (earlier->copyColor || earlier->copyDepth)) break;   // another pass's result
+                start--;
+            }
+            passes.emplace_back(start, i);
+            static std::set<uint64_t> logged;   // which surfaces these are (debugging)
+            if (logged.size() < 24 && logged.insert(uint64_t(resolve->destBase) << 32 | resolve->width << 16 | resolve->height).second)
+                Log("[d3d12] data pass: commands %zu-%zu -> %08X %ux%u%s\n", start, i, resolve->destBase, resolve->width, resolve->height, resolve->writeBack ? " (read back by the game)" : "");
+        }
+        return passes;
+    }
+
     // The frame's closing 2D pass. A frame ends with the copy that produces the picture shown (the
     // scanout); before it the game draws the final full-screen composite of the 3D scene and then
     // the HUD, menus and text into the same target, none of it depth-tested. That run of draws is
@@ -2596,6 +2629,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         bool flatBegun = false, drawnThisFrame = false;
         const std::vector<std::pair<size_t, size_t>> shadowPasses = ShadowPasses(frame);
         size_t shadowPass = 0;
+        const std::vector<std::pair<size_t, size_t>> dataPasses = DataPasses(frame);
+        size_t dataPass = 0;
         TemporalBeginFrame(frame, shadowPasses, flatStart);
         for (size_t index = 0; index < frame.commands.size(); index++)
         {
@@ -2611,6 +2646,17 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
                 else ExecuteResolve(std::get<RendererResolve>(command));
                 gInShadowPass = false;
+                continue;
+            }
+            while (dataPass < dataPasses.size() && index > dataPasses[dataPass].second) dataPass++;
+            if (dataPass < dataPasses.size() && index >= dataPasses[dataPass].first)
+            {
+                // A data surface: a whole multiple of the game's own size.
+                gActiveTwelfths = DataTwelfths();
+                gInFlatPass = true;   // nothing here is scene geometry (no jitter)
+                if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
+                else ExecuteResolve(std::get<RendererResolve>(command));
+                gInFlatPass = false;
                 continue;
             }
             if (auto* draw = std::get_if<RendererDraw>(&command))
@@ -2721,6 +2767,68 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         float w = float(gWidth), h = float(gHeight);
         if (w / h > 16.0f / 9.0f) w = h * 16.0f / 9.0f; else h = w * 9.0f / 16.0f;
         D3D12_VIEWPORT viewport{ (gWidth - w) * 0.5f, (gHeight - h) * 0.5f, w, h, 0.0f, 1.0f };
+        D3D12_RECT scissor{ 0, 0, LONG(gWidth), LONG(gHeight) };
+        gList->RSSetViewports(1, &viewport);
+        gList->RSSetScissorRects(1, &scissor);
+        BindDrawRoot();
+        gList->SetPipelineState(gOverlayPipeline.Get());
+        gList->SetGraphicsRootDescriptorTable(3, gpu);
+        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // Frame rate counter (PC Settings; NIER_SHOW_FPS=1 forces it on): the game frames presented a
+    // second, counted here and redrawn twice a second, in the top left corner of the picture.
+    void DrawFpsCounter()
+    {
+        static const bool forced = GetEnvironmentVariableA("NIER_SHOW_FPS", nullptr, 0) > 0;
+        static uint32_t frames = 0;
+        static LARGE_INTEGER since{};
+        static std::shared_ptr<DecodedTexture> label;
+        if (!forced && !Settings().showFps) { frames = 0; since.QuadPart = 0; label.reset(); return; }
+        LARGE_INTEGER now, frequency;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        if (!since.QuadPart) since = now;
+        frames++;
+        const double elapsed = double(now.QuadPart - since.QuadPart) / double(frequency.QuadPart);
+        if (elapsed >= 0.5)
+        {
+            char text[32];
+            snprintf(text, sizeof(text), "%.0f fps", frames / elapsed);
+            auto made = std::make_shared<DecodedTexture>();
+            if (DrawSmallLabel(text, made->data, made->width, made->height))
+            {
+                static uint64_t version = 0;
+                made->key = 0xFFFFFFFFFFFF0F5Dull;
+                made->contentHash = ++version;
+                made->rowPitch = made->width * 4;
+                made->subresources.push_back({ 0, made->width * 4, made->height });
+                label = made;
+            }
+            frames = 0;
+            since = now;
+        }
+        if (!label || gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return;
+        ID3D12Resource* texture = GetDecoded(*label);
+        if (!texture) return;
+        const UINT slot = gDrawSrvUsed;
+        gDrawSrvUsed += kTextureSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(slot) * gSrvStep;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(slot) * gSrvStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(texture, &view, cpu);
+        // Sized by the picture (the largest 16:9 area of the window), a little in from its corner.
+        float w = float(gWidth), h = float(gHeight);
+        if (w / h > 16.0f / 9.0f) w = h * 16.0f / 9.0f; else h = w * 9.0f / 16.0f;
+        const float labelHeight = h * 0.045f, labelWidth = labelHeight * float(label->width) / float(label->height), margin = h * 0.015f;
+        D3D12_VIEWPORT viewport{ (gWidth - w) * 0.5f + margin, (gHeight - h) * 0.5f + margin, labelWidth, labelHeight, 0.0f, 1.0f };
         D3D12_RECT scissor{ 0, 0, LONG(gWidth), LONG(gHeight) };
         gList->RSSetViewports(1, &viewport);
         gList->RSSetScissorRects(1, &scissor);
@@ -3029,6 +3137,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const uint32_t shownSurface = Shown().occurrence ? kSnapshotBase : Shown().base;
         if (guest && (shownSurface || guest->scanoutBase)) BlitScanout(shownSurface && gResolved.count(shownSurface) ? shownSurface : guest->scanoutBase);
         if (guest) DrawOverlay();
+        if (guest) DrawFpsCounter();
 
         if (movie)
         {
@@ -3111,11 +3220,13 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 UINT hz = 0;
                 if (GetMonitorInfoA(MonitorFromWindow(gWindow, MONITOR_DEFAULTTONEAREST), &info) && EnumDisplaySettingsA(info.szDevice, ENUM_CURRENT_SETTINGS, &mode))
                     hz = mode.dmDisplayFrequency;
-                const UINT n = (hz + 30) / 60;
-                const UINT now = forced ? std::min<UINT>(forced, 4) : (n >= 2 && n <= 4 && hz + 1 >= n * 60 && hz <= n * 60 + 1) ? n : 1;
-                if (now != multiple || checked == 1) Log("[present] display at %u Hz: each 60 fps frame is held for %u refresh%s\n", hz, now, now == 1 ? "" : "es");
+                const UINT guestHz = UINT(GuestRefreshHz());   // the game's own frame clock: 60, or more; 0 unlocked
+                const UINT n = guestHz ? (hz + guestHz / 2) / guestHz : 0;   // unlocked: no fixed relation to the display
+                const UINT now = forced ? std::min<UINT>(forced, 4) : (n >= 2 && n <= 4 && hz + 1 >= n * guestHz && hz <= n * guestHz + 1) ? n : 1;
+                if (now != multiple || checked == 1) Log("[present] display at %u Hz, game at %u Hz: each frame is held for %u refresh%s\n", hz, guestHz, now, now == 1 ? "" : "es");
                 multiple = now;
-                gVblankDivider = (n >= 1 && n <= 4 && hz + 1 >= n * 60 && hz <= n * 60 + 1) ? n : 0;
+                gVblankDivider = (guestHz && n >= 1 && n <= 4 && hz + 1 >= n * guestHz && hz <= n * guestHz + 1) ? n : 0;   // uncapped: the vblank doesn't follow the display
+                gDisplayHz = hz;
             }
             bool waiting;
             {
@@ -3351,8 +3462,12 @@ bool RendererWaitDisplayVblank()
     QueryPerformanceCounter(&end);
     const double ms = double(end.QuadPart - begin.QuadPart) * 1000.0 / double(frequency.QuadPart);
     static bool logged = false;
-    if (!logged && ms >= 8.0 && ms <= 40.0) { logged = true; Log("[present] the game's vblank follows the display (every %u refresh%s)\n", divider, divider == 1 ? "" : "es"); }
-    return ms >= 8.0 && ms <= 40.0;   // an output that doesn't really wait returns at once
+    const double expected = 1000.0 / (GuestRefreshHz() > 0 ? GuestRefreshHz() : int(std::max<UINT>(gDisplayHz.load(), 1)));   // unlocked: the display's own period
+    // With one refresh to wait for, the wait is as short as the time left to it; only an output that
+    // returns at once (no real wait) is refused.
+    const double least = divider > 1 ? expected * 0.5 : 0.3;
+    if (!logged && ms >= least && ms <= expected * 2.5) { logged = true; Log("[present] the game's vblank follows the display (every %u refresh%s)\n", divider, divider == 1 ? "" : "es"); }
+    return ms >= least && ms <= expected * 2.5;   // an output that doesn't really wait returns at once
 }
 
 void RendererSetOverlay(const uint8_t* rgba, uint32_t width, uint32_t height)
@@ -3374,6 +3489,7 @@ void RendererSetOverlay(const uint8_t* rgba, uint32_t width, uint32_t height)
     gOverlay = overlay;
 }
 
+uint32_t RendererDisplayHz() { return gDisplayHz.load(); }
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
 bool RendererReady() { return gReady; }
 void RendererWaitTotals(double totals[3]) { totals[0] = gShaderWaitMs.load(); totals[1] = gPipelineMs.load(); totals[2] = gPipelineWaitMs.load(); }

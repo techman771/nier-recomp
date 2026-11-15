@@ -53,12 +53,13 @@ namespace
     {
         return {
             { "borderless", &gSettings.borderless, 0, 1 },
-            { "frame_rate_60", &gSettings.frameRate60, 0, 1 },
+            { "frame_rate_60", &gSettings.frameRate60, 0, 2 },
             { "vsync", &gSettings.vsync, 0, 1 },
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
             { "upscaling", &gSettings.upscaling, 0, 2 },
             { "save_page", &gSettings.savePage, 1, 10 },
+            { "show_fps", &gSettings.showFps, 0, 1 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
             { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },
@@ -82,12 +83,14 @@ namespace
         T_Resolution, T_ResolutionHelp, T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880,
         T_Shadows, T_ShadowsHelp, T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra,
         T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3,
+        T_Uncapped,
+        T_FpsCounter, T_FpsCounterHelp,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
         "PC Settings", "Adjust display, frame rate and audio settings for PC.",
         "Display Mode", "Play in a window or in borderless fullscreen\n(also Alt+Enter).",
-        "Frame Rate", "Choose 60 fps, or the original 30 fps cap.",
+        "Frame Rate", "60 fps is well tested. Uncapped is experimental: VSync\nlimits it to the display's rate, and VRR is used below that.",
         "VSync", "Synchronize frames with the display to prevent tearing.",
         "Master Volume", "Adjust the overall volume.",
         "Mute in Background", "Silence the game while its window isn't focused.",
@@ -109,6 +112,8 @@ namespace
         "Original", "High", "Very High", "Ultra",
         "Upscaling", "Choose how a resolution below the screen's is enlarged.\nFSR 3.1 rebuilds detail over several frames.",
         "Off", "FSR 1", "FSR 3.1",
+        "Uncapped",
+        "Frame Rate Counter", "Show the current frame rate in the top left corner.",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -150,8 +155,9 @@ namespace
     struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[10]; };   // types 2 and 4 name their values
     const Item kItems[] = {
         { 60, 2, &gSettings.borderless, 1, T_DisplayMode, T_DisplayModeHelp, { T_Windowed, T_Borderless } },
-        { 61, 2, &gSettings.frameRate60, 1, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps } },
+        { 61, 4, &gSettings.frameRate60, 2, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps, T_Uncapped } },
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
+        { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
         { 69, 4, &gSettings.upscaling, 2, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3 } },
         { 68, 4, &gSettings.shadowQuality, 3, T_Shadows, T_ShadowsHelp, { T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra } },
@@ -428,6 +434,14 @@ void TitleQuitToDesktop(PPCRegister& r31)
     SettingsSave();
     fflush(stdout);
     TerminateProcess(GetCurrentProcess(), 0);   // as closing the window does
+}
+
+int GuestRefreshHz()
+{
+    static const int forced = [] { char v[16]; return GetEnvironmentVariableA("NIER_GUEST_HZ", v, sizeof(v)) ? atoi(v) : 0; }();
+    if (forced >= 30) return forced;
+    if (forced < 0) return 0;   // NIER_GUEST_HZ=-1: unlocked
+    return gSettings.frameRate60.load() >= 2 ? 0 : 60;   // 2: uncapped
 }
 
 bool PcSettingsOpen(PPCRegister& r31)
