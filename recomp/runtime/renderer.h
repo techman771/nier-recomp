@@ -84,6 +84,9 @@ struct ByteBuffer
 
 struct RendererDraw
 {
+    // Written out so that making one doesn't zero it first: `constants` (8 KB) is filled straight
+    // after, and a draw is made for every draw call of the game.
+    RendererDraw() {}
     std::shared_ptr<GuestShader> vs, ps;
     RenderTargetKey target;
     bool hasColor = true;
@@ -102,6 +105,8 @@ struct RendererDraw
     // vertex shader wrote there; 255 for none.
     uint8_t paramGen = 255;
     bool rectList = false;
+    // The indices are a triangle strip (0xFFFFFFFF starts a new one), drawn as one; otherwise a list.
+    bool strip = false;
     // Face culling (PA_SU_SC_MODE_CNTL): 0 none, 1 front faces, 2 back faces; which winding is the
     // front. Double-sided cloth, fur and hair are modelled as two coincident layers with opposite
     // normals and rely on this to hide the one facing away.
@@ -111,7 +116,7 @@ struct RendererDraw
     std::vector<uint32_t> indices;             // empty means non-indexed
     ByteBuffer vertexData;                     // byte order already corrected
     std::array<uint32_t, 96> vertexBase{};
-    std::array<float, 2048> constants{};
+    std::array<float, 2048> constants;         // not initialized (see the constructor)
     std::array<uint32_t, 8> boolConstants{};
     std::array<TextureBinding, 32> textures;   // one per fetch constant
     bool bypassViewport = false;
@@ -167,6 +172,10 @@ void RendererWaitTotals(double totals[3]);
 // Called once per guest swap. The planes are copied before returning.
 void RendererSubmitMovieFrame(uint64_t frame, const RendererPlane& y, const RendererPlane& u, const RendererPlane& v);
 void RendererSubmitFrame(RendererFrame&& frame);
+// An emptied command list of an earlier frame, to build the next frame in: its memory has been used
+// already, where a newly allocated list costs a page fault for every few commands (a draw is about
+// 10 KB). Empty with no capacity if none has come back yet.
+std::vector<RendererCommand> RendererTakeCommandList();
 
 void RendererDumpStats();
 // Called by the renderer (after the frame's GPU work) with a write-back resolve's pixels, RGBA8 rows.

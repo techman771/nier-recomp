@@ -329,7 +329,7 @@ namespace
             FrameCaptureSave(output, path, ShaderWords);
             gSaveCommandsAt = ~0ull;
         }
-        gFrameCommands.clear();
+        gFrameCommands = RendererTakeCommandList();   // an earlier frame's list, emptied: memory already in use
         gFrameCommands.reserve(commandCount + commandCount / 4 + 16);   // draws are large; avoid regrowing
         RendererSubmitFrame(std::move(output));
     }
@@ -647,7 +647,7 @@ namespace
         // Hashing the contents on every use dominated the command thread. Small data textures (bone
         // matrices, rewritten between draws) are still hashed every time; the rest once per frame,
         // since the game streams them in between frames.
-        struct HashMemo { uint64_t frame = ~0ull, hash = 0; };
+        struct HashMemo { uint64_t frame = ~0ull, hash = 0, signature = 0, fullFrame = 0; };
         static std::unordered_map<uint64_t, HashMemo> hashMemo;
         static const bool hashEveryUse = GetEnvironmentVariableA("NIER_HASH_EVERY_USE", nullptr, 0) > 0;   // debugging
         // Of the small ones only data textures are (one row, or a float format); hashing every small
@@ -658,12 +658,45 @@ namespace
         // Every byte is hashed (XXH3, many GB/s): a bone matrix rewritten in place may change only some
         // of a texel's components, which sampling would miss.
         uint64_t content = 0;
-        if (memo && memo->frame == gFrames.load()) content = memo->hash;
+        const uint64_t frameNow = gFrames.load();
+        if (memo && memo->frame == frameNow) content = memo->hash;
         else
         {
-            content = XXH3_64bits(source, size_t(bytes));
-            if (levels > 1) content = XXH3_64bits_withSeed(g_base + mipGuest, size_t(mipBytes), content);
-            if (memo) *memo = { gFrames.load(), content };
+            // Block-compressed textures are the game's art: never edited in place, only replaced whole
+            // when the game streams another one into the same memory. For those a sample is hashed
+            // each frame (64 bytes at 48 places across the base level and the mips) and the full hash
+            // taken only when the sample changes, or every ten seconds or so regardless. Hashing all
+            // of them in full once a frame was a fifth of this thread's time at The Aerie. Plain
+            // formats (which include the text glyph sheets, edited a glyph at a time) are always
+            // hashed in full. NIER_HASH_FULL=1 hashes everything in full (debugging).
+            static const bool hashFull = GetEnvironmentVariableA("NIER_HASH_FULL", nullptr, 0) > 0;
+            uint64_t signature = 0;
+            bool unchanged = false;
+            if (memo && blockSize == 4 && !hashFull && bytes >= 4096)
+            {
+                uint8_t sample[48 * 64];
+                const uint64_t spread = (bytes - 64) / 39;
+                for (int i = 0; i < 40; i++) memcpy(sample + i * 64, source + uint64_t(i) * spread, 64);
+                const bool mips = levels > 1 && mipBytes >= 4096;
+                for (int i = 0; i < 8; i++)
+                {
+                    if (mips) memcpy(sample + (40 + i) * 64, g_base + mipGuest + uint64_t(i) * ((mipBytes - 64) / 7), 64);
+                    else memset(sample + (40 + i) * 64, 0, 64);
+                }
+                signature = XXH3_64bits(sample, sizeof(sample)) | 1;   // never zero
+                unchanged = memo->signature == signature && frameNow - memo->fullFrame < 600 + (key & 255);
+            }
+            if (unchanged)
+            {
+                content = memo->hash;
+                memo->frame = frameNow;
+            }
+            else
+            {
+                content = XXH3_64bits(source, size_t(bytes));
+                if (levels > 1) content = XXH3_64bits_withSeed(g_base + mipGuest, size_t(mipBytes), content);
+                if (memo) *memo = { frameNow, content, signature, frameNow };
+            }
         }
 
         binding.scale[0] = float(t.width) / float(widthBlocks * blockSize);
@@ -965,25 +998,11 @@ namespace
             });
             return true;
         case 6:
-        {
-            // Strips are most of the game's geometry: written through a pointer into room for the
-            // largest result (three indices for each one read), then cut to what was written.
-            out.resize(in.size() * 3);
-            uint32_t* write = out.data();
-            const uint32_t* read = in.data();
-            forEachSegment([&](size_t begin, size_t end) {
-                for (size_t i = begin + 2; i < end; i++)
-                {
-                    const bool odd = (i - begin) & 1;
-                    write[0] = read[odd ? i - 1 : i - 2];
-                    write[1] = read[odd ? i - 2 : i - 1];
-                    write[2] = read[i];
-                    write += 3;
-                }
-            });
-            out.resize(size_t(write - out.data()));
+            // Strips are most of the game's geometry: handed on as they are (the restart marker is the
+            // host's strip cut value) and drawn as strips, instead of being expanded to a list.
+            draw.strip = true;
+            out = std::move(in);
             return true;
-        }
         case 13:
             for (size_t i = 0; i + 4 <= in.size(); i += 4) out.insert(out.end(), { in[i], in[i + 1], in[i + 2], in[i], in[i + 2], in[i + 3] });
             return true;
@@ -1014,7 +1033,16 @@ namespace
         }();
         if (!skipShaders.empty() && (skipShaders.count(vs->shader->hash) || skipShaders.count(ps->shader->hash))) return;
 
-        RendererDraw draw;
+        // Built in place at the end of the frame's commands, and taken off again if the draw is given
+        // up: a draw is about 10 KB, and building it apart and moving it in copied all of that again.
+        gFrameCommands.emplace_back(std::in_place_type<RendererDraw>);
+        struct Pending
+        {
+            bool keep = false;
+            ~Pending() { if (!keep) gFrameCommands.pop_back(); }
+        } pending;
+        RendererDraw* building = &std::get<RendererDraw>(gFrameCommands.back());
+#define draw (*building)
         uint32_t scale;
         draw.target = CurrentTarget(scale);
         draw.vs = vs->shader;
@@ -1080,7 +1108,8 @@ namespace
         uint32_t minIndex = 0xFFFFFFFF, maxIndex = 0;
         static const bool noTrim = GetEnvironmentVariableA("NIER_NO_VERTEX_TRIM", nullptr, 0) > 0;   // debugging
         if (vs->info.directVertexIndex && !noTrim)
-            for (uint32_t index : draw.indices) { minIndex = std::min(minIndex, index); maxIndex = std::max(maxIndex, index); }
+            for (uint32_t index : draw.indices)
+                if (index != kRestart) { minIndex = std::min(minIndex, index); maxIndex = std::max(maxIndex, index); }   // a strip keeps its restart markers
         struct VertexCopy { uint32_t slot, first, bytes, endian; const uint8_t* source; };
         VertexCopy copies[96];
         uint32_t copyCount = 0, totalBytes = 0;
@@ -1304,7 +1333,8 @@ namespace
             static std::set<uint64_t> logged;
             if (logged.size() < 8 && logged.insert(uint64_t(clear.source.edramBase) << 32 | clear.source.width).second)
                 Log("[gpu] depth-fill colour clear: base %X width %u value %08X\n", clear.source.edramBase, clear.source.width, clear.colorClear);
-            gFrameCommands.emplace_back(std::move(clear));
+            gFrameCommands.insert(gFrameCommands.end() - 1, std::move(clear));   // before the draw being built
+            building = &std::get<RendererDraw>(gFrameCommands.back());
         }
         // Debugging: vertex data and state of depth-only and rect draws in the logged frame.
         if (gFrames.load() == gLogDrawsAt)
@@ -1331,7 +1361,8 @@ namespace
                 draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3], values.c_str());
         }
         RendererPreparePipeline(draw);   // start creating a new pipeline now, ahead of the render thread
-        gFrameCommands.emplace_back(std::move(draw));
+        pending.keep = true;
+#undef draw
     }
 
     void OnDraw(uint32_t initiator, const IndexSource& source)

@@ -31,7 +31,7 @@ class Reader:
 def load(path):
     r = Reader(open(path, "rb").read())
     magic, version = r.get("II")
-    assert magic == 0x4D52464E and version in (1, 2, 3, 4), "not a frame capture this script can read"
+    assert magic == 0x4D52464E and version in (1, 2, 3, 4, 5), "not a frame capture this script can read"
     frame, scanout = r.get("Q"), r.get("I")
     shaders = []
     for _ in range(r.get("I")):
@@ -60,6 +60,7 @@ def load(path):
             d["blendConstant"] = r.get("ffff") if version >= 3 else (0.0, 0.0, 0.0, 0.0)
             d["alphaFunc"], d["alphaRef"] = r.get("Bf") if version >= 3 else (7, 0.0)
             d["paramGen"] = r.get("B") if version >= 4 else 255
+            d["strip"] = r.get("B") if version >= 5 else 0
             d["vertexCount"] = r.get("I")
             d["indices"] = struct.unpack_from("<%dI" % r.get("I"), r.d, r.o) if True else ()
             r.o += len(d["indices"]) * 4

@@ -303,6 +303,7 @@ void SettingsLoad()
     if (GetEnvironmentVariableA("NIER_FULLSCREEN", value, sizeof(value))) gSettings.borderless = value[0] == '1';
     if (GetEnvironmentVariableA("NIER_60FPS", value, sizeof(value))) gSettings.frameRate60 = value[0] != '0';
     if (GetEnvironmentVariableA("NIER_30FPS", value, sizeof(value))) gSettings.frameRate60 = 0;
+    if (GetEnvironmentVariableA("NIER_VSYNC", value, sizeof(value))) gSettings.vsync = value[0] != '0';
     if (GetEnvironmentVariableA("NIER_FRAME_RATE", value, sizeof(value))) gSettings.frameRate60 = std::clamp(atoi(value), 0, 6);   // the setting's index
 }
 

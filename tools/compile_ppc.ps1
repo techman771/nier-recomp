@@ -1,7 +1,7 @@
 # Builds recomp/build/nier.exe from the recompiled code and the runtime. Load devshell.ps1 first.
 # The runtime is optimized too (it emulates the GPU's command processor, which bounds gameplay speed);
 # -RuntimeOpt /Od gives a debuggable runtime. Symbols (/Z7) are kept either way.
-param([string]$Opt = '/O2', [string]$RuntimeOpt = '/O2')
+param([string]$Opt = '/O2', [string]$RuntimeOpt = '/O2', [string]$CpuArch = '/arch:AVX2')
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'recomp\build'
 New-Item -ItemType Directory -Force $build | Out-Null
@@ -12,7 +12,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $sources = Get-ChildItem (Join-Path $root 'recomp\out') -Filter *.cpp | Select-Object -ExpandProperty Name
 $runtime = Get-ChildItem (Join-Path $root 'recomp\runtime') -Filter *.cpp | Select-Object -ExpandProperty Name
 $x = '../../tools/XenonRecomp'
-$common = "/nologo /c /std:c++20 /MT /arch:AVX -msse4.1 -fno-strict-aliasing -Wno-everything -I$x/thirdparty/simde -I../out"
+# /arch:AVX2 (Haswell / Zen and later: AVX2, BMI, FMA; main.cpp checks for it at start). Contraction is
+# off so that no multiply and add are fused: the recompiled code's floating point stays exactly as it
+# was built and tested with /arch:AVX. -CpuArch /arch:AVX builds for older processors.
+$common = "/nologo /c /std:c++20 /MT $CpuArch -msse4.1 -ffp-contract=off -fno-strict-aliasing -Wno-everything -I$x/thirdparty/simde -I../out"
 $lib = '../../tools/build'
 $sdl = '../../tools/SDL3'   # tools/get_sdl3.ps1 fetches it; SDL3.dll is copied beside nier.exe below
 if (-not (Test-Path (Join-Path $PSScriptRoot 'SDL3\include\SDL3\SDL.h'))) { & (Join-Path $PSScriptRoot 'get_sdl3.ps1') }

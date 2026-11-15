@@ -543,6 +543,15 @@ void RegisterGuestThread(PPCContext* ctx)
 
 int main(int argc, char** argv)
 {
+    // The build uses AVX2 (tools/compile_ppc.ps1): say so plainly on a processor without it, rather
+    // than die on an illegal instruction somewhere later.
+#ifdef __AVX2__
+    if (!IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */))
+    {
+        MessageBoxA(nullptr, "This build needs a processor with AVX2 (Intel Haswell, AMD Excavator or Zen, or later).", "NieR", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+#endif
     std::string gameDir = argc > 1 ? argv[1] : "..\\..\\Nier";
     char* trace = nullptr;
     size_t length = 0;

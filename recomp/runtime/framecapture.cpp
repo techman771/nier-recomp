@@ -34,7 +34,7 @@
 
 namespace
 {
-    constexpr uint32_t kMagic = 0x4D52464E, kVersion = 4;   // "NFRM"; version 2 added the cull state, 3 the blend constant and alpha test, 4 the generated pixel parameter
+    constexpr uint32_t kMagic = 0x4D52464E, kVersion = 5;   // "NFRM"; version 2 added the cull state, 3 the blend constant and alpha test, 4 the generated pixel parameter, 5 the strip flag
 
     struct Writer
     {
@@ -144,7 +144,7 @@ void FrameCaptureSave(const RendererFrame& frame, const std::string& path,
             w.Put(shaderIndex.count(d->ps.get()) ? shaderIndex[d->ps.get()] : -1);
             w.Key(d->target); w.Put(uint8_t(d->hasColor)); w.Put(uint8_t(d->depthBound)); w.Key(d->depth);
             w.Put(d->depthControl); w.Put(d->stencilRefMask); w.Put(d->blendControl); w.Put(d->writeMask);
-            w.Put(uint8_t(d->rectList)); w.Put(d->cull); w.Put(uint8_t(d->frontCounterClockwise)); w.Bytes(d->blendConstant, sizeof(d->blendConstant)); w.Put(d->alphaFunc); w.Put(d->alphaRef); w.Put(d->paramGen); w.Put(d->vertexCount);
+            w.Put(uint8_t(d->rectList)); w.Put(d->cull); w.Put(uint8_t(d->frontCounterClockwise)); w.Bytes(d->blendConstant, sizeof(d->blendConstant)); w.Put(d->alphaFunc); w.Put(d->alphaRef); w.Put(d->paramGen); w.Put(uint8_t(d->strip)); w.Put(d->vertexCount);
             w.Put(uint32_t(d->indices.size())); w.Bytes(d->indices.data(), d->indices.size() * 4);
             w.Put(uint32_t(d->vertexData.size())); w.Bytes(d->vertexData.data(), d->vertexData.size());
             w.Bytes(d->vertexBase.data(), sizeof(d->vertexBase));
@@ -236,6 +236,7 @@ namespace
                 if (version >= 2) { d.cull = r.Get<uint8_t>(); d.frontCounterClockwise = r.Get<uint8_t>() != 0; }
                 if (version >= 3) { r.Bytes(d.blendConstant, sizeof(d.blendConstant)); d.alphaFunc = r.Get<uint8_t>(); d.alphaRef = r.Get<float>(); }
                 if (version >= 4) d.paramGen = r.Get<uint8_t>();
+                if (version >= 5) d.strip = r.Get<uint8_t>() != 0;
                 d.vertexCount = r.Get<uint32_t>();
                 d.indices.resize(r.Get<uint32_t>()); r.Bytes(d.indices.data(), d.indices.size() * 4);
                 d.vertexData.resize(r.Get<uint32_t>()); r.Bytes(d.vertexData.data(), d.vertexData.size());
@@ -321,7 +322,7 @@ namespace
 // capture but with block indices in place of data), 'E' end. Records precede their first use.
 namespace
 {
-    constexpr uint32_t kSequenceMagic = 0x5145534E, kSequenceVersion = 3;   // "NSEQ"; version 2 added the blend constant and alpha test, 3 the generated pixel parameter
+    constexpr uint32_t kSequenceMagic = 0x5145534E, kSequenceVersion = 4;   // "NSEQ"; version 2 added the blend constant and alpha test, 3 the generated pixel parameter, 4 the strip flag
     constexpr uint32_t kNoBlock = 0xFFFFFFFF;
     constexpr size_t kConstantPieces = 8, kPieceBytes = 2048 * 4 / kConstantPieces;
 
@@ -476,7 +477,7 @@ void FrameSequenceAdd(const RendererFrame& frame)
             b.Put(ShaderOf(r, d->vs)); b.Put(ShaderOf(r, d->ps));
             b.Key(d->target); b.Put(uint8_t(d->hasColor)); b.Put(uint8_t(d->depthBound)); b.Key(d->depth);
             b.Put(d->depthControl); b.Put(d->stencilRefMask); b.Put(d->blendControl); b.Put(d->writeMask);
-            b.Put(uint8_t(d->rectList)); b.Put(d->cull); b.Put(uint8_t(d->frontCounterClockwise)); b.Bytes(d->blendConstant, sizeof(d->blendConstant)); b.Put(d->alphaFunc); b.Put(d->alphaRef); b.Put(d->paramGen); b.Put(d->vertexCount);
+            b.Put(uint8_t(d->rectList)); b.Put(d->cull); b.Put(uint8_t(d->frontCounterClockwise)); b.Bytes(d->blendConstant, sizeof(d->blendConstant)); b.Put(d->alphaFunc); b.Put(d->alphaRef); b.Put(d->paramGen); b.Put(uint8_t(d->strip)); b.Put(d->vertexCount);
             b.Put(uint32_t(d->indices.size())); b.Put(BlockOf(r, d->indices.data(), d->indices.size() * 4));
             b.Put(uint32_t(d->vertexData.size())); b.Put(BlockOf(r, d->vertexData.data(), d->vertexData.size()));
             b.Bytes(d->vertexBase.data(), sizeof(d->vertexBase));
@@ -616,6 +617,7 @@ namespace
                 d.rectList = r.Get<uint8_t>() != 0; d.cull = r.Get<uint8_t>(); d.frontCounterClockwise = r.Get<uint8_t>() != 0;
                 if (s.version >= 2) { r.Bytes(d.blendConstant, sizeof(d.blendConstant)); d.alphaFunc = r.Get<uint8_t>(); d.alphaRef = r.Get<float>(); }
                 if (s.version >= 3) d.paramGen = r.Get<uint8_t>();
+                if (s.version >= 4) d.strip = r.Get<uint8_t>() != 0;
                 d.vertexCount = r.Get<uint32_t>();
                 const uint32_t indexCount = r.Get<uint32_t>();
                 if (const auto* data = block(r.Get<uint32_t>())) { d.indices.resize((std::min)(size_t(indexCount), data->size() / 4)); memcpy(d.indices.data(), data->data(), d.indices.size() * 4); }

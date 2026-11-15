@@ -13,6 +13,6 @@ python -I "$t\xenonscan\check_functions.py" "$root\recomp\out" "$o\dis.exe" "$ro
 "audit exit: $LASTEXITCODE"
 python -I "$t\xenonscan\opcode_tests\gen.py" "$root\recomp\out" "$tests\emitted.inc"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-clang-cl /nologo /std:c++20 /O1 /MT /EHsc /arch:AVX '-msse4.1' -fno-strict-aliasing -Wno-everything "/I$x\thirdparty\simde" "/I$root\recomp\out" "/I$tests" "$t\xenonscan\opcode_tests\harness.cpp" "/Fo:$tests\harness.obj" "/Fe:$tests\harness.exe"
+clang-cl /nologo /std:c++20 /O1 /MT /EHsc /arch:AVX2 '-msse4.1' '-ffp-contract=off' -fno-strict-aliasing -Wno-everything "/I$x\thirdparty\simde" "/I$root\recomp\out" "/I$tests" "$t\xenonscan\opcode_tests\harness.cpp" "/Fo:$tests\harness.obj" "/Fe:$tests\harness.exe"
 & "$tests\harness.exe"
 "opcode tests exit: $LASTEXITCODE"

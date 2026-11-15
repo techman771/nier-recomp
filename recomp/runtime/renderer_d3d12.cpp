@@ -77,6 +77,8 @@ float4 PSMain(Interpolated input) : SV_Target
     std::mutex gMailboxMutex;
     std::condition_variable gMailboxChanged, gQueueSpace;
     std::deque<RendererFrame> gFrameQueue;
+    std::mutex gCommandListMutex;
+    std::vector<std::vector<RendererCommand>> gCommandLists;   // emptied lists, for RendererTakeCommandList
     MailboxPlane gPlanes[3];
     bool gMailboxMovie = false;
     uint64_t gMailboxFrame = 0, gMailboxSequence = 0;
@@ -838,6 +840,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             desc.RasterizerState.CullMode = draw.rectList || draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
             desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
             desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;   // strips are drawn as strips (RendererDraw::strip)
             desc.NumRenderTargets = draw.hasColor ? 1 : 0;
             desc.RTVFormats[0] = draw.hasColor ? kTargetFormat : DXGI_FORMAT_UNKNOWN;
             if (draw.depthBound)
@@ -1290,7 +1293,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gList->SetGraphicsRootConstantBufferView(1, system.gpu);
         gList->SetGraphicsRootShaderResourceView(2, vertices.gpu);
         gList->SetGraphicsRootDescriptorTable(3, gpu);
-        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->IASetPrimitiveTopology(draw.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         D3D12_INDEX_BUFFER_VIEW lastIndexView{};
         if (draw.indices.empty())
         {
@@ -2108,6 +2111,7 @@ float2 main(MotionOut input) : SV_Target
         desc.RasterizerState.CullMode = draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
         desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
         desc.SampleDesc.Count = 1;
@@ -2189,7 +2193,7 @@ float2 main(MotionOut input) : SV_Target
             gList->SetGraphicsRootConstantBufferView(1, record.system);
             gList->SetGraphicsRootShaderResourceView(2, record.vertices);
             gList->SetGraphicsRootDescriptorTable(3, gpu);
-            gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            gList->IASetPrimitiveTopology(draw.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             gList->IASetIndexBuffer(&record.indices);
             gList->DrawIndexedInstanced(record.indices.SizeInBytes / 4, 1, 0, 0, 0);
             drawn++;
@@ -3348,6 +3352,13 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             }
             if (resize) Resize(resizeWidth, resizeHeight);
             if (hasWork) RenderFrame(planes, movie, frame, guest ? &*guest : nullptr);
+            if (guest)
+            {
+                // The frame's commands are done with: empty the list and keep it for a later frame.
+                guest->commands.clear();
+                std::lock_guard lock(gCommandListMutex);
+                if (gCommandLists.size() < 6) gCommandLists.push_back(std::move(guest->commands));
+            }
         }
         std::lock_guard lock(gMailboxMutex);
         gFrameQueue.clear();
@@ -3412,6 +3423,15 @@ void RendererSubmitMovieFrame(uint64_t frame, const RendererPlane& y, const Rend
 }
 
 // Guest frames are queued rather than replaced: a dropped frame could lose a one-time resolve.
+std::vector<RendererCommand> RendererTakeCommandList()
+{
+    std::lock_guard lock(gCommandListMutex);
+    if (gCommandLists.empty()) return {};
+    std::vector<RendererCommand> list = std::move(gCommandLists.back());
+    gCommandLists.pop_back();
+    return list;
+}
+
 void RendererSubmitFrame(RendererFrame&& frame)
 {
     gSubmitted++;

@@ -338,6 +338,37 @@ speed. Measured with the sampling profiler (`NIER_PROFILE`), 20 s of the first f
   index are copied (fetch constants often cover a whole level's geometry): 30 fps.
 The command thread is now about 60% busy; the game's main thread is always busy.
 `NIER_HASH_EVERY_USE=1` and `NIER_NO_VERTEX_TRIM=1` turn the two shortcuts off for comparison.
+Command thread, second round (with the frame rate unlocked it is what limits the game: 99.5% busy
+at The Aerie). Measured with the 240 cap, VSync off, the load script's frame numbers times four
+(fully uncapped, scripted presses are over before a menu reacts), NIER_PROFILE=11000,10:
+107 fps before. Its time went to CopySwapped 23% (vertex data), texture hashing 21%,
+AssemblePrimitives 19% with its zero-filled result, and about 20% in building and moving the draw
+record (emplace, memcpy, memset).
+- Command lists are recycled: each frame's list used to be a new allocation, so every draw's
+  10 KB record landed on untouched pages; the render thread now empties a finished frame's list and
+  hands it back (`RendererTakeCommandList`). Draws are built in place at the end of the list
+  (`#define draw (*building)` in BuildDraw, taken off again by `Pending` on an early return; the
+  depth-fill clear is inserted before it) and `RendererDraw() {}` leaves `constants`
+  uninitialized. Building in place alone gained nothing; with recycling: 140 fps.
+- Texture hashing: block-compressed textures (never edited in place, only replaced whole) get a
+  sampled check per frame, 64 bytes at 48 places, and a full hash only when it changes or every
+  600-855 frames; plain formats (glyph sheets are edited a glyph at a time) are still hashed in
+  full once a frame. NIER_HASH_FULL=1 for the old way. (Guest physical memory is file-mapped
+  views, so write watching isn't available.)
+- Triangle strips, most of the geometry, are drawn as strips (`RendererDraw::strip`, the restart
+  marker 0xFFFFFFFF being D3D12's strip cut value, set in every pipeline) instead of being expanded
+  to lists; the vertex range scan skips the markers. Captures record the flag (NFRM 5, NSEQ 4;
+  older ones still load). 170 fps, the picture unchanged at frame 3000 of Game 3.
+- AVX2: `compile_ppc.ps1` builds with `/arch:AVX2` (AVX2, BMI, FMA; `-CpuArch /arch:AVX` for the old
+  target) and `-ffp-contract=off`, so that the recompiled code's `a * b + c` (how fmadd is emitted)
+  and everything else compute exactly as in the AVX build that was tested, not fused. main.cpp
+  refuses to start on a processor without AVX2, with a message box. The opcode tests pass (1663
+  checks). 185 fps in the same measurement (170 before; the copy-and-swap loop is the main gainer).
+- User after the three changes above: "so far no broken visuals".
+- Left: CopySwapped 29% of what remains (vertex data copied and swapped for every draw, then
+  copied again by the render thread into the upload arena; swapping in the vertex shader and
+  writing straight into a per-frame upload buffer would remove most of it), XXH3 14%, heap 7%.
+
 Frame rate caps (asked for by the user after Uncapped gave no trouble: the Steam Deck OLED is 90 Hz,
 and some prefer a cap to VSync): Frame Rate is now 30, 60, 90, 120, 144, 240 fps and Uncapped
 (setting `frame_rate`, the index 0-6; the old `frame_rate_60` is still read: 0, 1, and anything
