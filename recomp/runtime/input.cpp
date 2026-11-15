@@ -248,7 +248,7 @@ namespace
         { { "dpad_left", "2H Sword Menu (D-Pad Left)", VK_LEFT }, Button, 0x0004 }, { { "dpad_right", "Spear Menu (D-Pad Right)", VK_RIGHT }, Button, 0x0008 },
     };
     std::atomic<int> gKeys[kKeyActions];
-    std::atomic<bool> gKeysReady{ false }, gCapture{ false }, gCaptureArmed{ false };
+    std::atomic<bool> gKeysReady{ false }, gCapture{ false }, gCaptureArmed{ false }, gOverlay{ false };
 
     void EnsureKeys()
     {
@@ -263,7 +263,7 @@ namespace
     // Returns true when a bound key is down.
     bool ApplyKeyboard(PadState& s)
     {
-        if (!PresenterHasFocus() || gCapture.load()) return false;   // a key being captured for a binding isn't input
+        if (!PresenterHasFocus() || gCapture.load() || gOverlay.load()) return false;   // a key being captured for a binding, or typed into the on-screen keyboard, isn't input
         EnsureKeys();
         bool any = false;
         for (int i = 0; i < kKeyActions; i++)
@@ -390,6 +390,26 @@ std::string InputKeyName(int key)
 // While capturing, keys don't act as the pad; InputPollNewKey returns the next key pressed once every
 // key has been released (0 until then). NIER_FAKE_KEY=<frame>:<vk> presses one for tests.
 void InputSetCapture(bool on) { gCapture = on; gCaptureArmed = false; }
+void InputSetOverlay(bool on) { gOverlay = on; }
+
+void InputOverlayRead(uint16_t& buttons, int16_t& lx, int16_t& ly)
+{
+    EnsureSdl();
+    static const bool ignorePads = GetEnvironmentVariableA("NIER_IGNORE_PADS", nullptr, 0) > 0;
+    buttons = 0;
+    lx = ly = 0;
+    for (uint32_t slot = 0; slot < USERS && !ignorePads; slot++)
+    {
+        PadState one;
+        InputStyle style = InputStyle::Xbox;
+        if (!ReadPad(slot, one, style)) continue;
+        if (Active(one)) SetLastStyle(style);
+        buttons |= one.buttons;
+        if (abs(one.lx) > abs(lx)) lx = one.lx;
+        if (abs(one.ly) > abs(ly)) ly = one.ly;
+    }
+    buttons |= ScriptedButtons();
+}
 
 int InputPollNewKey()
 {
@@ -490,6 +510,7 @@ GUEST_IMPORT(XamInputGetState)
             if (frame >= m.frame && frame < m.frame + m.frames) { pad.lx = int16_t(m.lx); pad.ly = int16_t(m.ly); }
     }
     pad.buttons |= ScriptedButtons();
+    if (gOverlay.load()) pad = PadState{};   // the on-screen keyboard has the input
     {
         // Recorded input for test runs. NIER_RECORD_INPUT=<file> writes the pad state the game is
         // given each time it changes ("frame buttons lt rt lx ly rx ry"); NIER_REPLAY_INPUT=<file>

@@ -331,7 +331,9 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     struct ArenaBlock { uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu; UINT64 offset; };
 
     ComPtr<ID3D12RootSignature> gDrawRoot;
-    ComPtr<ID3D12PipelineState> gBlitPipeline, gTargetCopyPipeline;
+    ComPtr<ID3D12PipelineState> gBlitPipeline, gTargetCopyPipeline, gOverlayPipeline;
+    std::mutex gOverlayMutex;
+    std::shared_ptr<DecodedTexture> gOverlay;   // RendererSetOverlay
     ComPtr<ID3D12DescriptorHeap> gDrawSrvHeap, gTargetRtvHeap, gSamplerHeap;
 
     // The draw root signature plus its sampler table (root parameter 4).
@@ -512,6 +514,18 @@ float PSMain(float4 position : SV_Position) : SV_Target
             desc.PS = { copy->GetBufferPointer(), copy->GetBufferSize() };
             desc.RTVFormats[0] = kTargetFormat;
             if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gTargetCopyPipeline)), "target copy pipeline")) return false;
+            // And onto the back buffer with alpha blending (the overlay).
+            desc.RTVFormats[0] = kBackBufferFormat;
+            auto& blend = desc.BlendState.RenderTarget[0];
+            blend.BlendEnable = TRUE;
+            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOp = D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gOverlayPipeline)), "overlay pipeline")) return false;
+            blend.BlendEnable = FALSE;
         }
 
         ComPtr<ID3DBlob> copyVs, copyPs;
@@ -2681,6 +2695,42 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         gList->DrawInstanced(3, 1, 0, 0);
     }
 
+    // Our own picture over the game's (the on-screen keyboard), in the largest 16:9 area of the window.
+    void DrawOverlay()
+    {
+        std::shared_ptr<DecodedTexture> overlay;
+        {
+            std::lock_guard lock(gOverlayMutex);
+            overlay = gOverlay;
+        }
+        if (!overlay || gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return;
+        ID3D12Resource* texture = GetDecoded(*overlay);
+        if (!texture) return;
+        const UINT slot = gDrawSrvUsed;
+        gDrawSrvUsed += kTextureSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(slot) * gSrvStep;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(slot) * gSrvStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(texture, &view, cpu);
+        float w = float(gWidth), h = float(gHeight);
+        if (w / h > 16.0f / 9.0f) w = h * 16.0f / 9.0f; else h = w * 9.0f / 16.0f;
+        D3D12_VIEWPORT viewport{ (gWidth - w) * 0.5f, (gHeight - h) * 0.5f, w, h, 0.0f, 1.0f };
+        D3D12_RECT scissor{ 0, 0, LONG(gWidth), LONG(gHeight) };
+        gList->RSSetViewports(1, &viewport);
+        gList->RSSetScissorRects(1, &scissor);
+        BindDrawRoot();
+        gList->SetPipelineState(gOverlayPipeline.Get());
+        gList->SetGraphicsRootDescriptorTable(3, gpu);
+        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->DrawInstanced(3, 1, 0, 0);
+    }
+
     void CALLBACK DebugMessage(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR description, void*)
     {
         static std::atomic<int> logged{ 0 };
@@ -2978,6 +3028,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         const uint32_t shownSurface = Shown().occurrence ? kSnapshotBase : Shown().base;
         if (guest && (shownSurface || guest->scanoutBase)) BlitScanout(shownSurface && gResolved.count(shownSurface) ? shownSurface : guest->scanoutBase);
+        if (guest) DrawOverlay();
 
         if (movie)
         {
@@ -3302,6 +3353,25 @@ bool RendererWaitDisplayVblank()
     static bool logged = false;
     if (!logged && ms >= 8.0 && ms <= 40.0) { logged = true; Log("[present] the game's vblank follows the display (every %u refresh%s)\n", divider, divider == 1 ? "" : "es"); }
     return ms >= 8.0 && ms <= 40.0;   // an output that doesn't really wait returns at once
+}
+
+void RendererSetOverlay(const uint8_t* rgba, uint32_t width, uint32_t height)
+{
+    std::shared_ptr<DecodedTexture> overlay;
+    if (rgba && width && height)
+    {
+        static std::atomic<uint64_t> version{ 0 };
+        overlay = std::make_shared<DecodedTexture>();
+        overlay->key = 0xFFFFFFFFFFFF0F5Cull;
+        overlay->contentHash = ++version;
+        overlay->width = width;
+        overlay->height = height;
+        overlay->rowPitch = width * 4;
+        overlay->data.assign(rgba, rgba + size_t(width) * height * 4);
+        overlay->subresources.push_back({ 0, width * 4, height });
+    }
+    std::lock_guard lock(gOverlayMutex);
+    gOverlay = overlay;
 }
 
 void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }

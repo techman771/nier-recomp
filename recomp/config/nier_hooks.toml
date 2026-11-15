@@ -93,6 +93,14 @@ name = "TitleKeepQuitEnabled"
 address = 0x8219B0B4
 registers = ["r11"]
 
+# The flag starts cleared when the title object is set up (stb r30,3043(r31) at 0x8219ACF8) and the
+# setter above only runs when the game re-checks its DLC (coming back from New Game, for one): at
+# boot the entry could stay off. It is switched on right after that initialisation as well.
+[[midasm_hook]]
+name = "TitleInitQuit"
+address = 0x8219ACFC
+registers = ["r31"]
+
 [[midasm_hook]]
 name = "TitleQuitToDesktop"
 address = 0x82199B20

@@ -152,7 +152,10 @@ struct RendererFrame
 void RendererInit(void* nativeWindow, uint32_t width, uint32_t height);
 void RendererResize(uint32_t width, uint32_t height);
 bool RendererWaitDisplayVblank();   // waits one 60 Hz period of the display's own refreshes; false if it can't
-bool RendererReady();   // the device exists and frames are accepted
+bool RendererReady();
+// A picture of ours drawn over the game's, alpha-blended, in the largest 16:9 area of the window
+// (the on-screen keyboard). The pixels are copied; null removes it.
+void RendererSetOverlay(const uint8_t* rgba, uint32_t width, uint32_t height);   // the device exists and frames are accepted
 // Running totals in milliseconds: time the render thread waited for shader compiles, time spent
 // creating pipelines, time the render thread waited for pipelines.
 void RendererWaitTotals(double totals[3]);

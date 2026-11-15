@@ -1,5 +1,5 @@
 # Runs nier.exe with a time limit, writing output to recomp/boot.log. Usage: run_boot.ps1 [seconds] [-Trace]
-param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest, [int]$SaveSlot = 0, [string]$Record = '', [string]$Replay = '')
+param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFrames = '', [string]$AutoPress = '', [int]$LogDrawsAt = 0, [switch]$Sound, [switch]$Fps30, [switch]$Playtest, [switch]$AskName, [int]$SaveSlot = 0, [string]$Record = '', [string]$Replay = '')
 # -Record <file> writes the pad input given to the game; -Replay <file> plays such a file back (test runs).
 # -Playtest: a run for the user to play: sound, primary monitor, and the user's own settings.ini
 # (display mode, frame rate etc. from Options > Game Settings > PC Settings). Test runs instead use
@@ -14,7 +14,8 @@ if ($Playtest) {
     $env:NIER_SETTINGS_FILE = Join-Path (Split-Path $PSScriptRoot -Parent) 'recomp\test_settings.ini'
     if ($Fps30) { $env:NIER_30FPS = '1' } else { $env:NIER_60FPS = '1' }
 }
-if (-not $env:NIER_PLAYER_NAME) { $env:NIER_PLAYER_NAME = 'Nier' }   # skips the name window
+# The hero's name: test runs answer the on-screen keyboard in advance; a playtest, or -AskName, shows it.
+if ($Playtest -or $AskName) { Remove-Item Env:NIER_PLAYER_NAME -ErrorAction SilentlyContinue } elseif (-not $env:NIER_PLAYER_NAME) { $env:NIER_PLAYER_NAME = 'Nier' }
 if (-not $Playtest -and -not $env:NIER_MONITOR) { $env:NIER_MONITOR = 'secondary' }      # keeps test windows off the main screen
 if ($Sound) { Remove-Item Env:NIER_MUTE -ErrorAction SilentlyContinue } else { $env:NIER_MUTE = '1' }   # test runs stay silent
 if ($LogDrawsAt -gt 0) { $env:NIER_LOG_DRAWS_AT = "$LogDrawsAt" } else { Remove-Item Env:NIER_LOG_DRAWS_AT -ErrorAction SilentlyContinue }

@@ -410,6 +410,11 @@ void TitleEnableQuit(PPCRegister& r4)
     if (!KeepTitleDlc()) r4.u64 = 1;   // the fourth entry can be chosen
 }
 
+void TitleInitQuit(PPCRegister& r31)
+{
+    if (!KeepTitleDlc()) W8(r31.u32 + 3043, 1);   // enabled from the start, not only after the game re-checks its DLC
+}
+
 void TitleKeepQuitEnabled(PPCRegister& r11)
 {
     if (!KeepTitleDlc()) r11.u64 = 0;   // "no DLC": the entry isn't greyed out again

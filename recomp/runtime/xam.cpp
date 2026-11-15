@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 #include "guest.h"
+#include "input.h"
+#include "renderer.h"
 #include "dlc.h"
 
 namespace
@@ -359,7 +361,8 @@ GUEST_IMPORT(XamUserReadProfileSettings)
     ctx.r3.u64 = overlapped ? X_ERROR_IO_PENDING : 0;
 }
 
-// There's no on-screen keyboard yet: accept the game's suggested text, or NIER_PLAYER_NAME if set.
+// The console's on-screen keyboard: ours (osk.cpp), drawn over the game. NIER_PLAYER_NAME answers it
+// in advance (scripted runs); NIER_KEYBOARD_DIALOG=1 uses a plain Windows dialog instead (debugging).
 namespace
 {
     // Stands in for the console's on-screen keyboard. Windows-only for now; the cross-platform
@@ -452,6 +455,14 @@ namespace
         }
     }
 
+    // The on-screen keyboard, or the dialog if asked for or if the renderer isn't up.
+    void AskKeyboard(KeyboardRequest& request)
+    {
+        static const bool dialog = GetEnvironmentVariableA("NIER_KEYBOARD_DIALOG", nullptr, 0) > 0;
+        if (dialog || !RendererReady()) { RunKeyboard(request); return; }
+        request.accepted = OskRun(request.text, request.title, request.description, request.length > 1 ? request.length - 1 : 0);
+    }
+
     void FinishKeyboard(const KeyboardRequest& request)
     {
         constexpr uint32_t kCancelled = 1223;
@@ -493,12 +504,17 @@ GUEST_IMPORT(XamShowKeyboardUI)
 
     if (!request->overlapped)
     {
-        RunKeyboard(*request);
+        AskKeyboard(*request);
         FinishKeyboard(*request);
         ctx.r3.u64 = request->accepted ? 0 : 1223;
         return;
     }
-    std::thread([request] { RunKeyboard(*request); FinishKeyboard(*request); }).detach();
+    // The request is pending until the keyboard closes. The game looks at the overlapped block's
+    // first word for that: left as it was (zero), the game took the request for done at once, with
+    // no name, while the keyboard was still open.
+    W32(request->overlapped, X_ERROR_IO_PENDING);
+    W32(request->overlapped + 0x18, X_ERROR_IO_PENDING);
+    std::thread([request] { AskKeyboard(*request); FinishKeyboard(*request); }).detach();
     ctx.r3.u64 = X_ERROR_IO_PENDING;
 }
 

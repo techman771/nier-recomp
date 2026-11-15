@@ -540,6 +540,28 @@ forced with `NIER_SHADER_SALT=1`, which makes bytecode neither cache has seen) t
 in total (optimized FXC: 2.1 s), and the fight runs at 58.6 fps. Warm: no waits, 59.9 fps. The stats
 dump reports shader-compile and pipeline waits on the render thread and total pipeline creation time.
 
+On-screen keyboard (`recomp/runtime/osk.cpp`), for XamShowKeyboardUI: the game asks for the hero's
+name with it (New Game > difficulty > keyboard > "Set your name as ...?", whose cursor starts on No;
+answering No shows "Please enter another name." and the keyboard again). Title "Enter a name",
+description "Please enter your name.", 10 characters at most. It is drawn with GDI+ into a 1920x1080
+image whenever something changes and shown by the renderer as an alpha-blended overlay over the
+scanout (`RendererSetOverlay`, `DrawOverlay`; the game keeps presenting frames meanwhile).
+Controller: d-pad / left stick move (with repeat), A types, X deletes, Y space, LB shift, Start
+accepts, B cancels; keyboard: WM_CHAR types, Enter accepts, Esc cancels, arrows move; mouse: click a
+key (`OskChar/OskKey/OskClick` from the window procedure). Shift is one-shot and on for the first
+letter. Only ASCII 32-126 is typed. While it is open the game gets an idle pad and key bindings are
+off (`InputSetOverlay`), and after it closes input stays held until the buttons are released, or the
+closing press would answer the game's next question. The hint line follows the last device used.
+Two things the old Windows dialog path also got wrong: the request must be marked pending in the
+overlapped block (first word and +0x18 = 997) before the thread starts, or the game takes it as
+done at once with no name; and `run_boot.ps1` always preset NIER_PLAYER_NAME, so a playtest never
+showed any keyboard. Now a playtest, or `-AskName`, shows it; other test runs still preset "Nier".
+NIER_KEYBOARD_DIALOG=1 uses the old dialog. Test route (with saves present the title cursor starts
+on Continue): Start every 60 frames to 600, `700:1` (Up), `800:1000` (New Game), `1150:1000`
+(Normal), `1400:1000`; the keyboard is up by frame 1550. Checked by script: typing, moving, Shift,
+accepting ("Set your name as Qw?" follows). The user tried it in a playtest ("all good"; the log
+shows a name returned and a cancel).
+
 Fast route to the fight: `recomp/newgame_args.txt` (Start every 60 frames skips the logos and menus;
 A at the "Overwrite previously-saved system data?" prompt keeps the default No; Left, A answers Yes
 to "Set your name as Nier?"). The opening credits can't be skipped; the fight starts around frame
@@ -942,6 +964,11 @@ From the user's playthrough (open unless marked):
   original wording had none; anything below it was lit by the glow alone, so Q and p looked half
   lit): `DrawPromptMask` takes a row band, fits capitals plus descenders at 60% depth into it
   (the text comes out about 7% smaller).
+  The user found it dead at boot and working after backing out of New Game (never reproduced
+  in a test run, where it worked at boot): the flag is cleared when the title object is set up
+  (0x8219ACF8) and the setter is called from one place only (0x8219B1E8, after the game
+  re-checks its DLC), so `TitleInitQuit` at 0x8219ACFC now sets it at set-up too. Confirmed
+  by the user ("all good").
   NIER_TITLE_DLC=1 keeps the original entry and label. Checked in a test run (entry
   highlights, confirm exits with code 0); not yet tried in a playtest.
 - "Press START to Skip" in cutscenes: text 11202000 now returns "Press <ICON=13> to Skip"

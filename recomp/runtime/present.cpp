@@ -63,7 +63,11 @@ namespace
         case WM_SIZE:
             if (w != SIZE_MINIMIZED) RendererResize(LOWORD(l), HIWORD(l));
             return 0;
+        case WM_CHAR:
+            OskChar(wchar_t(w));   // typing into the on-screen keyboard, when it is open
+            return 0;
         case WM_KEYDOWN:
+            if (w == VK_LEFT || w == VK_RIGHT || w == VK_UP || w == VK_DOWN) OskKey(int(w));
             if (w == VK_F12) GpuRequestCapture();   // capture the next frame for debugging
             if (w == VK_F9 && !(l & (1 << 30))) GpuRequestRecording();   // record 10 seconds (not on key repeat)
             if (w == VK_F11) { SetFullscreen(!gFullscreen); Settings().borderless = gFullscreen; SettingsSave(); }
@@ -98,7 +102,16 @@ namespace
             }
             return DefWindowProcA(window, message, w, l);
         }
-        case WM_LBUTTONDOWN: gLeftClicks++; return 0;
+        case WM_LBUTTONDOWN:
+            if (OskActive())
+            {
+                RECT client;
+                GetClientRect(window, &client);
+                OskClick(short(LOWORD(l)), short(HIWORD(l)), client.right, client.bottom);
+                return 0;
+            }
+            gLeftClicks++;
+            return 0;
         case WM_RBUTTONDOWN: gRightClicks++; return 0;
         case WM_MOUSEWHEEL: gWheel += GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA; return 0;
         case WM_TIMER:

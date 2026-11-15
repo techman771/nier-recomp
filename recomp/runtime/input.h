@@ -24,3 +24,15 @@ int InputPollNewKey();                             // the next key pressed durin
 void InputKeepPointerMode();                       // call each frame a pointer-driven menu is open
 bool InputPointerMode();
 void InputInject(uint16_t buttons);                // press pad buttons for a few frames (menu clicks)
+
+// An overlay of ours that takes the input (the on-screen keyboard, osk.cpp): while on, the game is
+// given an idle pad, and the overlay reads the controllers (and scripted presses) itself.
+void InputSetOverlay(bool on);
+void InputOverlayRead(uint16_t& buttons, int16_t& lx, int16_t& ly);
+
+// On-screen keyboard (osk.cpp).
+bool OskActive();
+void OskChar(wchar_t c);                           // a typed character (WM_CHAR)
+void OskKey(int virtualKey);                       // arrow keys
+void OskClick(int x, int y, int clientWidth, int clientHeight);
+bool OskRun(std::wstring& text, const std::wstring& title, const std::wstring& description, size_t maxChars);
