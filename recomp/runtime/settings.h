@@ -12,6 +12,7 @@ struct PcSettings
     // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
     std::atomic<int> resolutionScale{ 3 };
     std::atomic<int> upscaling{ 0 };           // how a lower render resolution is enlarged: 0 plain filtering, 1 FSR 1, 2 FSR 3.1 (temporal)
+    std::atomic<int> savePage{ 1 };            // which page of three game saves the save list shows (1-10)
     std::atomic<int> shadowQuality{ 0 };       // shadow map size: 0 the original 1024, 1 2048, 2 3072, 3 4096
     std::atomic<int> masterVolume{ 10 };       // 0-10
     std::atomic<int> muteInBackground{ 1 };    // silence while the window isn't focused

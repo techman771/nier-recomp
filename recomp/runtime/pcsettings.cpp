@@ -58,6 +58,7 @@ namespace
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
             { "upscaling", &gSettings.upscaling, 0, 2 },
+            { "save_page", &gSettings.savePage, 1, 10 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
             { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },

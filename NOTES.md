@@ -1157,6 +1157,21 @@ since `[[midasm_hook]]` tables would capture keys after them), implemented in xa
 - Save list (load and save screens; refreshed by sub_82427978): the 4th cursor stop is the device
   row. `DisableSelectDeviceRow` clears its enable byte (+8367; sub_824274E8 skips disabled stops)
   and `BlankSelectDeviceRow` sets its label to an empty string. The row's underline still shows.
+- Save pages (30 slots): the row is back in use. The game has three save slots (packages
+  GAME_DATA0-2) and only ever calls XamShowDeviceSelectorUI from this row, so that call now
+  turns to the next of ten pages (`save_page` in settings.ini, wrapping), and the game, taking
+  it for a newly chosen device, lists its saves again. Page 1 is the save folder itself, page
+  N its subfolder `pageN`; SYSTEM_DATA is shared (`PackageFolder`, `ListContent` in xam.cpp).
+  The row is labelled "<  Page N / 10  >" (`BlankSelectDeviceRow` now writes that into a guest
+  buffer; `DisableSelectDeviceRow` does nothing). Left and Right on the row turn back and
+  forward: the list's input routine tests confirm first (0x82427E7C on; cursor +8360, result
+  +8356), and `SavePageTurn` at 0x82427E84 makes a Left or Right press on row 3 count as the
+  confirm, noting the direction for the selector call (`InputLastGameState` gives the pad
+  state the game last saw, key bindings included). Confirm itself turns forward. Checked on
+  the load screen: Down from slot 3 reaches the row; Left 1 -> 10, Right -> 1 -> 2, A -> 3,
+  each showing that page's slots. The user turned pages both ways in playtests ("it works").
+  Not checked: saving into a slot of another page and loading it back.
+  NIER_STORAGE_MESSAGES=1 keeps the row as the game's own.
 - Text ids: the loaded text table is {id, string} pairs (e.g. around 0x85831000); 6740000 is Audio
   Output, not Select Device. `NIER_STORAGE_MESSAGES=1` keeps all of this original.
 - Scripted route to the save list / Game 1 on the test saves: Start every 60 frames to 600, then

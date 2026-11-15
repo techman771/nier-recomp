@@ -54,6 +54,16 @@ address = 0x82427B20
 registers = ["r11", "r27", "r31"]
 jump_address_on_true = 0x82427B7C
 
+# The save list's input (0x82427E7C on: confirm is tested first, and with the cursor, +8360, on
+# row 3 it sets the result +8356 = 1 at 0x82427ED0, which opens the device selector). With the
+# cursor on that row, Left or Right counts as confirming too, and says which way the page of saves
+# turns (SavePageTurn, xam.cpp).
+[[midasm_hook]]
+name = "SavePageTurn"
+address = 0x82427E84
+registers = ["r30"]
+jump_address_on_true = 0x82427ED0
+
 # The menu input handler (sub_8241C020), an action row was chosen: r4 holds its item id (22-36 are
 # the game's). Ours (Key Bindings pages, Restore Default Keys) are handled, then on to the common tail.
 [[midasm_hook]]

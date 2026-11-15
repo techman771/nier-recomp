@@ -44,3 +44,6 @@
 # Every pipeline the game has used on this machine (input of tools/pipeline_list)
 /recomp/pipelines_seen.txt
 __pycache__/
+
+# Zipped test builds (tools: see README in the zip)
+/dist/

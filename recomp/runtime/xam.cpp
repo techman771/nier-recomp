@@ -16,6 +16,7 @@
 #include "input.h"
 #include "renderer.h"
 #include "dlc.h"
+#include "settings.h"
 
 namespace
 {
@@ -148,18 +149,42 @@ namespace
         return folder;
     }
 
+    // Save pages: the game has three save slots (packages GAME_DATA0-2). Here there are ten pages of
+    // three: page 1 is the save folder itself, page N its subfolder pageN, and the system data
+    // (SYSTEM_DATA) is shared. The save list's fourth row, the console's "Select Device", turns the
+    // page (XamShowDeviceSelectorUI below, the row's label in SavePageRowLabel): the game then
+    // lists its saves again and finds the other page's. The page is kept in settings.ini.
+    constexpr int kSavePages = 10;
+    std::atomic<int> gPageDirection{ 1 };   // which way the next turn goes (SavePageTurn: Left sets -1)
+    int SavePage() { return std::clamp(Settings().savePage.load(), 1, kSavePages); }
+    bool PagedPackage(const std::string& package) { return package.rfind("GAME_DATA", 0) == 0; }
+    std::string PackageFolder(const std::string& package)
+    {
+        if (!PagedPackage(package) || SavePage() == 1) return SaveFolder();
+        return SaveFolder() + "\\page" + std::to_string(SavePage());
+    }
+
     // Each package's XCONTENT_DATA is kept beside its folder so enumeration can return it unchanged.
-    std::string MetadataPath(const std::string& package) { return SaveFolder() + "\\" + package + ".content"; }
+    std::string MetadataPath(const std::string& package) { return PackageFolder(package) + "\\" + package + ".content"; }
 
     std::vector<std::array<uint8_t, kContentDataBytes>> ListContent(uint32_t type)
     {
         std::vector<std::array<uint8_t, kContentDataBytes>> items;
+        // The save folder holds the shared packages and page 1's saves; another page's saves are in
+        // its own subfolder (whose name is not a package).
+        for (int pass = 0; pass < 2; pass++)
+        {
+        const bool pageFolder = pass == 1;
+        if (pageFolder && SavePage() == 1) break;
         WIN32_FIND_DATAA found;
-        HANDLE search = FindFirstFileA((SaveFolder() + "\\*").c_str(), &found);
-        if (search == INVALID_HANDLE_VALUE) return items;
+        HANDLE search = FindFirstFileA(((pageFolder ? SaveFolder() + "\\page" + std::to_string(SavePage()) : SaveFolder()) + "\\*").c_str(), &found);
+        if (search == INVALID_HANDLE_VALUE) continue;
         do
         {
             if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == '.') continue;
+            if (_strnicmp(found.cFileName, "page", 4) == 0 && isdigit(static_cast<unsigned char>(found.cFileName[4]))) continue;
+            // Game saves come from the page in use: the page's folder holds nothing else that counts.
+            if (pageFolder ? !PagedPackage(found.cFileName) : (PagedPackage(found.cFileName) && SavePage() != 1)) continue;
             std::array<uint8_t, kContentDataBytes> item{};
             if (FILE* file = fopen(MetadataPath(found.cFileName).c_str(), "rb"))
             {
@@ -178,6 +203,7 @@ namespace
             if (type == 0 || itemType == type) items.push_back(item);
         } while (FindNextFileA(search, &found));
         FindClose(search);
+        }
         return items;
     }
 }
@@ -271,8 +297,9 @@ GUEST_IMPORT(XamContentCreateEx)
         return;
     }
 
-    const std::string saveFolder = SaveFolder();
+    const std::string saveFolder = PackageFolder(name);
     const std::string directory = saveFolder + "\\" + name;
+    CreateDirectoryA(SaveFolder().c_str(), nullptr);
     CreateDirectoryA(saveFolder.c_str(), nullptr);
 
     const DWORD attributes = GetFileAttributesA(directory.c_str());
@@ -307,11 +334,21 @@ GUEST_IMPORT(XamContentClose)
     ctx.r3.u64 = overlapped ? X_ERROR_IO_PENDING : 0;
 }
 
-// A console shows a picker here; one virtual hard drive means there's only one possible answer.
+// A console shows a storage device picker here. The game only asks from the save list's fourth row,
+// and there is one virtual hard drive, so the request is put to another use: it turns to the next
+// page of saves (see SavePage above). The game takes the answer as a newly chosen device and lists
+// its saves again. NIER_STORAGE_MESSAGES=1 keeps the row and this call as they were.
 GUEST_IMPORT(XamShowDeviceSelectorUI)
 {
     const uint32_t deviceOut = ctx.r7.u32, overlapped = ctx.r8.u32;
-    Log("[xam] device selector: device pointer %08X overlapped %08X\n", deviceOut, overlapped);
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) == 0)
+    {
+        const int direction = gPageDirection.exchange(1);
+        Settings().savePage = (SavePage() - 1 + direction + kSavePages) % kSavePages + 1;
+        SettingsSave();
+        Log("[xam] save page %d of %d\n", SavePage(), kSavePages);
+    }
+    else Log("[xam] device selector: device pointer %08X overlapped %08X\n", deviceOut, overlapped);
     if (deviceOut) W32(deviceOut, 1);
     CompleteOverlapped(overlapped, 0, 0);
     ctx.r3.u64 = overlapped ? X_ERROR_IO_PENDING : 0;
@@ -609,16 +646,38 @@ bool SkipDlcNotice(PPCRegister& r30)
 }
 
 // "Select Device" row on the save list (load and save screens): see nier_hooks.toml.
+// The row stays enabled now: it turns the page of saves (it used to be switched off here).
 void DisableSelectDeviceRow(PPCRegister& r30)
 {
-    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return;
-    W8(r30.u32 + 8367, 0);
 }
 
+// The save list's input, cursor on the page row: Left turns back a page and Right forward, by way of
+// the row's own confirm (which asks for the device selector, where the page turns). True to confirm.
+bool SavePageTurn(PPCRegister& r30)
+{
+    static bool wasLeft = false, wasRight = false;
+    uint16_t buttons = 0;
+    int16_t lx = 0;
+    InputLastGameState(buttons, lx);
+    const bool left = (buttons & 0x0004) || lx < -16000, right = (buttons & 0x0008) || lx > 16000;
+    const bool pressedLeft = left && !wasLeft, pressedRight = right && !wasRight;
+    wasLeft = left;
+    wasRight = right;
+    if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0 || R32(r30.u32 + 8360) != 3) return false;
+    if (!pressedLeft && !pressedRight) return false;
+    gPageDirection = pressedLeft ? -1 : 1;
+    return true;
+}
+
+// Its label: which page of saves is showing.
 bool BlankSelectDeviceRow(PPCRegister& r11, PPCRegister& r27, PPCRegister& r31)
 {
     if (GetEnvironmentVariableA("NIER_STORAGE_MESSAGES", nullptr, 0) > 0) return false;
+    static const uint32_t buffer = GuestAlloc(64, 4, Region::Heap);
+    char text[64];
+    snprintf(text, sizeof(text), "<  Page %d / %d  >", SavePage(), kSavePages);
+    memcpy(g_base + buffer, text, strlen(text) + 1);
     r11.u64 = R32(r27.u32);   // the text element's vtable, as the branch expects
-    r31.u64 = 0x82046121;     // the NUL after "-----" in the image: an empty string
+    r31.u64 = buffer;
     return true;
 }

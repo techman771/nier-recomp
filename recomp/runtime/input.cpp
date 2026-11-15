@@ -392,6 +392,10 @@ std::string InputKeyName(int key)
 void InputSetCapture(bool on) { gCapture = on; gCaptureArmed = false; }
 void InputSetOverlay(bool on) { gOverlay = on; }
 
+static std::atomic<uint16_t> gGameButtons{ 0 };
+static std::atomic<int16_t> gGameLx{ 0 };
+void InputLastGameState(uint16_t& buttons, int16_t& lx) { buttons = gGameButtons.load(); lx = gGameLx.load(); }
+
 void InputOverlayRead(uint16_t& buttons, int16_t& lx, int16_t& ly)
 {
     EnsureSdl();
@@ -558,6 +562,8 @@ GUEST_IMPORT(XamInputGetState)
         }
     }
 
+    gGameButtons = pad.buttons;
+    gGameLx = pad.lx;
     if (state)
     {
         static std::atomic<int> logged{ 0 };

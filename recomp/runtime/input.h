@@ -27,6 +27,7 @@ void InputInject(uint16_t buttons);                // press pad buttons for a fe
 
 // An overlay of ours that takes the input (the on-screen keyboard, osk.cpp): while on, the game is
 // given an idle pad, and the overlay reads the controllers (and scripted presses) itself.
+void InputLastGameState(uint16_t& buttons, int16_t& lx);   // the pad state the game was last given
 void InputSetOverlay(bool on);
 void InputOverlayRead(uint16_t& buttons, int16_t& lx, int16_t& ly);
 
