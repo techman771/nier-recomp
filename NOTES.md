@@ -400,10 +400,64 @@ NIER_UPSCALING=<0|1> overrides): what happens when the render resolution is belo
   runtime compiles the two passes from those files at first use (`[fsr1] ready`); without the files
   the setting does nothing. Checked at 640x360 -> 1280x720 (Game 3): clearly crisper edges, HUD
   unaffected. The menu row itself hasn't been looked at yet.
-- Next: the temporal upscalers (FSR 3.1, then DLSS, XeSS, FSR 4). They need what this game
-  doesn't provide: sub-pixel camera jitter (can be added to the translated vertex shaders'
-  output for 3D passes), depth (available), motion vectors (to be derived, at first from depth
-  and the camera's matrices only) and the scene before post-processing and HUD.
+- FSR 1 confirmed by the user ("looks good"), menu row included.
+- Temporal upscalers (FSR 3.1 first, then DLSS, XeSS, FSR 4): groundwork, nothing built yet.
+  A gameplay frame (frame_f8519.nfrm, 188 commands) runs: 0-14 shadow map (-> 07A7D000
+  1024x1024); 17-29 a half-size pass (-> 07E7D000 640x360); 31-101 the scene; 102-106 copies
+  of it (149BD000 colour, 072E2000, 06A52000); 107-131 post-processing (depth of field
+  C42C4BC0 / AE4637CC, the luminance chain 512 -> 32x2, tone mapping); 135-138 more
+  depth-tested draws; 144-157 bloom; 160 on the 2D pass.
+  - Camera: every scene draw (71 draws, 10 vertex shaders) carries the same vertex constants
+    c5-c8, the view-projection matrix by rows (x, y, z, w; z = w - 0.094 here, so depth is 0 at
+    the near plane and approaches 1 far away), and c19 = the camera position. Motion vectors
+    for the static world can therefore be computed from the depth buffer and this matrix of the
+    current and the previous frame; moving and skinned objects would need more (their own
+    previous transforms) and will ghost until then.
+  - Jitter: add `jitter * position.w` to the clip position at the end of the translated vertex
+    shaders, from a system constant the renderer sets only for scene draws (depth-tested, main
+    target, not a shadow pass); full-screen passes stay unjittered.
+  - Where to upscale: the simple place is where FSR 1 sits (the finished scene before the 2D
+    pass), feeding the upscaler tone-mapped colour; the better one is after command 102, which
+    means running post-processing at display size and giving the later depth-tested draws a
+    display-sized depth buffer. Start with the simple place.
+- FSR 3.1 built (Upscaling value 2, "FSR 3.1"; NIER_UPSCALING=2). User, at 720p down to 360p on a
+  1440p window: "Looks good, shimmering and trailing with very low res but that's expected":
+  - SDK: AMD FSR SDK 2.4.0 (`tools/get_fsr_sdk.ps1`: API headers and the signed
+    `amd_fidelityfx_loader_dx12.dll` 39 KB and `amd_fidelityfx_upscaler_dx12.dll` 57.7 MB,
+    hash-checked, into `tools/FidelityFX/sdk`, not committed; `compile_ppc.ps1` adds the include
+    path and copies the DLLs beside nier.exe). The runtime loads the loader DLL by name and
+    calls ffxCreateContext / ffxQuery / ffxDispatch; without it the setting falls back to FSR 1.
+    The upscaler DLL reported "3.1.6" here; on Radeon cards that support it the same DLL
+    provides FSR 4 (untested).
+  - Jitter (`TemporalBeginFrame`): Halton(2,3), 8 x area-ratio phases, as the SDK recommends;
+    passed to draws as NDC offsets in `systemExtra.yz` for depth-tested draws outside the
+    shadow and 2D passes, and added at the end of the translated vertex shaders only when the
+    vertex's w isn't exactly 1. That last test matters: depth of field (AE4637CC), the shadow
+    mask (53D2B139) and soft particles (70D071F1) are full-screen quads with the depth test
+    on, and jittering them slid their picture against the scene (doubled image, and the
+    upscaler then never sharpened).
+  - Camera: the perspective matrix in c5-c8 carried by the most scene draws of the frame (a
+    vote; single objects carry their own combined matrix in the same registers and pass the
+    same shape test, so the first one found is wrong).
+  - Depth: the frame's latest full-size depth copy (`gSceneDepthBase`, here 14D55000), not
+    inverted, infinite far plane; near and vertical field of view come from the matrix (0.092,
+    55 degrees here).
+  - Motion vectors: a full-screen pass into R16G16F from that depth and
+    previous-camera x inverse(current-camera), in screen fractions (camera movement only).
+  - Dispatch in `TemporalUpscaled`, at FSR 1's place: colour = the finished render-sized scene
+    (flags: non-linear colour space, sRGB), output a display-sized UAV texture bound in place
+    of the surface; sharpening 0.3 (NIER_FSR3_SHARPNESS). The SDK leaves its own descriptor
+    heaps on the command list: ours are set again after the dispatch.
+  - Result at 640x360 -> 1280x720 (Game 3): while walking, ropes, banners and railings come
+    out close to a native picture; standing still the scenery is detailed and the idling
+    character slightly soft (it moves without motion vectors of its own).
+  - Debugging: NIER_FSR3_DEBUG=1 (the SDK's debug overlay, and a log line every 300 frames),
+    NIER_FSR3_BYPASS=1 (jittered frames straight to FSR 1), NIER_JITTER_SCALE=<x>[,<y>]
+    (scales the drawn jitter only; large values shake the window, so not on a visible run).
+  - Not done: motion vectors for moving and skinned objects; upscaling before the game's
+    post-processing; use at native resolution (anti-aliasing only); the half-size and particle
+    passes are jittered by the same rule but weren't checked separately. The vertex shader
+    change gives every vertex shader new HLSL, so the DXBC cache refills once.
 
 Pre-compilation, second look (after 581 shaders captured in the playthrough so far):
 - The archives and the executable hold standard shader containers (`tools/shader_containers.py`):

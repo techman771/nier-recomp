@@ -26,6 +26,9 @@
 #include "renderer.h"
 #include "settings.h"
 #include <xxHash/xxhash.h>   // shader cache keys
+#include <cfloat>
+#include <api/include/dx12/ffx_api_dx12.h>   // AMD FSR SDK (tools/get_fsr_sdk.ps1)
+#include <upscalers/include/ffx_upscale.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -369,7 +372,16 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ComPtr<ID3D12DescriptorHeap> gDepthDsvHeap;
     UINT gDepthDsvStep = 0, gDepthsCreated = 0;
     std::unordered_map<uint32_t, ResolvedResource> gResolved;
-    std::unordered_map<uint32_t, ID3D12Resource*> gUpscaledNow;   // FSR 1 stand-ins for resolved surfaces, valid for the draw being set up
+    std::unordered_map<uint32_t, ID3D12Resource*> gUpscaledNow;   // upscaled stand-ins for resolved surfaces, valid for the draw being set up
+    // Temporal upscaling (FSR 3.1 / FSR 4, see TemporalUpscaled): state shared with ExecuteDraw.
+    // While it is on, every depth-tested draw outside the shadow and 2D passes is shifted by a
+    // sub-pixel offset that changes each frame (the jitter), and the first such draw carrying a
+    // perspective view-projection matrix in vertex constants c5-c8 gives the frame's camera.
+    bool gTemporalOn = false, gInShadowPass = false, gInFlatPass = false;
+    float gJitterPixels[2] = {}, gJitterNdc[2] = {};
+    double gCameraNow[16] = {}, gCameraBefore[16] = {};
+    bool gCameraNowValid = false, gCameraBeforeValid = false;
+    uint32_t gSceneDepthBase = 0;   // the frame's latest full-size depth copy (a resolved surface)
     struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
     std::unordered_map<uint64_t, DecodedResource> gDecoded;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
@@ -1195,6 +1207,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
         s->alphaRef = draw.alphaRef;
         s->paramGen = draw.paramGen;
         s->extra[0] = 12.0f / float(gActiveTwelfths);
+        if (gTemporalOn && !gInShadowPass && !gInFlatPass && draw.depthBound && (draw.depthControl & 2))
+        {
+            s->extra[1] = gJitterNdc[0];
+            s->extra[2] = gJitterNdc[1];
+        }
         memcpy(s->vertexBase, draw.vertexBase.data(), sizeof(s->vertexBase));
         memcpy(s->boolConstants, draw.boolConstants.data(), sizeof(s->boolConstants));
 
@@ -1290,6 +1307,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         DepthResource* source = GetDepth(resolve.depth);
         if (!source || !resolve.width || !resolve.height) return;
         ResolvedResource& destination = gResolved[resolve.destBase];
+        if (!gInShadowPass && gActiveTwelfths == gResTwelfths && resolve.width >= 1024 && resolve.width > resolve.height) gSceneDepthBase = resolve.destBase;
         bool created = false;
         if (!destination.texture || !destination.depth || destination.width != resolve.width || destination.height != resolve.height || destination.twelfths != gActiveTwelfths)
         {
@@ -1638,7 +1656,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // to display size by EASU (edge-adaptive upsampling) and sharpened by RCAS, and the 2D pass
     // samples the result one to one. The shader code is AMD's (ffx_a.h, ffx_fsr1.h, MIT licensed),
     // read from the fsr1 folder beside the executable (tools/get_fsr1.ps1 fetches it); without those
-    // files the setting does nothing. NIER_UPSCALING=<0|1> overrides the setting (testing).
+    // files the setting does nothing. NIER_UPSCALING=<0|1|2> overrides the setting (testing).
     struct UpscaledSurface
     {
         ComPtr<ID3D12Resource> easu, sharpened;
@@ -1653,12 +1671,6 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ComPtr<ID3D12DescriptorHeap> gFsrRtvHeap;
     constexpr UINT kFsrSurfaces = 4;
     int gFsrState = 0;   // 0 not tried, 1 ready, -1 unavailable
-
-    bool UpscalingWanted()
-    {
-        static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING", v, sizeof(v)) ? atoi(v) : -1; }();
-        return (forced >= 0 ? forced : Settings().upscaling.load()) == 1 && gResTwelfths < gDisplayTwelfths;
-    }
 
     bool FsrReady()
     {
@@ -1869,19 +1881,413 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
         return up.sharpened.Get();
     }
 
+    // Temporal upscaling: FSR 3.1 through AMD's FSR SDK (amd_fidelityfx_loader_dx12.dll and
+    // amd_fidelityfx_upscaler_dx12.dll beside the executable; on Radeon cards that support it the
+    // same DLL runs FSR 4 instead). It sits where FSR 1 does: the finished scene, render-sized, on
+    // its way into the 2D pass. The game gives it none of what such an upscaler needs, so:
+    //  - jitter: see gTemporalOn above (applied at the end of the translated vertex shaders);
+    //  - depth: the game's own full-size depth copy of the frame (gSceneDepthBase);
+    //  - motion vectors: computed here from that depth and the camera of this frame and the last,
+    //    so they describe the camera's movement only. Things that move by themselves (characters,
+    //    particles) have no vectors of their own yet and can leave trails.
+    // The colour it gets is the tone-mapped picture after the game's post-processing (declared as
+    // non-linear), not the scene before it as the SDK would prefer.
+    struct TemporalState
+    {
+        HMODULE library = nullptr;
+        PfnFfxCreateContext create = nullptr;
+        PfnFfxDestroyContext destroy = nullptr;
+        PfnFfxQuery query = nullptr;
+        PfnFfxDispatch dispatch = nullptr;
+        int state = 0;   // 0 not tried, 1 loaded, -1 unavailable
+        ffxContext context = nullptr;
+        uint32_t renderWidth = 0, renderHeight = 0, outWidth = 0, outHeight = 0;
+        ComPtr<ID3D12Resource> motion, output;
+        D3D12_RESOURCE_STATES outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ComPtr<ID3D12PipelineState> motionPipeline;
+        ComPtr<ID3D12DescriptorHeap> rtvHeap;
+        uint32_t base = 0;
+        ID3D12Resource* source = nullptr;
+        uint64_t version = 0;
+        bool history = false;   // the upscaler has seen the frame before this one
+        uint32_t jitterIndex = 0;
+        uint64_t frame = ~0ull;   // the frame it last ran in
+    } gTemporal;
+
+    void TemporalMessage(uint32_t type, const wchar_t* message)
+    {
+        static int logged = 0;
+        if (logged++ < 20) Log("[fsr3] %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
+    }
+
+    bool TemporalLoaded()
+    {
+        if (gTemporal.state) return gTemporal.state > 0;
+        gTemporal.state = -1;
+        gTemporal.library = LoadLibraryA("amd_fidelityfx_loader_dx12.dll");
+        if (!gTemporal.library)
+        {
+            Log("[fsr3] amd_fidelityfx_loader_dx12.dll not found beside the executable (tools/get_fsr_sdk.ps1): FSR 3.1 falls back to FSR 1\n");
+            return false;
+        }
+        gTemporal.create = (PfnFfxCreateContext)GetProcAddress(gTemporal.library, "ffxCreateContext");
+        gTemporal.destroy = (PfnFfxDestroyContext)GetProcAddress(gTemporal.library, "ffxDestroyContext");
+        gTemporal.query = (PfnFfxQuery)GetProcAddress(gTemporal.library, "ffxQuery");
+        gTemporal.dispatch = (PfnFfxDispatch)GetProcAddress(gTemporal.library, "ffxDispatch");
+        if (!gTemporal.create || !gTemporal.destroy || !gTemporal.query || !gTemporal.dispatch)
+        {
+            Log("[fsr3] the FSR loader DLL lacks the expected functions\n");
+            return false;
+        }
+        const char kMotionShader[] = R"(
+cbuffer Motion : register(b1) { row_major float4x4 reproject; float4 texelAndJitter; };
+Texture2D<float4> depthTexture : register(t0, space1);
+float4 VSMain(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+// Where this pixel's surface was on screen a frame ago, given only how the camera moved: the pixel
+// is taken back to the world with this frame's camera and projected with the last one's. The result
+// is the offset to the previous position, in screen fractions.
+float2 PSMain(float4 position : SV_Position) : SV_Target
+{
+    float depth = depthTexture.Load(int3(position.xy, 0)).r;
+    float2 uv = position.xy * texelAndJitter.xy;
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0) - texelAndJitter.zw;
+    float4 before = mul(reproject, float4(ndc, depth, 1.0));
+    float2 ndcBefore = before.xy / (abs(before.w) > 1e-6 ? before.w : 1e-6);
+    return float2(ndcBefore.x - ndc.x, ndc.y - ndcBefore.y) * 0.5;
+}
+)";
+        ComPtr<ID3DBlob> vs, ps, errors;
+        if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, "motion", nullptr, nullptr, "VSMain", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &errors)) ||
+            FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, "motion", nullptr, nullptr, "PSMain", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &errors)))
+        {
+            Log("[fsr3] motion vector shader failed to compile: %s\n", errors ? (const char*)errors->GetBufferPointer() : "unknown");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = gDrawRoot.Get();
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gTemporal.motionPipeline)), "motion vector pipeline")) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap.NumDescriptors = 1;
+        if (!Check(gDevice->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&gTemporal.rtvHeap)), "motion vector RTV heap")) return false;
+        gTemporal.state = 1;
+        return true;
+    }
+
+    // 0 off, 1 FSR 1, 2 temporal (FSR 3.1 / 4); only below the display's resolution.
+    int UpscalingMode()
+    {
+        static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING", v, sizeof(v)) ? atoi(v) : -1; }();
+        if (gResTwelfths >= gDisplayTwelfths) return 0;
+        const int mode = forced >= 0 ? forced : Settings().upscaling.load();
+        if (mode == 2 && !TemporalLoaded()) return 1;
+        return mode;
+    }
+
+    float Halton(uint32_t index, uint32_t base)
+    {
+        float f = 1.0f, result = 0.0f;
+        for (uint32_t i = index; i > 0; i /= base) { f /= float(base); result += f * float(i % base); }
+        return result;
+    }
+
+    // Start of a frame's commands: this frame's jitter, the camera of the frame before, and this
+    // frame's camera: the perspective view-projection matrix (vertex constants c5-c8, by rows: a
+    // unit w row, and a z row differing from it only in the last term) that the most depth-tested
+    // draws outside the shadow and 2D passes carry. Objects with their own combined matrix in
+    // those registers pass the same test, so the first one found would not do.
+    void TemporalBeginFrame(const RendererFrame& frame, const std::vector<std::pair<size_t, size_t>>& shadowPasses, size_t flatStart)
+    {
+        gTemporalOn = UpscalingMode() == 2;
+        if (gCameraNowValid) memcpy(gCameraBefore, gCameraNow, sizeof(gCameraBefore));
+        gCameraBeforeValid = gCameraNowValid;
+        gCameraNowValid = false;
+        gSceneDepthBase = 0;
+        if (UpscalingMode() == 2)
+        {
+            std::unordered_map<uint64_t, std::pair<uint32_t, const float*>> votes;
+            size_t pass = 0;
+            for (size_t i = 0; i < frame.commands.size() && i < flatStart; i++)
+            {
+                while (pass < shadowPasses.size() && i > shadowPasses[pass].second) pass++;
+                if (pass < shadowPasses.size() && i >= shadowPasses[pass].first) continue;
+                const RendererDraw* draw = std::get_if<RendererDraw>(&frame.commands[i]);
+                if (!draw || !draw->hasColor || !draw->depthBound || !(draw->depthControl & 2)) continue;
+                const float* c = draw->constants.data() + 5 * 4;
+                const float wLength = std::sqrt(c[12] * c[12] + c[13] * c[13] + c[14] * c[14]);
+                const float apart = std::fabs(c[8] - c[12]) + std::fabs(c[9] - c[13]) + std::fabs(c[10] - c[14]);
+                if (std::fabs(wLength - 1.0f) > 0.02f || apart > 0.02f) continue;
+                auto& vote = votes[XXH3_64bits(c, 64)];
+                vote.first++;
+                vote.second = c;
+            }
+            const float* best = nullptr;
+            uint32_t most = 0;
+            for (const auto& [hash, vote] : votes) if (vote.first > most) { most = vote.first; best = vote.second; }
+            if (best && most >= 3)
+            {
+                for (int i = 0; i < 16; i++) gCameraNow[i] = best[i];
+                gCameraNowValid = true;
+            }
+        }
+        gJitterPixels[0] = gJitterPixels[1] = gJitterNdc[0] = gJitterNdc[1] = 0.0f;
+        if (!gTemporalOn) { gTemporal.history = false; return; }
+        // The sequence FSR recommends: Halton(2, 3), 8 phases times the area ratio.
+        const float ratio = float(gDisplayTwelfths) / float(gResTwelfths);
+        const uint32_t phases = std::max(1u, uint32_t(8.0f * ratio * ratio + 0.5f));
+        const uint32_t index = (gTemporal.jitterIndex++ % phases) + 1;
+        gJitterPixels[0] = Halton(index, 2) - 0.5f;
+        gJitterPixels[1] = Halton(index, 3) - 0.5f;
+        // NIER_JITTER_SCALE=<x>[,<y>] multiplies the offset drawn with (not the one reported to the
+        // upscaler): large values make the jitter visible, -1 flips an axis (debugging).
+        static const std::pair<float, float> scale = [] {
+            char v[32];
+            float x = 1.0f, y = 1.0f;
+            if (GetEnvironmentVariableA("NIER_JITTER_SCALE", v, sizeof(v)) && sscanf(v, "%f,%f", &x, &y) == 1) y = x;
+            return std::make_pair(x, y);
+        }();
+        gJitterNdc[0] = 2.0f * gJitterPixels[0] * scale.first / float(Scaled(1280));
+        gJitterNdc[1] = -2.0f * gJitterPixels[1] * scale.second / float(Scaled(720));
+    }
+
+    bool Invert4x4(const double m[16], double out[16])
+    {
+        double a[4][8];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.0 : 0.0);
+        for (int col = 0; col < 4; col++)
+        {
+            int pivot = col;
+            for (int r = col + 1; r < 4; r++) if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) pivot = r;
+            if (std::fabs(a[pivot][col]) < 1e-12) return false;
+            for (int c = 0; c < 8; c++) std::swap(a[col][c], a[pivot][c]);
+            const double scale = 1.0 / a[col][col];
+            for (int c = 0; c < 8; c++) a[col][c] *= scale;
+            for (int r = 0; r < 4; r++)
+                if (r != col)
+                {
+                    const double factor = a[r][col];
+                    for (int c = 0; c < 8; c++) a[r][c] -= factor * a[col][c];
+                }
+        }
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][c + 4];
+        return true;
+    }
+
+    // The display-sized picture the temporal upscaler makes of a render-sized scene surface. Null if
+    // it can't this frame (the caller then uses FSR 1).
+    ID3D12Resource* TemporalUpscaled(uint32_t base, const ResolvedResource& surface)
+    {
+        TemporalState& t = gTemporal;
+        if (!gTemporalOn || !gCameraNowValid || !gSceneDepthBase) return nullptr;
+        static const bool bypass = GetEnvironmentVariableA("NIER_FSR3_BYPASS", nullptr, 0) > 0;   // jittered frames straight to FSR 1 (debugging)
+        if (bypass) return nullptr;
+        if (t.output && t.base == base && t.source == surface.texture.Get() && t.version == surface.version) return t.output.Get();
+        if (t.frame == gExecutingFrame && t.base != base) return nullptr;   // one scene surface a frame
+        auto depthFound = gResolved.find(gSceneDepthBase);
+        if (depthFound == gResolved.end() || !depthFound->second.depth || !depthFound->second.texture) return nullptr;
+        const D3D12_RESOURCE_DESC in = surface.texture->GetDesc(), depthDesc = depthFound->second.texture->GetDesc();
+        if (depthDesc.Width != in.Width || depthDesc.Height != in.Height) return nullptr;
+        const uint32_t renderWidth = uint32_t(in.Width), renderHeight = uint32_t(in.Height);
+        const uint32_t outWidth = (surface.width * gDisplayTwelfths + 6) / 12, outHeight = (surface.height * gDisplayTwelfths + 6) / 12;
+        if (gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return nullptr;
+
+        if (!t.context || t.renderWidth != renderWidth || t.renderHeight != renderHeight || t.outWidth != outWidth || t.outHeight != outHeight)
+        {
+            if (t.context) { WaitForGpu(); t.destroy(&t.context, nullptr); t.context = nullptr; }
+            if (t.motion) gRetired.push_back(std::move(t.motion));
+            if (t.output) gRetired.push_back(std::move(t.output));
+            ffxCreateBackendDX12Desc backend{};
+            backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+            backend.device = gDevice.Get();
+            ffxCreateContextDescUpscale create{};
+            create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+            create.header.pNext = &backend.header;
+            create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+            create.maxRenderSize = { renderWidth, renderHeight };
+            create.maxUpscaleSize = { outWidth, outHeight };
+            create.fpMessage = TemporalMessage;
+            const ffxReturnCode_t code = t.create(&t.context, &create.header, nullptr);
+            if (code != FFX_API_RETURN_OK)
+            {
+                Log("[fsr3] creating the upscaler failed (code %u): falling back to FSR 1\n", code);
+                t.context = nullptr;
+                t.state = -1;
+                return nullptr;
+            }
+            ffxQueryGetProviderVersion provider{};
+            provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+            t.query(&t.context, &provider.header);
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Width = renderWidth;
+            desc.Height = renderHeight;
+            desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, kShaderRead, nullptr, IID_PPV_ARGS(&t.motion)), "motion vector texture")) return nullptr;
+            gDevice->CreateRenderTargetView(t.motion.Get(), nullptr, t.rtvHeap->GetCPUDescriptorHandleForHeapStart());
+            desc.Width = outWidth;
+            desc.Height = outHeight;
+            desc.Format = kTargetFormat;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&t.output)), "upscaler output")) return nullptr;
+            t.outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            t.renderWidth = renderWidth;
+            t.renderHeight = renderHeight;
+            t.outWidth = outWidth;
+            t.outHeight = outHeight;
+            t.history = false;
+            Log("[fsr3] upscaler ready: %s, %ux%u -> %ux%u\n", provider.versionName ? provider.versionName : "unknown version", renderWidth, renderHeight, outWidth, outHeight);
+        }
+
+        // Motion vectors: last frame's camera applied to this frame's positions.
+        double inverse[16], reproject[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+        const bool reprojected = gCameraBeforeValid && Invert4x4(gCameraNow, inverse);
+        if (reprojected)
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                {
+                    double sum = 0;
+                    for (int k = 0; k < 4; k++) sum += gCameraBefore[r * 4 + k] * inverse[k * 4 + c];
+                    reproject[r * 4 + c] = sum;
+                }
+        float constants[20];
+        for (int i = 0; i < 16; i++) constants[i] = float(reproject[i]);
+        constants[16] = 1.0f / float(renderWidth);
+        constants[17] = 1.0f / float(renderHeight);
+        constants[18] = gJitterNdc[0];
+        constants[19] = gJitterNdc[1];
+        {
+            auto toTarget = Transition(t.motion.Get(), kShaderRead, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            gList->ResourceBarrier(1, &toTarget);
+            const UINT slot = gDrawSrvUsed;
+            gDrawSrvUsed += kTextureSlots;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += SIZE_T(slot) * gSrvStep;
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += UINT64(slot) * gSrvStep;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = kDepthCopyFormat;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2D.MipLevels = 1;
+            gDevice->CreateShaderResourceView(depthFound->second.texture.Get(), &view, cpu);
+            ArenaBlock block = ArenaAlloc(sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            memcpy(block.cpu, constants, sizeof(constants));
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = t.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(renderWidth), float(renderHeight), 0.0f, 1.0f };
+            D3D12_RECT scissor{ 0, 0, LONG(renderWidth), LONG(renderHeight) };
+            gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            gList->RSSetViewports(1, &viewport);
+            gList->RSSetScissorRects(1, &scissor);
+            BindDrawRoot();
+            gList->SetPipelineState(t.motionPipeline.Get());
+            gList->SetGraphicsRootConstantBufferView(1, block.gpu);
+            gList->SetGraphicsRootDescriptorTable(3, gpu);
+            gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            gList->DrawInstanced(3, 1, 0, 0);
+            D3D12_RESOURCE_BARRIER barriers[2] = { Transition(t.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), {} };
+            UINT count = 1;
+            if (t.outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) barriers[count++] = Transition(t.output.Get(), t.outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            gList->ResourceBarrier(count, barriers);
+            t.outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+
+        // The camera's near plane and field of view, from the matrix: z = w - near, and the y row's
+        // length is 1 / tan(fov / 2).
+        const double* m = gCameraNow;
+        const double nearPlane = std::max(m[15] - m[11], 1e-3);
+        const double yScale = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+        ffxDispatchDescUpscale dispatch{};
+        dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        dispatch.commandList = gList.Get();
+        dispatch.color = ffxApiGetResourceDX12(surface.texture.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+        dispatch.depth = ffxApiGetResourceDX12(depthFound->second.texture.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+        dispatch.motionVectors = ffxApiGetResourceDX12(t.motion.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+        dispatch.output = ffxApiGetResourceDX12(t.output.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        dispatch.jitterOffset = { gJitterPixels[0], gJitterPixels[1] };
+        dispatch.motionVectorScale = { float(renderWidth), float(renderHeight) };
+        dispatch.renderSize = { renderWidth, renderHeight };
+        dispatch.upscaleSize = { outWidth, outHeight };
+        static const float sharpness = [] { char v[16]; return GetEnvironmentVariableA("NIER_FSR3_SHARPNESS", v, sizeof(v)) ? float(atof(v)) : 0.3f; }();
+        dispatch.enableSharpening = sharpness > 0.0f;
+        dispatch.sharpness = sharpness;
+        dispatch.frameTimeDelta = 1000.0f / 60.0f;
+        dispatch.preExposure = 1.0f;
+        dispatch.reset = !t.history || !reprojected || t.base != base;
+        dispatch.cameraNear = float(nearPlane);
+        dispatch.cameraFar = FLT_MAX;
+        dispatch.cameraFovAngleVertical = float(2.0 * std::atan(1.0 / std::max(yScale, 1e-3)));
+        dispatch.viewSpaceToMetersFactor = 1.0f;
+        dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+        static const bool debugView = GetEnvironmentVariableA("NIER_FSR3_DEBUG", nullptr, 0) > 0;   // the SDK's debug overlay
+        if (debugView) dispatch.flags |= FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
+        {
+            static uint32_t calls = 0, resets = 0;   // how it is going (debugging)
+            resets += dispatch.reset;
+            if (++calls == 1 || (debugView && calls % 300 == 1))
+                Log("[fsr3] f%llu: %u dispatches, %u resets; jitter %.3f %.3f px; near %.3f fov %.1f deg; depth %08X; reprojection %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f\n",
+                    gExecutingFrame, calls, resets, gJitterPixels[0], gJitterPixels[1], dispatch.cameraNear, dispatch.cameraFovAngleVertical * 57.2958f, gSceneDepthBase,
+                    reproject[0], reproject[1], reproject[2], reproject[3], reproject[4], reproject[5], reproject[6], reproject[7]);
+        }
+        const ffxReturnCode_t code = t.dispatch(&t.context, &dispatch.header);
+        // The SDK leaves its own heaps and pipeline on the command list.
+        ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
+        gList->SetDescriptorHeaps(2, heaps);
+        auto toRead = Transition(t.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+        gList->ResourceBarrier(1, &toRead);
+        t.outputState = kShaderRead;
+        if (code != FFX_API_RETURN_OK)
+        {
+            static int failures = 0;
+            if (failures++ < 4) Log("[fsr3] dispatch failed (code %u)\n", code);
+            t.history = false;
+            return nullptr;
+        }
+        t.history = true;
+        t.frame = gExecutingFrame;
+        t.base = base;
+        t.source = surface.texture.Get();
+        t.version = surface.version;
+        return t.output.Get();
+    }
+
     // Before a draw of the 2D pass: the scene-sized resolved surfaces it samples get their upscaled
     // stand-ins (WriteTextureDescriptor binds them).
     void PrepareUpscaledTextures(const RendererDraw& draw)
     {
         gUpscaledNow.clear();
-        if (!UpscalingWanted()) return;
+        const int mode = UpscalingMode();
+        if (!mode) return;
         for (const TextureBinding& binding : draw.textures)
         {
             if (!binding.valid || binding.decoded || binding.resolvedLevelCount || binding.cube) continue;
             auto found = gResolved.find(binding.resolvedBase);
             if (found == gResolved.end() || found->second.depth || !found->second.texture || found->second.twelfths != gResTwelfths) continue;
             if (found->second.width < 1024 || found->second.height < 576) continue;   // the scene, not a small effect buffer
-            if (ID3D12Resource* upscaled = Upscaled(binding.resolvedBase, found->second)) gUpscaledNow[binding.resolvedBase] = upscaled;
+            ID3D12Resource* upscaled = mode == 2 ? TemporalUpscaled(binding.resolvedBase, found->second) : nullptr;
+            if (!upscaled) upscaled = Upscaled(binding.resolvedBase, found->second);
+            if (upscaled) gUpscaledNow[binding.resolvedBase] = upscaled;
         }
     }
 
@@ -1900,17 +2306,21 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
         bool flatBegun = false, drawnThisFrame = false;
         const std::vector<std::pair<size_t, size_t>> shadowPasses = ShadowPasses(frame);
         size_t shadowPass = 0;
+        TemporalBeginFrame(frame, shadowPasses, flatStart);
         for (size_t index = 0; index < frame.commands.size(); index++)
         {
             const auto& command = frame.commands[index];
             gActiveTwelfths = gResTwelfths;
+            gInShadowPass = gInFlatPass = false;
             while (shadowPass < shadowPasses.size() && index > shadowPasses[shadowPass].second) shadowPass++;
             if (shadowPass < shadowPasses.size() && index >= shadowPasses[shadowPass].first)
             {
                 // A shadow map pass: its own scale, nothing else applies.
                 gActiveTwelfths = gShadowTwelfths;
+                gInShadowPass = true;
                 if (auto* draw = std::get_if<RendererDraw>(&command)) ExecuteDraw(*draw);
                 else ExecuteResolve(std::get<RendererResolve>(command));
+                gInShadowPass = false;
                 continue;
             }
             if (auto* draw = std::get_if<RendererDraw>(&command))
@@ -1920,6 +2330,7 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
                 {
                     if (!flatBegun) { BeginFlatPhase(flatTarget, drawnThisFrame); flatBegun = true; }
                     gActiveTwelfths = gDisplayTwelfths;
+                    gInFlatPass = true;
                     PrepareUpscaledTextures(*draw);
                 }
                 else if (onTarget) drawnThisFrame = true;

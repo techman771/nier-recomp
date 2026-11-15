@@ -16,6 +16,7 @@ $common = "/nologo /c /std:c++20 /MT /arch:AVX -msse4.1 -fno-strict-aliasing -Wn
 $lib = '../../tools/build'
 $sdl = '../../tools/SDL3'   # tools/get_sdl3.ps1 fetches it; SDL3.dll is copied beside nier.exe below
 if (-not (Test-Path (Join-Path $PSScriptRoot 'SDL3\include\SDL3\SDL.h'))) { & (Join-Path $PSScriptRoot 'get_sdl3.ps1') }
+if (-not (Test-Path (Join-Path $PSScriptRoot 'FidelityFX/sdk/upscalers/include/ffx_upscale.h'))) { & (Join-Path $PSScriptRoot 'get_fsr_sdk.ps1') | Out-Null }
 $libs = "$sdl/lib/x64/SDL3.lib $lib/XenonUtils/XenonUtils.lib $lib/thirdparty/disasm/disasm.lib $lib/thirdparty/fmt/fmt.lib $lib/thirdparty/xxHash/cmake_unofficial/xxhash.lib"
 $ninja = @(
     "rule cxx",
@@ -23,7 +24,7 @@ $ninja = @(
     "  description = `$in",
     "",
     "rule rt",
-    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$sdl/include -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
+    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$sdl/include -I../../tools/FidelityFX/sdk -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
     "  description = `$in",
     "",
     "rule link",
@@ -48,6 +49,11 @@ Copy-Item (Join-Path $PSScriptRoot 'SDL3/lib/x64/SDL3.dll') $build -Force
 if (-not (Test-Path (Join-Path $PSScriptRoot 'FidelityFX/fsr1/ffx_fsr1.h'))) { & (Join-Path $PSScriptRoot 'get_fsr1.ps1') | Out-Null }
 New-Item -ItemType Directory -Force (Join-Path $build 'fsr1') | Out-Null
 Copy-Item (Join-Path $PSScriptRoot 'FidelityFX/fsr1/*') (Join-Path $build 'fsr1') -Force
+# AMD's FSR SDK DLLs (the Upscaling setting's FSR 3.1); copied when missing or changed, they are large.
+foreach ($dll in 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll') {
+    $from = Join-Path $PSScriptRoot "FidelityFX/sdk/signedbin/$dll"; $to = Join-Path $build $dll
+    if ((Test-Path $from) -and (-not (Test-Path $to) -or (Get-Item $from).Length -ne (Get-Item $to).Length)) { Copy-Item $from $to -Force }
+}
 # Button glyph atlases (PlayStation, Xbox Series, keyboard), drawn by make_glyphs.ps1.
 $glyphScript = Join-Path $PSScriptRoot 'make_glyphs.ps1'
 $glyphOut = Join-Path $build 'glyphs\xbox.rgba'

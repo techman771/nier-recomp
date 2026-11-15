@@ -18,7 +18,7 @@ cbuffer System : register(b1)
     float4 texScale[32];
     uint4 boolConstants[2];
     uint4 texSign[8];
-    float4 systemExtra;   // x: guest pixels for each host pixel (1 / resolution scale)
+    float4 systemExtra;   // x: guest pixels for each host pixel (1 / resolution scale); yz: sub-pixel jitter in NDC (temporal upscaling)
 };
 ByteAddressBuffer vb : register(t16);
 SamplerState samplers[50] : register(s0);
@@ -641,6 +641,9 @@ float3 CubeDirection(float3 c)
     {
         output.position = oPos;
     }
+    // Temporal upscaling's sub-pixel jitter, for perspective geometry only: full-screen passes (w is
+    // exactly 1) can be depth-tested too, and shifting them slides their picture against the scene.
+    if (output.position.w != 1.0) output.position.xy += systemExtra.yz * output.position.w;
     for (int i_ = 0; i_ < 16; i_++) output.t[i_] = oT[i_];
     return output;
 }

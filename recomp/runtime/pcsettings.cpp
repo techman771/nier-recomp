@@ -57,7 +57,7 @@ namespace
             { "vsync", &gSettings.vsync, 0, 1 },
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
-            { "upscaling", &gSettings.upscaling, 0, 1 },
+            { "upscaling", &gSettings.upscaling, 0, 2 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
             { "mute_in_background", &gSettings.muteInBackground, 0, 1 },
             { "mouse_sensitivity", &gSettings.mouseSensitivity, 0, 10 },
@@ -80,7 +80,7 @@ namespace
         T_Icons, T_IconsHelp, T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal,
         T_Resolution, T_ResolutionHelp, T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880,
         T_Shadows, T_ShadowsHelp, T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra,
-        T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1,
+        T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
@@ -106,8 +106,8 @@ namespace
         "640 x 360", "854 x 480", "960 x 540", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3200 x 1800", "3840 x 2160", "5120 x 2880",
         "Shadow Quality", "Choose how detailed shadows are.\nOriginal is the game's own, with blocky edges.",
         "Original", "High", "Very High", "Ultra",
-        "Upscaling", "Choose how a resolution below the screen's is enlarged.\nFSR 1 keeps edges sharper than Off.",
-        "Off", "FSR 1",
+        "Upscaling", "Choose how a resolution below the screen's is enlarged.\nFSR 3.1 rebuilds detail over several frames.",
+        "Off", "FSR 1", "FSR 3.1",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -152,7 +152,7 @@ namespace
         { 61, 2, &gSettings.frameRate60, 1, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps } },
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
-        { 69, 4, &gSettings.upscaling, 1, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1 } },
+        { 69, 4, &gSettings.upscaling, 2, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3 } },
         { 68, 4, &gSettings.shadowQuality, 3, T_Shadows, T_ShadowsHelp, { T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },
