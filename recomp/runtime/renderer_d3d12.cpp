@@ -382,6 +382,19 @@ float PSMain(float4 position : SV_Position) : SV_Target
     double gCameraNow[16] = {}, gCameraBefore[16] = {};
     bool gCameraNowValid = false, gCameraBeforeValid = false;
     uint32_t gSceneDepthBase = 0;   // the frame's latest full-size depth copy (a resolved surface)
+    // Scene draws whose vertex shader reads textures (skinning: the bone matrices), noted by
+    // ExecuteDraw for the motion vector pass (ObjectMotion), with what it bound for them.
+    struct SkinnedDraw
+    {
+        const RendererDraw* draw = nullptr;
+        uint64_t key = 0;   // identifies the same draw in the next frame
+        D3D12_GPU_VIRTUAL_ADDRESS system = 0, vertices = 0;
+        D3D12_INDEX_BUFFER_VIEW indices{};
+        D3D12_VIEWPORT viewport{};
+        D3D12_RECT scissor{};
+    };
+    std::vector<SkinnedDraw> gSkinnedDraws;
+    const std::vector<int>* VertexTextureSlots(const GuestShader& vs);
     struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
     std::unordered_map<uint64_t, DecodedResource> gDecoded;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
@@ -957,7 +970,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
     }
 
-    ID3D12Resource* GetDecoded(const DecodedTexture& decoded)
+    ID3D12Resource* GetDecoded(const DecodedTexture& decoded, std::unordered_map<uint64_t, DecodedResource>& cache = gDecoded)
     {
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -971,8 +984,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         // One host texture per guest texture; new contents are uploaded into it, in command order,
         // so earlier draws in the frame still see the old contents.
         ComPtr<ID3D12Resource> texture;
-        auto found = gDecoded.find(decoded.key);
-        if (found != gDecoded.end())
+        auto found = cache.find(decoded.key);
+        if (found != cache.end())
         {
             if (found->second.contentHash == decoded.contentHash) return found->second.texture.Get();
             const D3D12_RESOURCE_DESC existing = found->second.texture->GetDesc();
@@ -1017,7 +1030,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
         auto barrier = Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
         gList->ResourceBarrier(1, &barrier);
-        gDecoded[decoded.key] = { texture, decoded.contentHash };
+        cache[decoded.key] = { texture, decoded.contentHash };
         return texture.Get();
     }
 
@@ -1263,6 +1276,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gList->SetGraphicsRootShaderResourceView(2, vertices.gpu);
         gList->SetGraphicsRootDescriptorTable(3, gpu);
         gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        D3D12_INDEX_BUFFER_VIEW lastIndexView{};
         if (draw.indices.empty())
         {
             gList->DrawInstanced(draw.vertexCount, 1, 0, 0);
@@ -1274,8 +1288,27 @@ float PSMain(float4 position : SV_Position) : SV_Target
             D3D12_INDEX_BUFFER_VIEW view{ indices.gpu, UINT(draw.indices.size() * 4), DXGI_FORMAT_R32_UINT };
             gList->IASetIndexBuffer(&view);
             gList->DrawIndexedInstanced(UINT(draw.indices.size()), 1, 0, 0, 0);
+            lastIndexView = view;
         }
         gDrawsExecuted++;
+        // For the per-object motion vectors: opaque scene geometry drawn with a skinning shader.
+        if (gTemporalOn && !gInShadowPass && !gInFlatPass && draw.depthBound && (draw.depthControl & 2) && (draw.depthControl & 4) && draw.hasColor && !draw.rectList && !draw.indices.empty())
+        {
+            const std::vector<int>* slots = VertexTextureSlots(*draw.vs);
+            if (slots && !slots->empty())
+            {
+                SkinnedDraw record;
+                record.draw = &draw;
+                const uint64_t identity[5] = { draw.vs->hash, draw.ps->hash, draw.vertexCount, draw.indices.size(), draw.vertexData.size() };
+                record.key = XXH3_64bits(identity, sizeof(identity));
+                record.system = system.gpu;
+                record.vertices = vertices.gpu;
+                record.indices = lastIndexView;
+                record.viewport = viewport;
+                record.scissor = scissor;
+                gSkinnedDraws.push_back(record);
+            }
+        }
     }
 
     // Clears requested alongside a copy happen after it. RB_COLOR_CLEAR is read as 0xAARRGGBB and
@@ -1892,6 +1925,248 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
     //    particles) have no vectors of their own yet and can leave trails.
     // The colour it gets is the tone-mapped picture after the game's post-processing (declared as
     // non-linear), not the scene before it as the SDK would prefer.
+    // Per-object motion vectors for skinned geometry (characters, enemies, cloth). The camera-only
+    // vectors treat everything as standing still in the world, so anything animated left trails in
+    // the temporal upscaler. A skinning vertex shader takes its bone matrices from a texture and
+    // its camera from constants: run with last frame's texture and constants it gives where the
+    // same vertex was a frame ago. So each such shader gets a second form whose body exists twice,
+    // once reading this frame's inputs and once last frame's (the constants as cP[], each texture
+    // tN as tPN in slot (N + 16) % 32), and which hands both clip positions to a pixel shader
+    // that writes their difference. Those draws are repeated into the motion vector texture after
+    // the camera pass, kept only where they are the visible surface (compared with the frame's
+    // depth copy, in slot 31). A draw is paired with last frame's by its shaders and sizes and
+    // its order among equals. NIER_NO_OBJECT_MOTION=1 turns this off.
+    struct MotionVariant
+    {
+        std::vector<int> slots;        // texture slots the vertex shader reads
+        bool usable = false, tried = false;
+        ComPtr<ID3DBlob> blob;
+        std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> pipelines;   // by cull state
+    };
+    std::unordered_map<uint64_t, MotionVariant> gMotionVariants;
+    ComPtr<ID3DBlob> gObjectMotionPixel;
+    struct PreviousDraw
+    {
+        std::array<float, 2048> constants;
+        std::vector<std::pair<int, std::shared_ptr<DecodedTexture>>> textures;
+    };
+    std::unordered_map<uint64_t, PreviousDraw> gPreviousDraws;   // by key and order among equals
+    std::unordered_map<uint64_t, DecodedResource> gDecodedBefore;   // host textures holding last frame's contents
+
+    MotionVariant& VariantFor(const GuestShader& vs)
+    {
+        MotionVariant& variant = gMotionVariants[vs.hash];
+        if (variant.tried) return variant;
+        variant.tried = true;
+        const std::string& hlsl = vs.hlsl;
+        if (hlsl.find("TextureCube") != std::string::npos) return variant;
+        for (size_t at = 0; (at = hlsl.find("Texture2D<float4> t", at)) != std::string::npos; at++)
+        {
+            const int slot = atoi(hlsl.c_str() + at + 19);
+            if (hlsl.compare(at + 19, 1, "0") >= 0 && hlsl.compare(at + 19, 1, "9") <= 0) variant.slots.push_back(slot);
+        }
+        return variant;
+    }
+
+    const std::vector<int>* VertexTextureSlots(const GuestShader& vs) { return &VariantFor(vs).slots; }
+
+    // Compiles the two-bodied form of a skinning vertex shader (once; false if it can't be made).
+    bool PrepareVariant(const GuestShader& vs, MotionVariant& variant)
+    {
+        if (variant.blob) return true;
+        if (variant.usable || variant.slots.empty()) return false;   // usable is set only on the first attempt
+        variant.usable = true;
+        const std::string& hlsl = vs.hlsl;
+        const std::string mainStart = "Interpolated main(uint vertexId : SV_VertexID)";
+        const std::string constants = "cbuffer Constants : register(b0) { float4 c[512]; };";
+        const size_t mainAt = hlsl.find(mainStart), constantsAt = hlsl.find(constants);
+        if (mainAt == std::string::npos || constantsAt == std::string::npos) return false;
+        for (int slot : variant.slots)
+            for (int other : variant.slots)
+                if ((slot + 16) % 32 == other || slot == 31 || (slot + 16) % 32 == 31) return false;   // no free slot for last frame's copy
+        std::string head = hlsl.substr(0, mainAt);
+        head.replace(constantsAt, constants.size(), "cbuffer Constants : register(b0) { float4 c[512]; float4 cP[512]; };");
+        for (int slot : variant.slots)
+            head += "Texture2D<float4> tP" + std::to_string(slot) + " : register(t" + std::to_string((slot + 16) % 32) + ", space1);\n";
+        const std::string body = hlsl.substr(mainAt);
+        std::string now = body, before = body;
+        now.replace(0, mainStart.size(), "Interpolated BodyNow_(uint vertexId)");
+        before.replace(0, mainStart.size(), "Interpolated BodyBefore_(uint vertexId)");
+        auto replaceAll = [](std::string& text, const std::string& from, const std::string& to) {
+            for (size_t at = 0; (at = text.find(from, at)) != std::string::npos; at += to.size())
+            {
+                const bool wordStart = at == 0 || !(isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_');
+                if (wordStart) text.replace(at, from.size(), to);
+                else { at += from.size(); at -= to.size(); }
+            }
+        };
+        replaceAll(before, "c[", "cP[");
+        for (int slot : variant.slots) replaceAll(before, "t" + std::to_string(slot) + ".", "tP" + std::to_string(slot) + ".");
+        const std::string source = head + now + before + R"(
+struct MotionOut { float4 position : SV_Position; float4 now : TEXCOORD0; float4 before : TEXCOORD1; };
+MotionOut main(uint vertexId : SV_VertexID)
+{
+    Interpolated a = BodyNow_(vertexId), b = BodyBefore_(vertexId);
+    MotionOut output;
+    output.position = a.position;
+    output.now = a.position;
+    output.before = b.position;
+    return output;
+}
+)";
+        ComPtr<ID3DBlob> errors;
+        if (FAILED(D3DCompile(source.data(), source.size(), "motion variant", nullptr, nullptr, "main", "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION, 0, &variant.blob, &errors)))
+        {
+            Log("[fsr3] motion form of vertex shader %016llX failed to compile: %s\n", vs.hash, errors ? (const char*)errors->GetBufferPointer() : "unknown");
+            variant.blob.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    ID3D12PipelineState* VariantPipeline(MotionVariant& variant, const RendererDraw& draw)
+    {
+        const uint32_t state = uint32_t(draw.cull) | (draw.frontCounterClockwise ? 4u : 0u);
+        auto found = variant.pipelines.find(state);
+        if (found != variant.pipelines.end()) return found->second.Get();
+        if (!gObjectMotionPixel)
+        {
+            const char kPixel[] = R"(
+Texture2D<float4> depthTexture : register(t31, space1);
+struct MotionOut { float4 position : SV_Position; float4 now : TEXCOORD0; float4 before : TEXCOORD1; };
+float2 main(MotionOut input) : SV_Target
+{
+    // Only the visible surface: the frame's depth copy holds it (depth runs 0 near to 1 far, and
+    // 1 - depth shrinks with distance, so the allowance is a share of that).
+    float depth = depthTexture.Load(int3(input.position.xy, 0)).r;
+    if (input.position.z > depth + (1.0 - depth) * 0.02 + 1e-6) discard;
+    float2 a = input.now.xy / input.now.w, b = input.before.xy / input.before.w;
+    return float2(b.x - a.x, a.y - b.y) * 0.5;
+}
+)";
+            ComPtr<ID3DBlob> errors;
+            if (FAILED(D3DCompile(kPixel, sizeof(kPixel) - 1, "object motion", nullptr, nullptr, "main", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &gObjectMotionPixel, &errors)))
+            {
+                Log("[fsr3] object motion pixel shader failed to compile: %s\n", errors ? (const char*)errors->GetBufferPointer() : "unknown");
+                return nullptr;
+            }
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = gDrawRoot.Get();
+        desc.VS = { variant.blob->GetBufferPointer(), variant.blob->GetBufferSize() };
+        desc.PS = { gObjectMotionPixel->GetBufferPointer(), gObjectMotionPixel->GetBufferSize() };
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        ComPtr<ID3D12PipelineState> pipeline;
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "object motion pipeline")) return nullptr;
+        return (variant.pipelines[state] = pipeline).Get();
+    }
+
+    // The frame's skinned draws again, into the motion vector texture (bound as the render target
+    // by the caller, with `rtv`), each with last frame's inputs beside this frame's.
+    void ObjectMotion(D3D12_CPU_DESCRIPTOR_HANDLE rtv, ID3D12Resource* depthCopy)
+    {
+        static const bool off = GetEnvironmentVariableA("NIER_NO_OBJECT_MOTION", nullptr, 0) > 0;
+        if (off || gSkinnedDraws.empty()) return;
+        std::unordered_map<uint64_t, uint32_t> order;
+        uint32_t drawn = 0;
+        for (const SkinnedDraw& record : gSkinnedDraws)
+        {
+            const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
+            auto before = gPreviousDraws.find(key);
+            if (before == gPreviousDraws.end()) continue;
+            const RendererDraw& draw = *record.draw;
+            MotionVariant& variant = VariantFor(*draw.vs);
+            if (!PrepareVariant(*draw.vs, variant)) continue;
+            ID3D12PipelineState* pipeline = VariantPipeline(variant, draw);
+            if (!pipeline || gDrawSrvUsed + kTextureSlots > kDrawDescriptors) continue;
+
+            // Textures first (uploads change the command list's state): this frame's contents in the
+            // usual host texture, last frame's in its twin.
+            ID3D12Resource* textures[kTextureSlots] = {};
+            DXGI_FORMAT formats[kTextureSlots] = {};
+            bool complete = true;
+            for (int slot : variant.slots)
+            {
+                const TextureBinding& binding = draw.textures[slot];
+                std::shared_ptr<DecodedTexture> old;
+                for (const auto& [oldSlot, texture] : before->second.textures) if (oldSlot == slot) old = texture;
+                if (!binding.valid || !binding.decoded || !old || old->width != binding.decoded->width || old->height != binding.decoded->height || old->format != binding.decoded->format) { complete = false; break; }
+                textures[slot] = GetDecoded(*binding.decoded);
+                textures[(slot + 16) % 32] = GetDecoded(*old, gDecodedBefore);
+                formats[slot] = formats[(slot + 16) % 32] = DecodedFormat(binding.decoded->format);
+                if (!textures[slot] || !textures[(slot + 16) % 32]) { complete = false; break; }
+            }
+            if (!complete) continue;
+
+            const UINT first = gDrawSrvUsed;
+            gDrawSrvUsed += kTextureSlots;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += SIZE_T(first) * gSrvStep;
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += UINT64(first) * gSrvStep;
+            for (UINT slot = 0; slot < kTextureSlots; slot++)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                view.Texture2D.MipLevels = 1;
+                ID3D12Resource* resource = slot == 31 ? depthCopy : textures[slot];
+                view.Format = slot == 31 ? kDepthCopyFormat : resource ? formats[slot] : DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (resource && slot != 31)
+                {
+                    // As the draw itself views it (component order).
+                    const bool own = std::find(variant.slots.begin(), variant.slots.end(), int(slot)) != variant.slots.end();
+                    const TextureBinding& binding = draw.textures[own ? slot : (slot + 16) % 32];   // last frame's copy sits 16 slots on
+                    view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(binding.swizzle[0], binding.swizzle[1], binding.swizzle[2], binding.swizzle[3]);
+                }
+                gDevice->CreateShaderResourceView(resource, &view, cpu);
+                cpu.ptr += gSrvStep;
+            }
+            ArenaBlock constants = ArenaAlloc(2 * 8192, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            memcpy(constants.cpu, draw.constants.data(), 8192);
+            memcpy(constants.cpu + 8192, before->second.constants.data(), 8192);
+            gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            gList->RSSetViewports(1, &record.viewport);
+            gList->RSSetScissorRects(1, &record.scissor);
+            BindDrawRoot();
+            gList->SetPipelineState(pipeline);
+            gList->SetGraphicsRootConstantBufferView(0, constants.gpu);
+            gList->SetGraphicsRootConstantBufferView(1, record.system);
+            gList->SetGraphicsRootShaderResourceView(2, record.vertices);
+            gList->SetGraphicsRootDescriptorTable(3, gpu);
+            gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            gList->IASetIndexBuffer(&record.indices);
+            gList->DrawIndexedInstanced(record.indices.SizeInBytes / 4, 1, 0, 0, 0);
+            drawn++;
+        }
+        static uint32_t frames = 0;
+        if (frames++ % 600 == 0) Log("[fsr3] object motion: %u of %zu skinned draws paired with last frame's\n", drawn, gSkinnedDraws.size());
+    }
+
+    // End of a frame's commands: what the next frame's object motion needs of this one.
+    void RememberSkinnedDraws()
+    {
+        gPreviousDraws.clear();
+        std::unordered_map<uint64_t, uint32_t> order;
+        for (const SkinnedDraw& record : gSkinnedDraws)
+        {
+            const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
+            PreviousDraw& kept = gPreviousDraws[key];
+            kept.constants = record.draw->constants;
+            for (int slot : *VertexTextureSlots(*record.draw->vs))
+                if (record.draw->textures[slot].valid && record.draw->textures[slot].decoded) kept.textures.emplace_back(slot, record.draw->textures[slot].decoded);
+        }
+        gSkinnedDraws.clear();
+    }
+
     struct TemporalState
     {
         HMODULE library = nullptr;
@@ -2206,6 +2481,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             gList->SetGraphicsRootDescriptorTable(3, gpu);
             gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             gList->DrawInstanced(3, 1, 0, 0);
+            ObjectMotion(rtv, depthFound->second.texture.Get());   // skinned geometry: its own movement on top
             D3D12_RESOURCE_BARRIER barriers[2] = { Transition(t.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), {} };
             UINT count = 1;
             if (t.outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) barriers[count++] = Transition(t.output.Get(), t.outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2365,6 +2641,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             }
         }
         gActiveTwelfths = gResTwelfths;
+        gInShadowPass = gInFlatPass = false;
+        RememberSkinnedDraws();
     }
 
     // Shows the scanout surface in the back buffer. It's in render target channel order, so no swap.

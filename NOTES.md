@@ -454,7 +454,25 @@ NIER_UPSCALING=<0|1> overrides): what happens when the render resolution is belo
   - Debugging: NIER_FSR3_DEBUG=1 (the SDK's debug overlay, and a log line every 300 frames),
     NIER_FSR3_BYPASS=1 (jittered frames straight to FSR 1), NIER_JITTER_SCALE=<x>[,<y>]
     (scales the drawn jitter only; large values shake the window, so not on a visible run).
-  - Not done: motion vectors for moving and skinned objects; upscaling before the game's
+  - Per-object motion vectors for skinned geometry (`ObjectMotion`, after the camera pass, into
+    the same texture; NIER_NO_OBJECT_MOTION=1 turns it off; awaiting the user's playtest).
+    Skinning vertex shaders read their bone matrices from a texture (t16, one row) and the
+    shared camera from c5-c8, so the bones are in world space. `ExecuteDraw` notes each opaque
+    scene draw whose vertex shader declares textures (`gSkinnedDraws`, with the arena blocks
+    it used); at the end of the frame its constants and those textures are kept
+    (`RememberSkinnedDraws`), keyed by shaders, vertex/index counts and order among equals. The
+    next frame, each paired draw is repeated with a second form of its vertex shader
+    (`PrepareVariant`: the translated main body twice, the copy reading `cP[]` and `tPN` in
+    slot (N+16)%32, i.e. last frame's inputs) and a pixel shader that writes the difference of
+    the two clip positions where the fragment is the visible surface (depth copy in slot 31,
+    2% of 1 - depth allowed). Last frame's texture contents live in their own host textures
+    (`gDecodedBefore`). Game 3: 7 of 7 skinned draws paired; at 360p -> 720p the running
+    character keeps its shape where the camera-only vectors left it speckled and dissolving.
+    Limits: the second shader form compiles on the render thread the first time a skinning
+    shader is seen (a hitch); two identical enemies that swap draw order get each other's
+    history for a frame; rigid moving objects (their own matrix in constants) and particles
+    still have camera-only vectors.
+  - Not done: motion vectors for rigid moving objects and particles; upscaling before the game's
     post-processing; use at native resolution (anti-aliasing only); the half-size and particle
     passes are jittered by the same rule but weren't checked separately. The vertex shader
     change gives every vertex shader new HLSL, so the DXBC cache refills once.
