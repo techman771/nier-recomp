@@ -44,6 +44,10 @@ Set-Content -Encoding ascii (Join-Path $build 'build.ninja') $ninja
 ninja -C $build -k 0
 $result = $LASTEXITCODE
 Copy-Item (Join-Path $PSScriptRoot 'SDL3/lib/x64/SDL3.dll') $build -Force
+# AMD's FSR 1 shader headers (the Upscaling setting compiles its passes from them at runtime).
+if (-not (Test-Path (Join-Path $PSScriptRoot 'FidelityFX/fsr1/ffx_fsr1.h'))) { & (Join-Path $PSScriptRoot 'get_fsr1.ps1') | Out-Null }
+New-Item -ItemType Directory -Force (Join-Path $build 'fsr1') | Out-Null
+Copy-Item (Join-Path $PSScriptRoot 'FidelityFX/fsr1/*') (Join-Path $build 'fsr1') -Force
 # Button glyph atlases (PlayStation, Xbox Series, keyboard), drawn by make_glyphs.ps1.
 $glyphScript = Join-Path $PSScriptRoot 'make_glyphs.ps1'
 $glyphOut = Join-Path $build 'glyphs\xbox.rgba'

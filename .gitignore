@@ -36,6 +36,7 @@
 /recomp/build/settings.ini
 /dlc/
 /tools/SDL3/
+/tools/FidelityFX/
 
 # Recorded controller input for test runs (run_boot.ps1 -Record)
 /recomp/recordings/

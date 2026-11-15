@@ -369,6 +369,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ComPtr<ID3D12DescriptorHeap> gDepthDsvHeap;
     UINT gDepthDsvStep = 0, gDepthsCreated = 0;
     std::unordered_map<uint32_t, ResolvedResource> gResolved;
+    std::unordered_map<uint32_t, ID3D12Resource*> gUpscaledNow;   // FSR 1 stand-ins for resolved surfaces, valid for the draw being set up
     struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
     std::unordered_map<uint64_t, DecodedResource> gDecoded;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
@@ -1100,6 +1101,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (found != gResolved.end())
             {
                 resource = found->second.texture.Get();
+                if (!gUpscaledNow.empty())   // FSR 1: the display-sized, sharpened stand-in
+                {
+                    auto upscaled = gUpscaledNow.find(binding.resolvedBase);
+                    if (upscaled != gUpscaledNow.end()) resource = upscaled->second;
+                }
                 swap = found->second.swapRedBlue;
                 depthCopy = found->second.depth;
                 if (depthCopy) format = kDepthCopyFormat;
@@ -1625,6 +1631,260 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gList->DrawInstanced(3, 1, 0, 0);
     }
 
+    // FSR 1 (PC Settings > Upscaling): AMD's spatial upscaler, for a render resolution below the
+    // display's. The frame's closing 2D pass (FindFlatPhase) draws at display size, and its first
+    // draws sample the finished scene from a render-sized resolved surface: plain bilinear filtering
+    // there is what made a low render resolution look soft. With FSR 1 that surface is first enlarged
+    // to display size by EASU (edge-adaptive upsampling) and sharpened by RCAS, and the 2D pass
+    // samples the result one to one. The shader code is AMD's (ffx_a.h, ffx_fsr1.h, MIT licensed),
+    // read from the fsr1 folder beside the executable (tools/get_fsr1.ps1 fetches it); without those
+    // files the setting does nothing. NIER_UPSCALING=<0|1> overrides the setting (testing).
+    struct UpscaledSurface
+    {
+        ComPtr<ID3D12Resource> easu, sharpened;
+        uint32_t inWidth = 0, inHeight = 0, outWidth = 0, outHeight = 0;
+        D3D12_RESOURCE_STATES easuState = D3D12_RESOURCE_STATE_RENDER_TARGET, sharpenedState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        ID3D12Resource* source = nullptr;   // what it was made from
+        uint64_t version = 0;
+        UINT slot = 0;
+    };
+    std::unordered_map<uint32_t, UpscaledSurface> gUpscaled;        // by the resolved surface's guest address
+    ComPtr<ID3D12PipelineState> gEasuPipeline, gRcasPipeline;
+    ComPtr<ID3D12DescriptorHeap> gFsrRtvHeap;
+    constexpr UINT kFsrSurfaces = 4;
+    int gFsrState = 0;   // 0 not tried, 1 ready, -1 unavailable
+
+    bool UpscalingWanted()
+    {
+        static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING", v, sizeof(v)) ? atoi(v) : -1; }();
+        return (forced >= 0 ? forced : Settings().upscaling.load()) == 1 && gResTwelfths < gDisplayTwelfths;
+    }
+
+    bool FsrReady()
+    {
+        if (gFsrState) return gFsrState > 0;
+        gFsrState = -1;
+        auto readFile = [](const char* path, std::string& out) {
+            FILE* file = fopen(path, "rb");
+            if (!file) return false;
+            fseek(file, 0, SEEK_END);
+            const long size = ftell(file);
+            fseek(file, 0, SEEK_SET);
+            out.resize(size_t(std::max(size, 0L)));
+            const bool ok = size > 0 && fread(out.data(), 1, out.size(), file) == out.size();
+            fclose(file);
+            return ok;
+        };
+        std::string a, fsr;
+        if (!readFile("fsr1\\ffx_a.h", a) || !readFile("fsr1\\ffx_fsr1.h", fsr))
+        {
+            Log("[fsr1] fsr1\\ffx_a.h and ffx_fsr1.h not found beside the executable (tools/get_fsr1.ps1): Upscaling stays plain\n");
+            return false;
+        }
+        const std::string source = std::string(R"(
+cbuffer Fsr : register(b1) { uint4 con0, con1, con2, con3; float4 outputTexel; };
+Texture2D<float4> source : register(t0, space1);
+SamplerState linearClamp : register(s0);
+#define A_GPU 1
+#define A_HLSL 1
+)") + a + R"(
+#ifdef PASS_EASU
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return source.GatherRed(linearClamp, p); }
+AF4 FsrEasuGF(AF2 p) { return source.GatherGreen(linearClamp, p); }
+AF4 FsrEasuBF(AF2 p) { return source.GatherBlue(linearClamp, p); }
+#else
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return source.Load(int3(p, 0)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#endif
+)" + fsr + R"(
+float4 VSMain(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+float4 PSMain(float4 position : SV_Position) : SV_Target
+{
+#ifdef PASS_EASU
+    AF3 color;
+    FsrEasuF(color, AU2(position.xy), con0, con1, con2, con3);
+    return float4(color, source.SampleLevel(linearClamp, position.xy * outputTexel.xy, 0).a);   // alpha: plainly filtered
+#else
+    AF1 r, g, b;
+    FsrRcasF(r, g, b, AU2(position.xy), con0);
+    return float4(r, g, b, source.Load(int3(position.xy, 0)).a);
+#endif
+}
+)";
+        ComPtr<ID3DBlob> vs, easu, rcas, errors;
+        const D3D_SHADER_MACRO easuMacros[] = { { "PASS_EASU", "1" }, { nullptr, nullptr } };
+        if (FAILED(D3DCompile(source.data(), source.size(), "fsr1", nullptr, nullptr, "VSMain", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &errors)) ||
+            FAILED(D3DCompile(source.data(), source.size(), "fsr1", easuMacros, nullptr, "PSMain", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &easu, &errors)) ||
+            FAILED(D3DCompile(source.data(), source.size(), "fsr1", nullptr, nullptr, "PSMain", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &rcas, &errors)))
+        {
+            Log("[fsr1] shaders failed to compile: %s\n", errors ? (const char*)errors->GetBufferPointer() : "unknown");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = gDrawRoot.Get();
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.PS = { easu->GetBufferPointer(), easu->GetBufferSize() };
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = kTargetFormat;
+        desc.SampleDesc.Count = 1;
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gEasuPipeline)), "FSR 1 EASU pipeline")) return false;
+        desc.PS = { rcas->GetBufferPointer(), rcas->GetBufferSize() };
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gRcasPipeline)), "FSR 1 RCAS pipeline")) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap.NumDescriptors = kFsrSurfaces * 2;
+        if (!Check(gDevice->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&gFsrRtvHeap)), "FSR 1 RTV heap")) return false;
+        Log("[fsr1] ready (EASU + RCAS)\n");
+        gFsrState = 1;
+        return true;
+    }
+
+    // One full-screen FSR pass: `from` (in the shader-read state) into `to` (in the render-target state).
+    void FsrPass(ID3D12PipelineState* pipeline, ID3D12Resource* from, D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t width, uint32_t height, const uint32_t constants[20])
+    {
+        const UINT slot = gDrawSrvUsed;
+        gDrawSrvUsed += kTextureSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(slot) * gSrvStep;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(slot) * gSrvStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = kTargetFormat;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(from, &view, cpu);
+        ArenaBlock block = ArenaAlloc(80, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        memcpy(block.cpu, constants, 80);
+        D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f };
+        D3D12_RECT scissor{ 0, 0, LONG(width), LONG(height) };
+        gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        gList->RSSetViewports(1, &viewport);
+        gList->RSSetScissorRects(1, &scissor);
+        BindDrawRoot();
+        gList->SetPipelineState(pipeline);
+        gList->SetGraphicsRootConstantBufferView(1, block.gpu);
+        gList->SetGraphicsRootDescriptorTable(3, gpu);
+        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // The display-sized, sharpened version of a render-sized resolved surface; made again only when
+    // the surface has been copied to since. Null if it can't be made.
+    ID3D12Resource* Upscaled(uint32_t base, const ResolvedResource& surface)
+    {
+        if (!FsrReady()) return nullptr;
+        auto found = gUpscaled.find(base);
+        if (found == gUpscaled.end())
+        {
+            if (gUpscaled.size() >= kFsrSurfaces) return nullptr;
+            const UINT slot = UINT(gUpscaled.size());
+            found = gUpscaled.emplace(base, UpscaledSurface{}).first;
+            found->second.slot = slot;
+        }
+        UpscaledSurface& up = found->second;
+        const D3D12_RESOURCE_DESC in = surface.texture->GetDesc();
+        const uint32_t outWidth = (surface.width * gDisplayTwelfths + 6) / 12, outHeight = (surface.height * gDisplayTwelfths + 6) / 12;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = gFsrRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(up.slot) * 2 * gTargetRtvStep;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvSharpened = rtv;
+        rtvSharpened.ptr += gTargetRtvStep;
+        if (!up.sharpened || up.outWidth != outWidth || up.outHeight != outHeight)
+        {
+            if (up.easu) gRetired.push_back(std::move(up.easu));
+            if (up.sharpened) gRetired.push_back(std::move(up.sharpened));
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = outWidth;
+            desc.Height = outHeight;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = kTargetFormat;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE clear{};
+            clear.Format = kTargetFormat;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&up.easu)), "FSR 1 surface") ||
+                !Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&up.sharpened)), "FSR 1 surface"))
+            {
+                up.easu.Reset();
+                up.sharpened.Reset();
+                return nullptr;
+            }
+            gDevice->CreateRenderTargetView(up.easu.Get(), nullptr, rtv);
+            gDevice->CreateRenderTargetView(up.sharpened.Get(), nullptr, rtvSharpened);
+            up.easuState = up.sharpenedState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            up.outWidth = outWidth;
+            up.outHeight = outHeight;
+            up.source = nullptr;
+            Log("[fsr1] surface %08X: %ux%u -> %ux%u\n", base, unsigned(in.Width), unsigned(in.Height), outWidth, outHeight);
+        }
+        if (up.source == surface.texture.Get() && up.version == surface.version) return up.sharpened.Get();
+        if (gDrawSrvUsed + 2 * kTextureSlots > kDrawDescriptors) return nullptr;
+        up.source = surface.texture.Get();
+        up.version = surface.version;
+        up.inWidth = uint32_t(in.Width);
+        up.inHeight = uint32_t(in.Height);
+
+        auto bits = [](float value) { uint32_t b; memcpy(&b, &value, 4); return b; };
+        const float inW = float(in.Width), inH = float(in.Height), outW = float(outWidth), outH = float(outHeight);
+        uint32_t constants[20] = {
+            bits(inW / outW), bits(inH / outH), bits(0.5f * inW / outW - 0.5f), bits(0.5f * inH / outH - 0.5f),   // as FsrEasuCon
+            bits(1.0f / inW), bits(1.0f / inH), bits(1.0f / inW), bits(-1.0f / inH),
+            bits(-1.0f / inW), bits(2.0f / inH), bits(1.0f / inW), bits(2.0f / inH),
+            bits(0.0f), bits(4.0f / inH), 0, 0,
+            bits(1.0f / outW), bits(1.0f / outH), 0, 0,
+        };
+        if (up.easuState != D3D12_RESOURCE_STATE_RENDER_TARGET)
+        {
+            auto barrier = Transition(up.easu.Get(), up.easuState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            gList->ResourceBarrier(1, &barrier);
+        }
+        FsrPass(gEasuPipeline.Get(), surface.texture.Get(), rtv, outWidth, outHeight, constants);
+        D3D12_RESOURCE_BARRIER barriers[2] = { Transition(up.easu.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), {} };
+        UINT count = 1;
+        if (up.sharpenedState != D3D12_RESOURCE_STATE_RENDER_TARGET) barriers[count++] = Transition(up.sharpened.Get(), up.sharpenedState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        gList->ResourceBarrier(count, barriers);
+        up.easuState = kShaderRead;
+        // RCAS: sharpness in stops below the maximum (0.2 is AMD's suggested default), as FsrRcasCon.
+        static const float stops = [] { char v[16]; return GetEnvironmentVariableA("NIER_FSR_SHARPNESS", v, sizeof(v)) ? float(atof(v)) : 0.2f; }();
+        uint32_t rcas[20] = { bits(std::exp2(-stops)), 0, 0, 0 };
+        FsrPass(gRcasPipeline.Get(), up.easu.Get(), rtvSharpened, outWidth, outHeight, rcas);
+        auto toRead = Transition(up.sharpened.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
+        gList->ResourceBarrier(1, &toRead);
+        up.sharpenedState = kShaderRead;
+        return up.sharpened.Get();
+    }
+
+    // Before a draw of the 2D pass: the scene-sized resolved surfaces it samples get their upscaled
+    // stand-ins (WriteTextureDescriptor binds them).
+    void PrepareUpscaledTextures(const RendererDraw& draw)
+    {
+        gUpscaledNow.clear();
+        if (!UpscalingWanted()) return;
+        for (const TextureBinding& binding : draw.textures)
+        {
+            if (!binding.valid || binding.decoded || binding.resolvedLevelCount || binding.cube) continue;
+            auto found = gResolved.find(binding.resolvedBase);
+            if (found == gResolved.end() || found->second.depth || !found->second.texture || found->second.twelfths != gResTwelfths) continue;
+            if (found->second.width < 1024 || found->second.height < 576) continue;   // the scene, not a small effect buffer
+            if (ID3D12Resource* upscaled = Upscaled(binding.resolvedBase, found->second)) gUpscaledNow[binding.resolvedBase] = upscaled;
+        }
+    }
+
     void ExecuteGuestCommands(const RendererFrame& frame)
     {
         uint32_t shownCopies = 0;
@@ -1660,9 +1920,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 {
                     if (!flatBegun) { BeginFlatPhase(flatTarget, drawnThisFrame); flatBegun = true; }
                     gActiveTwelfths = gDisplayTwelfths;
+                    PrepareUpscaledTextures(*draw);
                 }
                 else if (onTarget) drawnThisFrame = true;
                 ExecuteDraw(*draw);
+                gUpscaledNow.clear();
             }
             else
             {
@@ -1950,6 +2212,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
             gTargets.clear();
             gDepths.clear();
             gResolved.clear();
+            for (auto& [base, up] : gUpscaled) { if (up.easu) gRetired.push_back(std::move(up.easu)); if (up.sharpened) gRetired.push_back(std::move(up.sharpened)); }
+            gUpscaled.clear();
             gResolvedChains.clear();
             gTargetsCreated = 0;
             gDepthsCreated = 0;

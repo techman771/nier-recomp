@@ -386,6 +386,25 @@ output). Debug switches added: `NIER_SCAN_U32=<hex>,...` (find 32-bit values in 
 `NIER_DUMP_RANGE=<address>,<bytes>` (both at a profiler exit), and the log names each shader's
 microcode address the first time it is loaded.
 
+Upscaling (PC Settings > Upscaling, item 69, `upscaling` in settings.ini: 0 Off, 1 FSR 1;
+NIER_UPSCALING=<0|1> overrides): what happens when the render resolution is below the display's.
+- Off: the 2D pass's first draws sample the render-sized scene with the game's own bilinear filter.
+- FSR 1 (AMD's spatial upscaler): before a draw of the 2D pass, each render-sized resolved surface
+  it samples that is at least 1024x576 in guest pixels (the scene; seen: 06A52000) is enlarged to
+  display size by EASU and sharpened by RCAS (`Upscaled`, `PrepareUpscaledTextures`), and
+  `WriteTextureDescriptor` binds the result in its place; redone only when the surface has been
+  copied to since. Constants as FsrEasuCon / FsrRcasCon; sharpness 0.2 stops
+  (NIER_FSR_SHARPNESS=<stops>, 0 sharpest). Alpha is filtered plainly. The shaders are AMD's
+  `ffx_a.h` and `ffx_fsr1.h` (MIT), not committed: `tools/get_fsr1.ps1` fetches them (hash-checked)
+  into `tools/FidelityFX/fsr1`, `compile_ppc.ps1` copies them to `recomp/build/fsr1`, and the
+  runtime compiles the two passes from those files at first use (`[fsr1] ready`); without the files
+  the setting does nothing. Checked at 640x360 -> 1280x720 (Game 3): clearly crisper edges, HUD
+  unaffected. The menu row itself hasn't been looked at yet.
+- Next: the temporal upscalers (FSR 3.1, then DLSS, XeSS, FSR 4). They need what this game
+  doesn't provide: sub-pixel camera jitter (can be added to the translated vertex shaders'
+  output for 3D passes), depth (available), motion vectors (to be derived, at first from depth
+  and the camera's matrices only) and the scene before post-processing and HUD.
+
 Pre-compilation, second look (after 581 shaders captured in the playthrough so far):
 - The archives and the executable hold standard shader containers (`tools/shader_containers.py`):
   magic 102A1100 pixel / 102A1101 vertex, then virtual size, physical size, 0, constant table
