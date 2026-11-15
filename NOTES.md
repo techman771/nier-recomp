@@ -338,7 +338,18 @@ speed. Measured with the sampling profiler (`NIER_PROFILE`), 20 s of the first f
   index are copied (fetch constants often cover a whole level's geometry): 30 fps.
 The command thread is now about 60% busy; the game's main thread is always busy.
 `NIER_HASH_EVERY_USE=1` and `NIER_NO_VERTEX_TRIM=1` turn the two shortcuts off for comparison.
-Frame Rate above 60 (setting `frame_rate_60`: 0 30 fps cap, 1 60, 2 Uncapped, experimental). The
+Frame rate caps (asked for by the user after Uncapped gave no trouble: the Steam Deck OLED is 90 Hz,
+and some prefer a cap to VSync): Frame Rate is now 30, 60, 90, 120, 144, 240 fps and Uncapped
+(setting `frame_rate`, the index 0-6; the old `frame_rate_60` is still read: 0, 1, and anything
+higher as Uncapped; NIER_FRAME_RATE=<index> for tests). 30 and 60 keep the fixed 60 Hz vblank. The
+rates above are Uncapped with a limiter (`FrameRateCap`): the vblank follows each queued flip, no
+sooner than 1/cap after the one before (or one display refresh with VSync on, whichever is longer),
+the earliest moment stepping on by exactly that gap so the average is exact. Measured on Game 3
+with the counter on (the user asked for the counter to be on when testing caps): the 90 cap gave
+90.0 fps and "90 fps" on the counter; the 120 cap 115 fps on the 120 Hz display. Not tried: 144,
+240, the menu row.
+
+Frame Rate above 60, as first built (setting `frame_rate_60`: 0 30 fps cap, 1 60, 2 Uncapped, experimental). The
 user tried 120, 240 and Unlocked in a playtest and asked for 120 and 240 to be dropped; fixed rates
 above 60 now exist only through NIER_GUEST_HZ. What follows describes all of them, except that
 Uncapped no longer follows the display's refreshes with VSync on: the user found that it behaved

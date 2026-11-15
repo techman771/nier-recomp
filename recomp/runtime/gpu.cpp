@@ -1703,9 +1703,18 @@ namespace
                 // millisecond with it off (menus would run at thousands of frames a second). Nothing
                 // here waits for the display's own refreshes: that made every late frame cost a whole
                 // refresh (240, 120, 80...), where a variable refresh display shows it when it is ready.
-                const int64_t gap = Settings().vsync ? frequency.QuadPart / std::max<int64_t>(RendererDisplayHz(), 30) : frequency.QuadPart / 1000;
-                const int64_t earliest = next.QuadPart + gap;   // `next` holds the last vblank's time here
-                for (LARGE_INTEGER now;;)
+                // The Frame Rate setting's own limit (90, 120, 144, 240) works the same way: the larger
+                // of the two gaps applies.
+                int64_t gap = Settings().vsync ? frequency.QuadPart / std::max<int64_t>(RendererDisplayHz(), 30) : frequency.QuadPart / 1000;
+                if (const int cap = FrameRateCap()) gap = std::max<int64_t>(gap, frequency.QuadPart / cap);
+                // The earliest moment for the next vblank steps on by the gap from the one before, so the
+                // rate averages the limit exactly; after a pause it starts again from now.
+                static int64_t earliest = 0;
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                earliest += gap;
+                if (earliest < now.QuadPart - gap) earliest = now.QuadPart;
+                for (;;)
                 {
                     QueryPerformanceCounter(&now);
                     if (now.QuadPart >= earliest) break;
@@ -1792,8 +1801,8 @@ namespace
 void GpuInstallHooks()
 {
     PPC_LOOKUP_FUNC(g_base, 0x8257A4B0) = QueueFlipEveryVblank;   // checks the Frame Rate setting on every flip
-    static const char* const kNames[] = { "30 fps cap", "60 fps", "uncapped" };
-    Log("[gpu] frame rate: %s\n", kNames[std::clamp(Settings().frameRate60.load(), 0, 2)]);
+    static const char* const kNames[] = { "30 fps cap", "60 fps", "90 fps", "120 fps", "144 fps", "240 fps", "uncapped" };
+    Log("[gpu] frame rate: %s\n", kNames[std::clamp(Settings().frameRate60.load(), 0, 6)]);
 }
 
 void GpuDumpStats()

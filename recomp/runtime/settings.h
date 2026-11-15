@@ -6,7 +6,7 @@
 struct PcSettings
 {
     std::atomic<int> borderless{ 1 };          // display mode: 0 windowed, 1 borderless fullscreen
-    std::atomic<int> frameRate60{ 1 };         // Frame Rate: 0 the original 30 fps cap, 1 60 fps, 2 uncapped (experimental)
+    std::atomic<int> frameRate60{ 1 };         // Frame Rate: 0 the original 30 fps cap, 1 60 fps, 2 90, 3 120, 4 144, 5 240, 6 uncapped
     std::atomic<int> vsync{ 1 };
     // Internal resolution (applied between frames): 0 640x360, 1 854x480, 2 960x540, 3 1280x720 (the original),
     // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
@@ -28,6 +28,9 @@ void SettingsSave();
 // Uncapped frame rate, where vblanks follow the display or each frame (NIER_GUEST_HZ=<rate>
 // overrides, -1 for uncapped; other rates, such as 120, exist only through it, for testing).
 int GuestRefreshHz();
+// The Frame Rate setting's limit in frames a second for the rates above 60 (90, 120, 144, 240), or 0
+// for none (uncapped; 30 and 60 are paced by the fixed vblank instead).
+int FrameRateCap();
 void SettingsPollPage();   // live values while the PC Settings page is open (called from the audio thread)
 
 // Applying settings that need more than a read at the point of use.

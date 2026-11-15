@@ -53,7 +53,7 @@ namespace
     {
         return {
             { "borderless", &gSettings.borderless, 0, 1 },
-            { "frame_rate_60", &gSettings.frameRate60, 0, 2 },
+            { "frame_rate", &gSettings.frameRate60, 0, 6 },
             { "vsync", &gSettings.vsync, 0, 1 },
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
@@ -83,14 +83,14 @@ namespace
         T_Resolution, T_ResolutionHelp, T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880,
         T_Shadows, T_ShadowsHelp, T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra,
         T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3,
-        T_Uncapped,
+        T_Uncapped, T_90fps, T_120fps, T_144fps, T_240fps,
         T_FpsCounter, T_FpsCounterHelp,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
         "PC Settings", "Adjust display, frame rate and audio settings for PC.",
         "Display Mode", "Play in a window or in borderless fullscreen\n(also Alt+Enter).",
-        "Frame Rate", "60 fps is well tested. Uncapped is experimental: VSync\nlimits it to the display's rate, and VRR is used below that.",
+        "Frame Rate", "60 fps is well tested; higher rates are experimental.\nVSync also limits the game to the display's rate.",
         "VSync", "Synchronize frames with the display to prevent tearing.",
         "Master Volume", "Adjust the overall volume.",
         "Mute in Background", "Silence the game while its window isn't focused.",
@@ -112,7 +112,7 @@ namespace
         "Original", "High", "Very High", "Ultra",
         "Upscaling", "Choose how a resolution below the screen's is enlarged.\nFSR 3.1 rebuilds detail over several frames.",
         "Off", "FSR 1", "FSR 3.1",
-        "Uncapped",
+        "Uncapped", "90 fps", "120 fps", "144 fps", "240 fps",
         "Frame Rate Counter", "Show the current frame rate in the top left corner.",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
@@ -155,7 +155,7 @@ namespace
     struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[10]; };   // types 2 and 4 name their values
     const Item kItems[] = {
         { 60, 2, &gSettings.borderless, 1, T_DisplayMode, T_DisplayModeHelp, { T_Windowed, T_Borderless } },
-        { 61, 4, &gSettings.frameRate60, 2, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps, T_Uncapped } },
+        { 61, 4, &gSettings.frameRate60, 6, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps, T_90fps, T_120fps, T_144fps, T_240fps, T_Uncapped } },
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
@@ -291,6 +291,8 @@ void SettingsLoad()
             if (sscanf(line, " %63[^= ] = %d", key, &value) != 2) continue;
             for (const Field& field : Fields())
                 if (strcmp(field.key, key) == 0) field.value->store(std::clamp(value, field.min, field.max));
+            // The setting's name before it had more than three values (0 30 fps, 1 60 fps, 2 and up uncapped).
+            if (strcmp(key, "frame_rate_60") == 0) gSettings.frameRate60 = value <= 0 ? 0 : value == 1 ? 1 : 6;
             if (strncmp(key, "key_", 4) == 0) InputSetKeyById(key + 4, std::clamp(value, 0, 254));
         }
         fclose(file);
@@ -301,6 +303,7 @@ void SettingsLoad()
     if (GetEnvironmentVariableA("NIER_FULLSCREEN", value, sizeof(value))) gSettings.borderless = value[0] == '1';
     if (GetEnvironmentVariableA("NIER_60FPS", value, sizeof(value))) gSettings.frameRate60 = value[0] != '0';
     if (GetEnvironmentVariableA("NIER_30FPS", value, sizeof(value))) gSettings.frameRate60 = 0;
+    if (GetEnvironmentVariableA("NIER_FRAME_RATE", value, sizeof(value))) gSettings.frameRate60 = std::clamp(atoi(value), 0, 6);   // the setting's index
 }
 
 void SettingsSave()
@@ -441,7 +444,19 @@ int GuestRefreshHz()
     static const int forced = [] { char v[16]; return GetEnvironmentVariableA("NIER_GUEST_HZ", v, sizeof(v)) ? atoi(v) : 0; }();
     if (forced >= 30) return forced;
     if (forced < 0) return 0;   // NIER_GUEST_HZ=-1: unlocked
-    return gSettings.frameRate60.load() >= 2 ? 0 : 60;   // 2: uncapped
+    return gSettings.frameRate60.load() >= 2 ? 0 : 60;   // above 60: no fixed vblank (a limiter, FrameRateCap)
+}
+
+int FrameRateCap()
+{
+    switch (gSettings.frameRate60.load())
+    {
+    case 2: return 90;
+    case 3: return 120;
+    case 4: return 144;
+    case 5: return 240;
+    default: return 0;
+    }
 }
 
 bool PcSettingsOpen(PPCRegister& r31)
