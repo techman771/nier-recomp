@@ -386,6 +386,57 @@ output). Debug switches added: `NIER_SCAN_U32=<hex>,...` (find 32-bit values in 
 `NIER_DUMP_RANGE=<address>,<bytes>` (both at a profiler exit), and the log names each shader's
 microcode address the first time it is loaded.
 
+Pre-compilation, second look (after 581 shaders captured in the playthrough so far):
+- The archives and the executable hold standard shader containers (`tools/shader_containers.py`):
+  magic 102A1100 pixel / 102A1101 vertex, then virtual size, physical size, 0, constant table
+  offset, definition table offset, shader record offset; the record starts with the microcode's
+  offset inside the physical part (0x40: after the float literals) and its size. 557 distinct
+  pixel and 331 distinct vertex shaders are stored that way (about 1,800 copies of each kind).
+  But of the 331 pixel shaders captured only 32 are among them byte for byte and 23 with a few
+  words changed; of 250 vertex shaders none identically (19 with a few words changed). The rest
+  are the headerless physical parts described above (their headers are elsewhere) or generated.
+- What a first-run hitch is made of (Game 1 from boot with NIER_SHADER_SALT=1, 130 pipelines):
+  the driver's CreateGraphicsPipelineState takes 2,553 ms in total (59 over 5 ms, worst 106 ms)
+  and the render thread waits 881 ms for pipelines in 20 waits; it never waits for an FXC compile
+  directly. A pipeline needs the patched vertex shader, the pixel shader and the render state,
+  none of which the files give by themselves, so compiling stored pixel shaders ahead would
+  remove only the smaller, parallel part of each hitch.
+- What would remove them: a pipeline list recorded while playing (vertex shader, pixel shader,
+  render state), replayed on a background thread at boot. For the player who recorded it that
+  only guards against the driver's cache being reset. For other players the list would have to
+  say where each shader's microcode is in their own copy of the game (file, offset, length,
+  hash) plus the few vertex fetch words D3D patches in; shaders stored nowhere (about a sixth
+  in the first sample) would still compile at first use. The user approved shipping it.
+- Built (pipeline list):
+  - Recording: `RendererPreparePipeline` appends every new combination the game uses to
+    `recomp/pipelines_seen.txt` (kept across runs, test runs included; not committed):
+    `P <vs hash> <ps hash> <blend> <write mask> <depth control> <stencil masks> <flags>`
+    (flags: 1 rect list, 2 colour, 4 depth bound, 8/16 cull, 32 counter-clockwise front).
+  - `tools/pipeline_list.cpp` (build: `clang++ -O2 -std=c++20 tools\pipeline_list.cpp -o
+    toolsuild\pipeline_list.exe` in the dev shell; run: `pipeline_list recomp\pipelines_seen.txt
+    recomp\shaders recomp\config\pipeline_list.txt Nier recomp\captures\image.bin
+    media\layer1.cpk media\layer2.cpk`, about 10 s) looks for each used shader's microcode
+    (`recomp/shaders/*.bin`) in the image and the archives, allowing up to a third of the words
+    to differ, and writes `recomp/config/pipeline_list.txt` (committed): `S <vs|ps> <hash>
+    <source> <offset> <dwords> [index:value,...]` (source `image`: offset is the guest address;
+    the index:value pairs are the words to patch in) and the `P` lines whose shaders were found.
+  - `recomp/runtime/prewarm.cpp` (`PrewarmStart`, after LoadGame): a thread waits for the
+    renderer, reads each listed shader from the player's files, patches it, checks the hash,
+    translates it and queues the compile and the pipelines (`RendererPrewarmShader/Pipeline`).
+    Those jobs go to the back of the worker queues; whatever the game asks for goes to the front
+    and pulls its own queued job forward. NIER_NO_PREWARM=1 turns it off. Log: `[prewarm]`.
+  - First result (boot to The Aerie, 131 pipelines, 94 shaders): 65 shaders placed (vertex: 1
+    as captured, 30 patched, 8 not found; pixel: 29 as captured, 5 patched, 21 not found; 412
+    patched words in all), 84 pipelines made ahead. With the DXBC cache emptied (the driver's
+    cache was warm, so this measures only the FXC part): render thread waits for pipelines
+    545 ms in 15 waits without the list, 207 ms in 9 with it. A run with the driver's cache
+    cold as well hasn't been measured since (NIER_SHADER_SALT gives only one other variant).
+  - Not placed: the scene and character material family (`8263A851`, `D461B875`, ...): only a
+    few instructions of each occur in the image, none whole anywhere searched. Finding where
+    they come from (the package format, or how they are generated) is what would lift coverage.
+  - The list covers only what has been recorded since this was built; it grows as the user
+    plays (regenerate and commit now and then).
+
 Cheaper first-use compiles (both measured over the 60 fps route, fight profiled at frame 11000):
 registers are emitted as separate variables (`r0`, `r1`, ...) instead of an `r[]` array (written as
 `r[N]` during translation and rewritten at the end, so `NIER_PS_DEBUG` / `NIER_SHADER_PATCH`

@@ -39,4 +39,7 @@
 
 # Recorded controller input for test runs (run_boot.ps1 -Record)
 /recomp/recordings/
+
+# Every pipeline the game has used on this machine (input of tools/pipeline_list)
+/recomp/pipelines_seen.txt
 __pycache__/

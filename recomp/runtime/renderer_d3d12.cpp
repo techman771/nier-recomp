@@ -559,6 +559,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::unordered_map<uint64_t, std::shared_future<ComPtr<ID3DBlob>>> results;   // by guest hash
         std::unordered_map<uint64_t, std::shared_ptr<std::promise<ComPtr<ID3DBlob>>>> promises;
         bool started = false;
+        bool backlog = false;   // ahead-of-time jobs were queued (urgent requests then look for theirs)
     } gShaderJobs;
 
     void ShaderWorker()
@@ -579,8 +580,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
     }
 
-    // Starts compiling a shader unless it is already compiled or queued; returns its result.
-    std::shared_future<ComPtr<ID3DBlob>> QueueShader(const std::shared_ptr<const GuestShader>& shader)
+    // Starts compiling a shader unless it is already compiled or queued; returns its result. What the
+    // game needs now (`urgent`) goes ahead of the pipeline list's ahead-of-time work, and pulls its
+    // own job forward if that work had queued it already.
+    std::shared_future<ComPtr<ID3DBlob>> QueueShader(const std::shared_ptr<const GuestShader>& shader, bool urgent = true)
     {
         std::lock_guard lock(gShaderJobs.mutex);
         if (!gShaderJobs.started)
@@ -590,12 +593,25 @@ float PSMain(float4 position : SV_Position) : SV_Target
             for (unsigned i = 0; i < workers; i++) std::thread(ShaderWorker).detach();
         }
         auto found = gShaderJobs.results.find(shader->hash);
-        if (found != gShaderJobs.results.end()) return found->second;
+        if (found != gShaderJobs.results.end())
+        {
+            if (urgent && gShaderJobs.backlog)
+                for (auto queued = gShaderJobs.queue.begin(); queued != gShaderJobs.queue.end(); ++queued)
+                    if ((*queued)->hash == shader->hash)
+                    {
+                        auto job = *queued;
+                        gShaderJobs.queue.erase(queued);
+                        gShaderJobs.queue.push_front(job);
+                        break;
+                    }
+            return found->second;
+        }
         auto promise = std::make_shared<std::promise<ComPtr<ID3DBlob>>>();
         std::shared_future<ComPtr<ID3DBlob>> future = promise->get_future().share();
         gShaderJobs.results[shader->hash] = future;
         gShaderJobs.promises[shader->hash] = promise;
-        gShaderJobs.queue.push_back(shader);
+        if (urgent) gShaderJobs.queue.push_front(shader);
+        else { gShaderJobs.queue.push_back(shader); gShaderJobs.backlog = true; }
         gShaderJobs.work.notify_one();
         return future;
     }
@@ -676,6 +692,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::unordered_map<uint64_t, std::shared_future<ComPtr<ID3D12PipelineState>>> results;
         std::unordered_map<uint64_t, std::shared_ptr<std::promise<ComPtr<ID3D12PipelineState>>>> promises;
         bool started = false;
+        bool backlog = false;
     } gPipelineJobs;
     std::atomic<double> gPipelineWaitMs{ 0 };
     std::atomic<uint64_t> gPipelineWaits{ 0 };
@@ -698,7 +715,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
     }
 
-    std::shared_future<ComPtr<ID3D12PipelineState>> QueuePipeline(const PipelineState& state, uint64_t key)
+    std::shared_future<ComPtr<ID3D12PipelineState>> QueuePipeline(const PipelineState& state, uint64_t key, bool urgent = true)
     {
         std::lock_guard lock(gPipelineJobs.mutex);
         if (!gPipelineJobs.started)
@@ -708,12 +725,25 @@ float PSMain(float4 position : SV_Position) : SV_Target
             for (unsigned i = 0; i < workers; i++) std::thread(PipelineWorker).detach();
         }
         auto found = gPipelineJobs.results.find(key);
-        if (found != gPipelineJobs.results.end()) return found->second;
+        if (found != gPipelineJobs.results.end())
+        {
+            if (urgent && gPipelineJobs.backlog)
+                for (auto queued = gPipelineJobs.queue.begin(); queued != gPipelineJobs.queue.end(); ++queued)
+                    if (queued->first == key)
+                    {
+                        auto job = std::move(*queued);
+                        gPipelineJobs.queue.erase(queued);
+                        gPipelineJobs.queue.push_front(std::move(job));
+                        break;
+                    }
+            return found->second;
+        }
         auto promise = std::make_shared<std::promise<ComPtr<ID3D12PipelineState>>>();
         std::shared_future<ComPtr<ID3D12PipelineState>> future = promise->get_future().share();
         gPipelineJobs.results[key] = future;
         gPipelineJobs.promises[key] = promise;
-        gPipelineJobs.queue.emplace_back(key, state);
+        if (urgent) gPipelineJobs.queue.emplace_front(key, state);
+        else { gPipelineJobs.queue.emplace_back(key, state); gPipelineJobs.backlog = true; }
         gPipelineJobs.work.notify_one();
         return future;
     }
@@ -740,7 +770,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // Creates a pipeline (on a worker thread): waits for its shaders' compiles, then lets the driver build it.
     ComPtr<ID3D12PipelineState> CreatePipeline(const PipelineState& draw)
     {
-        ComPtr<ID3DBlob> vsBlob = QueueShader(draw.vs).get(), psBlob = QueueShader(draw.ps).get();
+        std::shared_future<ComPtr<ID3DBlob>> vsFuture = QueueShader(draw.vs), psFuture = QueueShader(draw.ps);   // both started before waiting
+        ComPtr<ID3DBlob> vsBlob = vsFuture.get(), psBlob = psFuture.get();
         ID3DBlob* vs = vsBlob.Get(), * ps = psBlob.Get();
         ComPtr<ID3D12PipelineState> pipeline;
         if (vs && ps)
@@ -2332,5 +2363,57 @@ void RendererPreparePipeline(const RendererDraw& draw)
     static thread_local std::unordered_set<uint64_t> seen;   // cheap check before the shared map
     const PipelineState state = PipelineStateOf(draw);
     const uint64_t key = PipelineKey(state);
-    if (seen.insert(key).second) QueuePipeline(state, key);
+    if (!seen.insert(key).second) return;
+    QueuePipeline(state, key);
+
+    // Every combination the game uses is noted in recomp/pipelines_seen.txt (kept across runs, not
+    // committed): tools/pipeline_list turns it into the list that prewarm.cpp replays at boot.
+    static std::unordered_set<uint64_t> recorded;
+    static FILE* file = [] {
+        if (FILE* old = fopen("..\\pipelines_seen.txt", "r"))
+        {
+            char line[160];
+            unsigned long long vs, ps;
+            unsigned blend, mask, depth, stencil, flags;
+            while (fgets(line, sizeof(line), old))
+                if (sscanf(line, "P %llx %llx %x %x %x %x %x", &vs, &ps, &blend, &mask, &depth, &stencil, &flags) == 7)
+                    recorded.insert(XXH3_64bits(line, strcspn(line, "\r\n")));
+            fclose(old);
+        }
+        return fopen("..\\pipelines_seen.txt", "a");
+    }();
+    if (!file) return;
+    char line[160];
+    const uint32_t flags = (state.rectList ? 1 : 0) | (state.hasColor ? 2 : 0) | (state.depthBound ? 4 : 0) | (uint32_t(state.cull) << 3) | (state.frontCounterClockwise ? 32 : 0);
+    const int length = snprintf(line, sizeof(line), "P %016llX %016llX %08X %X %08X %08X %X", (unsigned long long)state.vs->hash, (unsigned long long)state.ps->hash,
+                                state.blendControl, state.writeMask, state.depthControl, state.stencilRefMask & 0xFFFF00, flags);
+    if (recorded.insert(XXH3_64bits(line, size_t(length))).second) { fprintf(file, "%s\n", line); fflush(file); }
+}
+
+std::atomic<uint64_t> gPrewarmedShaders{ 0 }, gPrewarmedPipelines{ 0 };
+
+void RendererPrewarmShader(const std::shared_ptr<GuestShader>& shader)
+{
+    gPrewarmedShaders++;
+    QueueShader(shader, false);
+}
+
+void RendererPrewarmPipeline(const std::shared_ptr<GuestShader>& vs, const std::shared_ptr<GuestShader>& ps, uint32_t blendControl, uint32_t writeMask,
+                             uint32_t depthControl, uint32_t stencilRefMask, uint32_t flags)
+{
+    if (!vs || !ps || !gReady) return;
+    PipelineState state;
+    state.vs = vs;
+    state.ps = ps;
+    state.blendControl = blendControl;
+    state.writeMask = writeMask;
+    state.depthControl = depthControl;
+    state.stencilRefMask = stencilRefMask;
+    state.rectList = flags & 1;
+    state.hasColor = (flags >> 1) & 1;
+    state.depthBound = (flags >> 2) & 1;
+    state.cull = uint8_t((flags >> 3) & 3);
+    state.frontCounterClockwise = (flags >> 5) & 1;
+    gPrewarmedPipelines++;
+    QueuePipeline(state, PipelineKey(state), false);
 }

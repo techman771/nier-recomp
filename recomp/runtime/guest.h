@@ -34,6 +34,7 @@ void GpuRequestCapture();   // F12: log every draw of the next frame and save it
 void GpuRequestRecording(); // F9: record every frame for 10 seconds
 void ProfilerInit();        // NIER_PROFILE=<frame>,<seconds>: sampling profile into the log
 void GpuResetFrameTiming(); // restart the frame time statistics (the profiler does at its start)
+void PrewarmStart();        // prewarm.cpp: compile the pipeline list's shaders and pipelines ahead of use
 void GpuInstallHooks();    // replaces indirect-call table entries (NIER_60FPS)
 void XamInstallHooks();    // replaces indirect-call table entries (skips the storage messages)
 void NoteGuestSwap();      // the game submitted a frame (for NIER_FIXED_TIME)
