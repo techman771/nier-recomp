@@ -8,6 +8,9 @@
 // where it was found, never the code itself. Vertex shaders are stored with their vertex fetch
 // instructions left blank and filled in by the console's D3D at runtime, so a stored copy may
 // differ from what was captured in some words: those words are recorded as patches.
+// Most model files in the archives are "lzo" containers (recomp/runtime/lzo1x.h): each one found in an
+// archive is unpacked and searched too, and a shader inside one gets a Z line (the container's place
+// in the archive and the shader's place in the unpacked data).
 //
 // Usage: pipeline_list <seen.txt> <shader dir> <output> <game dir> <image.bin or -> <archive relative to game dir>...
 #define _CRT_SECURE_NO_WARNINGS
@@ -20,6 +23,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "../recomp/runtime/lzo1x.h"
 
 struct Shader
 {
@@ -30,6 +34,7 @@ struct Shader
     // best copy found
     int source = -1;
     uint64_t offset = 0;
+    int64_t container = -1;         // inside an lzo container at this offset of the source (offset: in its unpacked data)
     uint32_t differing = UINT32_MAX;
     std::vector<uint32_t> patches;  // word indices that differ in the stored copy
 };
@@ -108,6 +113,34 @@ int main(int argc, char** argv)
     }
 
     std::vector<std::string> sources;
+    // Looks for the shaders at positions [from, limit) of `data` (`have` bytes, which start `base`
+    // bytes into the source or, with `container` set, into that container's unpacked data).
+    auto search = [&](const uint8_t* data, size_t from, size_t limit, size_t have, int source, int64_t container, uint64_t base) {
+        for (size_t p = from; p < limit; p++)
+        {
+            if (!prefilter[uint32_t(data[p]) << 16 | uint32_t(data[p + 1]) << 8 | data[p + 2]]) continue;
+            uint64_t key;
+            memcpy(&key, data + p, 8);
+            auto found = anchors.find(key);
+            if (found == anchors.end()) continue;
+            for (const Anchor& anchor : found->second)
+            {
+                Shader& shader = shaders[anchor.shader];
+                if (shader.differing == 0 || p < anchor.offset || p - anchor.offset + shader.code.size() > have) continue;
+                const uint8_t* stored = data + p - anchor.offset;
+                uint32_t differing = 0;
+                const uint32_t count = uint32_t(shader.words.size()), allowed = std::min(shader.differing, count / 3);
+                for (uint32_t w = 0; w < count && differing <= allowed; w++) differing += Be(stored + w * 4) != shader.words[w];
+                if (differing >= shader.differing || differing > count / 3) continue;
+                shader.differing = differing;
+                shader.source = source;
+                shader.container = container;
+                shader.offset = base + p - anchor.offset;
+                shader.patches.clear();
+                for (uint32_t w = 0; w < count; w++) if (Be(stored + w * 4) != shader.words[w]) shader.patches.push_back(w);
+            }
+        }
+    };
     auto scan = [&](const std::string& path, const std::string& name) {
         FILE* file = fopen(path.c_str(), "rb");
         if (!file) { fprintf(stderr, "cannot read %s\n", path.c_str()); return; }
@@ -115,6 +148,7 @@ int main(int argc, char** argv)
         sources.push_back(name);
         const size_t chunkSize = 256u << 20, overlap = 1u << 17;
         std::vector<uint8_t> data(chunkSize + 2 * overlap);
+        std::vector<uint64_t> containers;   // lzo containers start on 0x800 boundaries
         uint64_t base = 0;
         size_t kept = 0, scanFrom = 0;
         while (true)
@@ -125,29 +159,9 @@ int main(int argc, char** argv)
             // Positions whose anchor and whole shader lie inside what is loaded; the rest waits for
             // the next chunk (the overlap is larger than any shader).
             const size_t limit = got == 0 ? have - 8 : have - std::min(have, overlap);
-            for (size_t p = scanFrom; p < limit; p++)
-            {
-                if (!prefilter[uint32_t(data[p]) << 16 | uint32_t(data[p + 1]) << 8 | data[p + 2]]) continue;
-                uint64_t key;
-                memcpy(&key, data.data() + p, 8);
-                auto found = anchors.find(key);
-                if (found == anchors.end()) continue;
-                for (const Anchor& anchor : found->second)
-                {
-                    Shader& shader = shaders[anchor.shader];
-                    if (shader.differing == 0 || p < anchor.offset || p - anchor.offset + shader.code.size() > have) continue;
-                    const uint8_t* stored = data.data() + p - anchor.offset;
-                    uint32_t differing = 0;
-                    const uint32_t count = uint32_t(shader.words.size()), allowed = std::min(shader.differing, count / 3);
-                    for (uint32_t w = 0; w < count && differing <= allowed; w++) differing += Be(stored + w * 4) != shader.words[w];
-                    if (differing >= shader.differing || differing > count / 3) continue;
-                    shader.differing = differing;
-                    shader.source = source;
-                    shader.offset = base + p - anchor.offset;
-                    shader.patches.clear();
-                    for (uint32_t w = 0; w < count; w++) if (Be(stored + w * 4) != shader.words[w]) shader.patches.push_back(w);
-                }
-            }
+            search(data.data(), scanFrom, limit, have, source, -1, base);
+            for (uint64_t at = (base + scanFrom + 0x7FF) & ~0x7FFull; at < base + limit; at += 0x800)
+                if (!memcmp(data.data() + (at - base), "lzo\0", 4)) containers.push_back(at);
             if (got == 0) break;
             // Keep the unsearched tail and as much again before it, for a shader that starts earlier.
             const size_t keep = std::min(have, 2 * overlap);
@@ -156,8 +170,36 @@ int main(int argc, char** argv)
             kept = keep;
             scanFrom = keep - std::min(keep, overlap);
         }
+        // The containers: each unpacked whole, then searched like the file itself.
+        uint32_t unpackedContainers = 0, damaged = 0;
+        std::vector<uint8_t> packed, plain;
+        for (const uint64_t container : containers)
+        {
+            uint8_t header[0x20];
+            if (_fseeki64(file, int64_t(container), SEEK_SET) != 0 || fread(header, 1, sizeof(header), file) != sizeof(header)) continue;
+            const uint32_t slot = Be(header + 8), count = Be(header + 12);
+            if (slot == 0 || count == 0 || count > 0x4000) continue;
+            plain.clear();
+            bool good = true;
+            for (uint32_t b = 0; b < count && good; b++)
+            {
+                uint8_t blockHeader[12];
+                good = _fseeki64(file, int64_t(LzoBlockHeaderAt(container, slot, b)), SEEK_SET) == 0 && fread(blockHeader, 1, 12, file) == 12;
+                if (!good) break;
+                LzoBlock block;
+                block.offset = Be(blockHeader); block.unpacked = Be(blockHeader + 4); block.packed = Be(blockHeader + 8);
+                good = block.offset == plain.size() && block.unpacked <= (64u << 20) && block.packed <= slot;
+                if (!good) break;
+                packed.resize(block.packed);
+                plain.resize(size_t(block.offset) + block.unpacked);
+                good = fread(packed.data(), 1, block.packed, file) == block.packed && LzoUnpackBlock(block, packed.data(), plain.data() + block.offset);
+            }
+            if (!good) { damaged++; continue; }
+            unpackedContainers++;
+            if (plain.size() > 16) search(plain.data(), 0, plain.size() - 8, plain.size(), source, int64_t(container), 0);
+        }
         fclose(file);
-        printf("searched %s\n", name.c_str());
+        printf("searched %s (%u lzo containers unpacked, %u not readable)\n", name.c_str(), unpackedContainers, damaged);
     };
     if (imagePath != "-") scan(imagePath, "image");
     for (int i = 6; i < argc; i++) scan(gameDir + "/" + argv[i], argv[i]);
@@ -171,7 +213,8 @@ int main(int argc, char** argv)
         patchWords += shader.differing;
         found.push_back(&shader);
     }
-    std::sort(found.begin(), found.end(), [](const Shader* a, const Shader* b) { return a->source != b->source ? a->source < b->source : a->offset < b->offset; });
+    std::sort(found.begin(), found.end(), [](const Shader* a, const Shader* b) {
+        return a->source != b->source ? a->source < b->source : a->container != b->container ? a->container < b->container : a->offset < b->offset; });
     std::set<std::pair<bool, uint64_t>> available;
     for (const Shader* shader : found) available.insert({ shader->pixel, shader->hash });
 
@@ -183,8 +226,12 @@ int main(int argc, char** argv)
     {
         // In the image the offset becomes the guest address the image is loaded at.
         const bool image = sources[shader->source] == "image";
-        fprintf(out, "S %s %016llX %s %llX %zu", shader->pixel ? "ps" : "vs", (unsigned long long)shader->hash, sources[shader->source].c_str(),
-                (unsigned long long)(shader->offset + (image ? 0x82000000ull : 0)), shader->words.size());
+        if (shader->container >= 0)
+            fprintf(out, "Z %s %016llX %s %llX %llX %zu", shader->pixel ? "ps" : "vs", (unsigned long long)shader->hash, sources[shader->source].c_str(),
+                    (unsigned long long)shader->container, (unsigned long long)shader->offset, shader->words.size());
+        else
+            fprintf(out, "S %s %016llX %s %llX %zu", shader->pixel ? "ps" : "vs", (unsigned long long)shader->hash, sources[shader->source].c_str(),
+                    (unsigned long long)(shader->offset + (image ? 0x82000000ull : 0)), shader->words.size());
         for (size_t i = 0; i < shader->patches.size(); i++) fprintf(out, "%c%u:%X", i ? ',' : ' ', shader->patches[i], shader->words[shader->patches[i]]);
         fprintf(out, "\n");
     }

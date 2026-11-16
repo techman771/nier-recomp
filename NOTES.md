@@ -615,9 +615,19 @@ Pre-compilation, second look (after 581 shaders captured in the playthrough so f
     cache was warm, so this measures only the FXC part): render thread waits for pipelines
     545 ms in 15 waits without the list, 207 ms in 9 with it. A run with the driver's cache
     cold as well hasn't been measured since (NIER_SHADER_SALT gives only one other variant).
-  - Not placed: the scene and character material family (`8263A851`, `D461B875`, ...): only a
-    few instructions of each occur in the image, none whole anywhere searched. Finding where
-    they come from (the package format, or how they are generated) is what would lift coverage.
+  - The scene and character material family (`8263A851`, `D461B875`, ...) was not placed at first: those
+    shaders are inside "lzo" containers. Most model files in the archives (*.MDP; found by the
+    magic at any 0x800 boundary, 333 in the two archives) are stored that way: `lzo\0`, slot size
+    at +8 (0x20000), block count at +12, unpacked size at +16; block b starts at container + slot
+    * b (block 0: 0x20 further on) with its unpacked offset, unpacked size and packed size
+    (big-endian), then LZO1X data, or the bytes as they are when the two sizes are equal
+    (`recomp/runtime/lzo1x.h`, our own decoder). The *.MDV beside each is CRILAYLA-compressed by
+    the archive itself and holds no microcode. `tools/pipeline_list` unpacks every container and
+    searches it; a shader found there gets a `Z` line (container offset in the archive, offset in
+    the unpacked data) and prewarm.cpp unpacks the block it is in. Result: 559 of 559 recorded
+    pipelines and all 451 shaders placed (before: 199 of 353), the tool takes about 11 s.
+  - The user's first play of the opening with the list at 353 recorded 206 more combinations:
+    the opening had not been recorded on this machine, and it stuttered from compiles.
   - The list covers only what has been recorded since this was built; it grows as the user
     plays (regenerate and commit now and then).
 
