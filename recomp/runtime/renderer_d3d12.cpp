@@ -612,7 +612,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // While the game waits for the pipeline list at start-up (PrewarmWait) nothing else needs the
     // processor: extra workers (`temporary`) help until that is over (RendererPrewarmBoost).
     std::atomic<bool> gPrewarmBoost{ false };
-    std::atomic<uint32_t> gPipelineJobsQueued{ 0 }, gPipelineJobsDone{ 0 };
+    std::atomic<uint32_t> gPipelineJobsQueued{ 0 }, gPipelineJobsDone{ 0 }, gShaderJobsQueued{ 0 }, gShaderJobsDone{ 0 };
 
     void ShaderWorker(bool temporary)
     {
@@ -630,6 +630,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gShaderJobs.promises.erase(shader->hash);
             }
             promise->set_value(CompileGuestShader(*shader));
+            gShaderJobsDone++;
         }
     }
 
@@ -663,6 +664,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::shared_future<ComPtr<ID3DBlob>> future = promise->get_future().share();
         gShaderJobs.results[shader->hash] = future;
         gShaderJobs.promises[shader->hash] = promise;
+        gShaderJobsQueued++;
         if (urgent) gShaderJobs.queue.push_front(shader);
         else { gShaderJobs.queue.push_back(shader); gShaderJobs.backlog = true; }
         gShaderJobs.work.notify_one();
@@ -3883,11 +3885,11 @@ void RendererPrewarmPipeline(const std::shared_ptr<GuestShader>& vs, const std::
     QueuePipeline(state, PipelineKey(state), false);
 }
 
-// Pipelines created so far, of those asked for (the list's and the game's).
+// Shaders compiled and pipelines created so far, of those asked for (the list's and the game's).
 void RendererPrewarmProgress(uint32_t& done, uint32_t& total)
 {
-    done = gPipelineJobsDone.load();
-    total = gPipelineJobsQueued.load();
+    done = gPipelineJobsDone.load() + gShaderJobsDone.load();
+    total = gPipelineJobsQueued.load() + gShaderJobsQueued.load();
 }
 
 // On: extra shader and pipeline workers, for as long as the game itself is not running. Off: they

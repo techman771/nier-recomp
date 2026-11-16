@@ -14,6 +14,13 @@
 //     (a shader inside one of the archives' "lzo" containers, lzo1x.h: most model files are)
 //   P <vs hash> <ps hash> <blend> <write mask> <depth control> <stencil masks> <flags>
 //
+// Shader lines that no P line uses are pixel shaders the files hold but nobody has drawn yet
+// (tools/pipeline_list lists every one it finds). They are compiled once, the first time the game
+// starts, so that meeting one in play costs no compile: a note in the shader cache folder
+// (prepared_<hash of the list>.txt) says it has been done, and later starts leave them alone, since
+// the compiled shader is then read from the cache when it is first drawn. NIER_PREWARM_ALL=1 does
+// them regardless.
+//
 // Everything is queued behind what the game itself needs (renderer: urgent jobs go first).
 // NIER_NO_PREWARM=1 turns it off.
 #include <windows.h>
@@ -26,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "guest.h"
 #include "lzo1x.h"
@@ -35,6 +43,7 @@
 namespace
 {
     std::atomic<bool> gListQueued{ false };   // everything on the list has been handed to the renderer (or there is no list)
+    std::string gPreparedNote;                // set when the undrawn shaders were queued too: PrewarmWait writes it once they are done
 
     void PrewarmThread()
     {
@@ -51,6 +60,23 @@ namespace
         uint32_t shaderLines = 0, unreadable = 0, mismatched = 0, untranslated = 0, pipelines = 0, pipelinesSkipped = 0;
         std::vector<char> line(1 << 16);
 
+        // First the pipelines: the shaders they use are wanted on every start, the rest only once.
+        std::unordered_set<uint64_t> used[2];
+        uint64_t listHash = 1469598103934665603ull;
+        while (fgets(line.data(), int(line.size()), list))
+        {
+            for (const char* c = line.data(); *c; c++) listHash = (listHash ^ uint8_t(*c)) * 1099511628211ull;
+            unsigned long long vs, ps;
+            if (line[0] == 'P' && sscanf(line.data(), "P %llx %llx", &vs, &ps) == 2) { used[0].insert(vs); used[1].insert(ps); }
+        }
+        rewind(list);
+        char note[96];
+        snprintf(note, sizeof(note), "..\\shadercache\\prepared_%016llX.txt", (unsigned long long)listHash);
+        const bool undrawnToo = GetFileAttributesA(note) == INVALID_FILE_ATTRIBUTES || GetEnvironmentVariableA("NIER_PREWARM_ALL", nullptr, 0) > 0;
+        uint32_t undrawn = 0;
+
+        std::map<std::string, uint32_t> reasons;   // why shaders could not be translated
+
         // The words as stored, then: the list's patches, the hash check, translation, and the compile queued.
         const auto place = [&](std::vector<uint32_t>& words, const char* patch, bool pixel, uint64_t hash) {
             while (*patch)
@@ -66,7 +92,7 @@ namespace
             for (uint32_t word : words) actual = (actual ^ word) * 1099511628211ull;
             if (actual != hash) { mismatched++; return; }
             TranslatedShader translated = TranslateShader(words, pixel, hash);
-            if (!translated.ok) { untranslated++; return; }
+            if (!translated.ok) { untranslated++; reasons[translated.error]++; return; }
             auto shader = std::make_shared<GuestShader>();
             shader->hash = hash;
             shader->hlsl = std::move(translated.hlsl);
@@ -138,8 +164,9 @@ namespace
                 unsigned count;
                 int consumed = 0;
                 if (sscanf(line.data(), "S %7s %llx %259s %llx %u%n", stage, &hash, source, &offset, &count, &consumed) != 5 || count == 0 || count > 0x4000) continue;
-                shaderLines++;
                 const bool pixel = !strcmp(stage, "ps");
+                if (!used[pixel ? 1 : 0].count(hash)) { if (!undrawnToo) continue; undrawn++; }
+                shaderLines++;
                 std::vector<uint32_t> words(count);
                 if (!strcmp(source, "image"))
                 {
@@ -166,6 +193,7 @@ namespace
                 unsigned count;
                 int consumed = 0;
                 if (sscanf(line.data(), "Z %7s %llx %259s %llx %llx %u%n", stage, &hash, source, &containerAt, &offset, &count, &consumed) != 6 || count == 0 || count > 0x4000) continue;
+                if (!used[strcmp(stage, "ps") ? 0 : 1].count(hash)) { if (!undrawnToo) continue; undrawn++; }
                 shaderLines++;
                 auto opened = files.find(source);
                 if (opened == files.end()) opened = files.emplace(source, fopen((g_gameDir + "\\" + source).c_str(), "rb")).first;
@@ -193,6 +221,8 @@ namespace
         Log("[prewarm] pipeline list: %zu of %u shaders and %u pipelines queued in %.0f ms (%u unreadable, %u different from the list, %u untranslated; %u pipelines without their shaders)\n",
             shaders[0].size() + shaders[1].size(), shaderLines, pipelines, double(end.QuadPart - begin.QuadPart) * 1000.0 / double(frequency.QuadPart),
             unreadable, mismatched, untranslated, pipelinesSkipped);
+        for (const auto& [reason, count] : reasons) Log("[prewarm]   %u untranslated: %s\n", count, reason.c_str());
+        if (undrawn) { Log("[prewarm] %u of those shaders have not been drawn yet: compiled this once\n", undrawn); gPreparedNote = note; }
     }
 }
 
@@ -229,9 +259,9 @@ void PrewarmWait()
         if (gListQueued && done >= total && GetTickCount64() - begin >= showFor) break;
         const ULONGLONG now = GetTickCount64();
         if (done != lastDone) { lastDone = done; progressAt = now; }
-        if (now - progressAt > 30000) { Log("[prewarm] no pipeline finished for 30 s: starting the game without the rest\n"); break; }
+        if (now - progressAt > 30000) { Log("[prewarm] nothing finished for 30 s: starting the game without the rest\n"); gPreparedNote.clear(); break; }
         // Nothing is shown for the first 0.7 s: warm caches are done by then.
-        if (gListQueued && (now - begin > 700 || showFor))
+        if (now - begin > 700 || showFor)
         {
             if (done != shownDone)
             {
@@ -256,5 +286,10 @@ void PrewarmWait()
     }
     uint32_t done = 0, total = 0;
     RendererPrewarmProgress(done, total);
-    Log("[prewarm] %u of %u pipelines ready after %llu ms%s\n", done, total, GetTickCount64() - begin, shown ? " (progress shown)" : "");
+    Log("[prewarm] %u of %u shaders and pipelines ready after %llu ms%s\n", done, total, GetTickCount64() - begin, shown ? " (progress shown)" : "");
+    if (!gPreparedNote.empty())
+    {
+        CreateDirectoryA("..\\shadercache", nullptr);
+        if (FILE* file = fopen(gPreparedNote.c_str(), "w")) { fprintf(file, "Every shader on the pipeline list with this hash has been compiled into this folder.\n"); fclose(file); }
+    }
 }

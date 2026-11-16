@@ -636,6 +636,28 @@ Pre-compilation, second look (after 581 shaders captured in the playthrough so f
     caches (nothing shown), 1.7 s with the game's shader cache emptied and the driver's partly
     warm. `NIER_NO_PREWARM_WAIT=1` starts at once as before; `NIER_PREWARM_SHOW=<ms>` keeps the
     picture up that long to look at it. It gives up if no pipeline finishes for 30 s.
+  - Shaders nobody has drawn yet: `tools/pipeline_list` also lists every pixel shader stored in the
+    archives' model and effect files (`EnumerateStored`; 612 beyond the 254 recorded, so about 866
+    in all). A file pair X.MDV / X.MDP (models; X.EFV / X.EFP effects) holds the shader headers in
+    the V file (CRILAYLA-compressed by the archive for models, plain for effects; found by the
+    magic 102A1100 / 102A1101) and the code in the P file. The code parts of a group of headers
+    follow one another in header order, each rounded up to 32 bytes; a model has one group at the
+    end of its unpacked data starting on a 4 KB boundary, an effect file several groups. Each
+    header's code is looked for right after the one before, and when that does not read as
+    microcode (`PlausibleMicrocode`: control flow first, only exec/alloc kinds, blocks start right
+    after it and reach the end) the file is searched. All 5,291 pixel shader headers are placed
+    that way, 264 of the recorded pixel shaders come out among them, and all 612 new ones
+    translate. The archive's file table (`CPK `/`TOC ` @UTF tables) gives the pairs.
+  - The game compiles those once: shader lines no P line uses are skipped when
+    `recomp/shadercache/prepared_<hash of the list>.txt` exists, and compiled (behind the
+    "Preparing shaders" picture) when it does not; `NIER_PREWARM_ALL=1` forces it. With the
+    shader cache emptied: 1,063 shaders and 559 pipelines in 3.5 s here, 0.3 s on the next start.
+    What this saves when an unrecorded place is first drawn is the pixel shader's compile; the
+    vertex shader (patched per vertex layout, so unknown ahead) and the driver's pipeline build
+    still happen then. Not measured in play.
+  - An earlier count of "2,285 pixel / 1,030 vertex shaders stored" (tools/shader_containers.py over
+    the unpacked data) was wrong: in a V file the code does not follow the header, so the script
+    read whatever came next as code and counted it.
   - The list covers only what has been recorded since this was built; it grows as the user
     plays (regenerate and commit now and then).
 
