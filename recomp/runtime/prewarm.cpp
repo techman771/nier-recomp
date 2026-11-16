@@ -18,6 +18,7 @@
 // NIER_NO_PREWARM=1 turns it off.
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -33,8 +34,11 @@
 
 namespace
 {
+    std::atomic<bool> gListQueued{ false };   // everything on the list has been handed to the renderer (or there is no list)
+
     void PrewarmThread()
     {
+        struct Done { ~Done() { gListQueued = true; } } done;
         while (!RendererReady()) Sleep(50);
         FILE* list = fopen("..\\config\\pipeline_list.txt", "r");
         if (!list) return;
@@ -195,6 +199,62 @@ namespace
 // Called once the game's image is loaded.
 void PrewarmStart()
 {
-    if (GetEnvironmentVariableA("NIER_NO_PREWARM", nullptr, 0) > 0) return;
+    if (GetEnvironmentVariableA("NIER_NO_PREWARM", nullptr, 0) > 0) { gListQueued = true; return; }
     std::thread(PrewarmThread).detach();
+}
+
+// Holds the game's start until everything on the list is built, so nothing on it is compiled
+// during play. With warm caches (the game's compiled shaders and the driver's pipelines) that is
+// well under a second and nothing is shown; otherwise, the first time and after a driver update,
+// a "Preparing shaders" picture with a bar. NIER_NO_PREWARM_WAIT=1: don't wait (the list is then
+// built in the background while the game runs, as before). NIER_PREWARM_SHOW=<ms>: the picture stays
+// at least that long, whatever the caches hold (to look at it).
+void PrewarmWait()
+{
+    if (GetEnvironmentVariableA("NIER_NO_PREWARM_WAIT", nullptr, 0) > 0) return;
+    const ULONGLONG begin = GetTickCount64();
+    char show[16];
+    const ULONGLONG showFor = GetEnvironmentVariableA("NIER_PREWARM_SHOW", show, sizeof(show)) ? ULONGLONG(atoi(show)) : 0;
+    while (!RendererReady()) { if (GetTickCount64() - begin > 20000) return; Sleep(10); }
+    RendererPrewarmBoost(true);
+    std::vector<uint8_t> rgba;
+    uint32_t shownDone = UINT32_MAX, lastDone = 0;
+    uint64_t frame = 0;
+    bool shown = false;
+    ULONGLONG progressAt = GetTickCount64();
+    while (true)
+    {
+        uint32_t done = 0, total = 0;
+        RendererPrewarmProgress(done, total);
+        if (gListQueued && done >= total && GetTickCount64() - begin >= showFor) break;
+        const ULONGLONG now = GetTickCount64();
+        if (done != lastDone) { lastDone = done; progressAt = now; }
+        if (now - progressAt > 30000) { Log("[prewarm] no pipeline finished for 30 s: starting the game without the rest\n"); break; }
+        // Nothing is shown for the first 0.7 s: warm caches are done by then.
+        if (gListQueued && (now - begin > 700 || showFor))
+        {
+            if (done != shownDone)
+            {
+                uint32_t width = 0, height = 0;
+                if (DrawProgressScreen(done, total, rgba, width, height)) RendererSetOverlay(rgba.data(), width, height);
+                shownDone = done;
+                shown = true;
+            }
+            RendererFrame empty;   // a black picture under the overlay
+            empty.frame = frame++;
+            RendererSubmitFrame(std::move(empty));
+        }
+        Sleep(30);
+    }
+    RendererPrewarmBoost(false);
+    if (shown)
+    {
+        RendererSetOverlay(nullptr, 0, 0);
+        RendererFrame empty;
+        empty.frame = frame++;
+        RendererSubmitFrame(std::move(empty));
+    }
+    uint32_t done = 0, total = 0;
+    RendererPrewarmProgress(done, total);
+    Log("[prewarm] %u of %u pipelines ready after %llu ms%s\n", done, total, GetTickCount64() - begin, shown ? " (progress shown)" : "");
 }

@@ -609,7 +609,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
         bool backlog = false;   // ahead-of-time jobs were queued (urgent requests then look for theirs)
     } gShaderJobs;
 
-    void ShaderWorker()
+    // While the game waits for the pipeline list at start-up (PrewarmWait) nothing else needs the
+    // processor: extra workers (`temporary`) help until that is over (RendererPrewarmBoost).
+    std::atomic<bool> gPrewarmBoost{ false };
+    std::atomic<uint32_t> gPipelineJobsQueued{ 0 }, gPipelineJobsDone{ 0 };
+
+    void ShaderWorker(bool temporary)
     {
         while (true)
         {
@@ -617,7 +622,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
             std::shared_ptr<std::promise<ComPtr<ID3DBlob>>> promise;
             {
                 std::unique_lock lock(gShaderJobs.mutex);
-                gShaderJobs.work.wait(lock, [] { return !gShaderJobs.queue.empty(); });
+                gShaderJobs.work.wait(lock, [temporary] { return !gShaderJobs.queue.empty() || (temporary && !gPrewarmBoost); });
+                if (gShaderJobs.queue.empty()) return;
                 shader = gShaderJobs.queue.front();
                 gShaderJobs.queue.pop_front();
                 promise = gShaderJobs.promises[shader->hash];
@@ -637,7 +643,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         {
             gShaderJobs.started = true;
             const unsigned workers = std::clamp(std::thread::hardware_concurrency() / 4, 2u, 6u);
-            for (unsigned i = 0; i < workers; i++) std::thread(ShaderWorker).detach();
+            for (unsigned i = 0; i < workers; i++) std::thread(ShaderWorker, false).detach();
         }
         auto found = gShaderJobs.results.find(shader->hash);
         if (found != gShaderJobs.results.end())
@@ -744,7 +750,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     std::atomic<double> gPipelineWaitMs{ 0 };
     std::atomic<uint64_t> gPipelineWaits{ 0 };
 
-    void PipelineWorker()
+    void PipelineWorker(bool temporary)
     {
         while (true)
         {
@@ -752,13 +758,15 @@ float PSMain(float4 position : SV_Position) : SV_Target
             std::shared_ptr<std::promise<ComPtr<ID3D12PipelineState>>> promise;
             {
                 std::unique_lock lock(gPipelineJobs.mutex);
-                gPipelineJobs.work.wait(lock, [] { return !gPipelineJobs.queue.empty(); });
+                gPipelineJobs.work.wait(lock, [temporary] { return !gPipelineJobs.queue.empty() || (temporary && !gPrewarmBoost); });
+                if (gPipelineJobs.queue.empty()) return;
                 job = std::move(gPipelineJobs.queue.front());
                 gPipelineJobs.queue.pop_front();
                 promise = gPipelineJobs.promises[job.first];
                 gPipelineJobs.promises.erase(job.first);
             }
             promise->set_value(CreatePipeline(job.second));
+            gPipelineJobsDone++;
         }
     }
 
@@ -769,7 +777,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         {
             gPipelineJobs.started = true;
             const unsigned workers = std::clamp(std::thread::hardware_concurrency() / 6, 2u, 4u);
-            for (unsigned i = 0; i < workers; i++) std::thread(PipelineWorker).detach();
+            for (unsigned i = 0; i < workers; i++) std::thread(PipelineWorker, false).detach();
         }
         auto found = gPipelineJobs.results.find(key);
         if (found != gPipelineJobs.results.end())
@@ -789,6 +797,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::shared_future<ComPtr<ID3D12PipelineState>> future = promise->get_future().share();
         gPipelineJobs.results[key] = future;
         gPipelineJobs.promises[key] = promise;
+        gPipelineJobsQueued++;
         if (urgent) gPipelineJobs.queue.emplace_front(key, state);
         else { gPipelineJobs.queue.emplace_back(key, state); gPipelineJobs.backlog = true; }
         gPipelineJobs.work.notify_one();
@@ -3872,6 +3881,36 @@ void RendererPrewarmPipeline(const std::shared_ptr<GuestShader>& vs, const std::
     state.frontCounterClockwise = (flags >> 5) & 1;
     gPrewarmedPipelines++;
     QueuePipeline(state, PipelineKey(state), false);
+}
+
+// Pipelines created so far, of those asked for (the list's and the game's).
+void RendererPrewarmProgress(uint32_t& done, uint32_t& total)
+{
+    done = gPipelineJobsDone.load();
+    total = gPipelineJobsQueued.load();
+}
+
+// On: extra shader and pipeline workers, for as long as the game itself is not running. Off: they
+// finish what they hold and leave.
+void RendererPrewarmBoost(bool on)
+{
+    if (on && !gPrewarmBoost.exchange(true))
+    {
+        const unsigned threads = std::thread::hardware_concurrency();
+        const unsigned extra = threads > 6 ? (threads - 4) / 2 : 1;   // of each kind, beside the usual 2-6 and 2-4
+        for (unsigned i = 0; i < extra; i++)
+        {
+            std::thread(ShaderWorker, true).detach();
+            std::thread(PipelineWorker, true).detach();
+        }
+    }
+    else if (!on && gPrewarmBoost.exchange(false))
+    {
+        { std::lock_guard lock(gShaderJobs.mutex); }
+        gShaderJobs.work.notify_all();
+        { std::lock_guard lock(gPipelineJobs.mutex); }
+        gPipelineJobs.work.notify_all();
+    }
 }
 
 bool RendererFsr4Available()

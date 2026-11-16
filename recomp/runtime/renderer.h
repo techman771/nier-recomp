@@ -212,3 +212,7 @@ void RendererPreparePipeline(const RendererDraw& draw);
 void RendererPrewarmShader(const std::shared_ptr<GuestShader>& shader);
 void RendererPrewarmPipeline(const std::shared_ptr<GuestShader>& vs, const std::shared_ptr<GuestShader>& ps, uint32_t blendControl, uint32_t writeMask,
                              uint32_t depthControl, uint32_t stencilRefMask, uint32_t flags);
+void RendererPrewarmProgress(uint32_t& done, uint32_t& total);   // pipelines created, of those asked for
+void RendererPrewarmBoost(bool on);                              // extra workers while the game waits (PrewarmWait)
+// The "Preparing shaders" picture (osk.cpp): 1920x1080 RGBA for RendererSetOverlay.
+bool DrawProgressScreen(uint32_t done, uint32_t total, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);

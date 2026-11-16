@@ -628,6 +628,14 @@ Pre-compilation, second look (after 581 shaders captured in the playthrough so f
     pipelines and all 451 shaders placed (before: 199 of 353), the tool takes about 11 s.
   - The user's first play of the opening with the list at 353 recorded 206 more combinations:
     the opening had not been recorded on this machine, and it stuttered from compiles.
+  - The game's start waits for the list (`PrewarmWait`, prewarm.cpp, called after `PrewarmStart`):
+    before, the list was built in the background and a fresh machine reached the opening first.
+    While it waits extra shader and pipeline workers run (`RendererPrewarmBoost`: nothing else
+    needs the processor), and after 0.7 s a "Preparing shaders" picture with a bar is shown
+    (`DrawProgressScreen`, osk.cpp, as the overlay over empty frames). Here: 0.4 s with warm
+    caches (nothing shown), 1.7 s with the game's shader cache emptied and the driver's partly
+    warm. `NIER_NO_PREWARM_WAIT=1` starts at once as before; `NIER_PREWARM_SHOW=<ms>` keeps the
+    picture up that long to look at it. It gives up if no pipeline finishes for 30 s.
   - The list covers only what has been recorded since this was built; it grows as the user
     plays (regenerate and commit now and then).
 

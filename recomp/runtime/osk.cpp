@@ -248,6 +248,46 @@ bool DrawSmallLabel(const std::string& text, std::vector<uint8_t>& rgba, uint32_
     return true;
 }
 
+bool DrawProgressScreen(uint32_t done, uint32_t total, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
+{
+    if (!StartGdiplus()) return false;
+    width = kCanvasWidth;
+    height = kCanvasHeight;
+    Bitmap bitmap(INT(width), INT(height), PixelFormat32bppARGB);
+    {
+        Graphics g(&bitmap);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+        g.Clear(Color(255, 0, 0, 0));
+        SolidBrush ink(Color(255, 236, 232, 222)), dim(Color(255, 150, 146, 138)), trough(Color(255, 40, 39, 36));
+        FontFamily family(L"Segoe UI");
+        Font title(&family, 54, FontStyleRegular, UnitPixel), note(&family, 30, FontStyleRegular, UnitPixel);
+        StringFormat centred;
+        centred.SetAlignment(StringAlignmentCenter);
+        g.DrawString(L"Preparing shaders", -1, &title, RectF(0, 420, float(width), 80), &centred, &ink);
+        const float left = 560, top = 530, barWidth = 800, barHeight = 10;
+        g.FillRectangle(&trough, left, top, barWidth, barHeight);
+        const float part = total ? float((std::min)(done, total)) / float(total) : 0.0f;
+        g.FillRectangle(&ink, left, top, barWidth * part, barHeight);
+        wchar_t count[64];
+        swprintf(count, 64, L"%u of %u", (std::min)(done, total), total);
+        g.DrawString(count, -1, &note, RectF(0, 566, float(width), 50), &centred, &dim);
+        g.DrawString(L"This happens the first time the game starts, and after a graphics driver update.", -1, &note, RectF(0, 640, float(width), 50), &centred, &dim);
+    }
+    BitmapData data;
+    Rect all(0, 0, INT(width), INT(height));
+    rgba.resize(size_t(width) * height * 4);
+    if (bitmap.LockBits(&all, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return false;
+    for (uint32_t y = 0; y < height; y++)
+    {
+        const uint8_t* source = static_cast<const uint8_t*>(data.Scan0) + size_t(y) * data.Stride;
+        uint8_t* out = rgba.data() + size_t(y) * width * 4;
+        for (uint32_t x = 0; x < width; x++) { out[x * 4] = source[x * 4 + 2]; out[x * 4 + 1] = source[x * 4 + 1]; out[x * 4 + 2] = source[x * 4]; out[x * 4 + 3] = source[x * 4 + 3]; }
+    }
+    bitmap.UnlockBits(&data);
+    return true;
+}
+
 bool OskActive() { return gActive.load(); }
 
 void OskChar(wchar_t c)

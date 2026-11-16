@@ -573,7 +573,8 @@ int main(int argc, char** argv)
     FrameReplayRunIfRequested();   // NIER_REPLAY_FRAME: render a saved frame instead of running the game
     BuildFunctionIndex();
     uint32_t entry = LoadGame(gameDir);
-    PrewarmStart();   // shaders and pipelines from the pipeline list, in the background
+    PrewarmStart();   // shaders and pipelines from the pipeline list
+    PrewarmWait();    // ... all built before the game starts (a progress picture when that takes long)
     ProfilerInit();
     WatchInit();
     BreakInit();
