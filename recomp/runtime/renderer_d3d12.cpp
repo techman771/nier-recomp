@@ -6,6 +6,10 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <pdh.h>     // GPU use, for the load readout (SampleLoad)
+#include <pdhmsg.h>
+#include <psapi.h>
+#pragma comment(lib, "pdh.lib")
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -1597,10 +1601,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // square depth copy (1024x1024 in this game; the scene's own depth copies have the screen's
     // shape) that isn't the picture. Its pass is the commands before that copy back to the previous
     // copy from the same surface or the start of the frame: the clears and the casters' draws.
-    std::vector<std::pair<size_t, size_t>> ShadowPasses(const RendererFrame& frame)
+    std::vector<std::pair<size_t, size_t>> ShadowPasses(const RendererFrame& frame, bool always = false)
     {
         std::vector<std::pair<size_t, size_t>> passes;
-        if (gShadowTwelfths == gResTwelfths) return passes;
+        if (!always && gShadowTwelfths == gResTwelfths) return passes;
         for (size_t i = 0; i < frame.commands.size(); i++)
         {
             const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]);
@@ -1634,10 +1638,10 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // row is half covered, the average the game reads is too dark and so is the whole picture.
     // The whole chain goes together: its surfaces are levels of one texture and must agree.
     uint32_t DataTwelfths() { return std::max(1u, gResTwelfths / 12) * 12; }
-    std::vector<std::pair<size_t, size_t>> DataPasses(const RendererFrame& frame)
+    std::vector<std::pair<size_t, size_t>> DataPasses(const RendererFrame& frame, bool always = false)
     {
         std::vector<std::pair<size_t, size_t>> passes;
-        if (gResTwelfths == DataTwelfths()) return passes;
+        if (!always && gResTwelfths == DataTwelfths()) return passes;
         for (size_t i = 0; i < frame.commands.size(); i++)
         {
             const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]);
@@ -1666,14 +1670,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // scales the scene texture to the display as it draws, and everything after lands on display
     // pixels. Returns the index of the first command of the pass (commands.size() if there is none)
     // and the target it draws to. NIER_NATIVE_2D=0 turns it off.
-    size_t FindFlatPhase(const RendererFrame& frame, RenderTargetKey& target)
+    size_t FindFlatPhase(const RendererFrame& frame, RenderTargetKey& target, bool always = false)
     {
         const size_t none = frame.commands.size();
         static const bool enabled = [] {
             char value[8];
             return !(GetEnvironmentVariableA("NIER_NATIVE_2D", value, sizeof(value)) && value[0] == '0');
         }();
-        if (!enabled || !frame.scanoutBase || gDisplayTwelfths == gResTwelfths) return none;
+        if (!frame.scanoutBase || (!always && (!enabled || gDisplayTwelfths == gResTwelfths))) return none;
         size_t end = none;
         for (size_t i = frame.commands.size(); i-- > 0;)
             if (const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]))
@@ -2227,6 +2231,7 @@ float2 main(MotionOut input) : SV_Target
         PfnFfxDispatch dispatch = nullptr;
         int state = 0;   // 0 not tried, 1 loaded, -1 unavailable
         ffxContext context = nullptr;
+        bool newest = false;   // the context was made for the FSR 4 setting (else FSR 3.1)
         uint32_t renderWidth = 0, renderHeight = 0, outWidth = 0, outHeight = 0;
         ComPtr<ID3D12Resource> motion, output;
         D3D12_RESOURCE_STATES outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -2239,6 +2244,12 @@ float2 main(MotionOut input) : SV_Target
         uint32_t jitterIndex = 0;
         uint64_t frame = ~0ull;   // the frame it last ran in
     } gTemporal;
+
+    std::string gTemporalName = "FSR 3.1";   // the temporal upscaler in use, for the timing log ("FSR 4.1.2")
+    std::string gAdapterName;
+    ComPtr<IDXGIAdapter3> gAdapter3;   // for the video memory in use (SampleLoad)
+    std::mutex gPerfMutex;
+    RendererPerf gPerfTotals;   // since the last RendererPerfTake
 
     void TemporalMessage(uint32_t type, const wchar_t* message)
     {
@@ -2315,13 +2326,65 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     }
 
     // 0 off, 1 FSR 1, 2 temporal (FSR 3.1 / 4); only below the display's resolution.
-    int UpscalingMode()
+    int UpscalingSetting()
     {
         static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING", v, sizeof(v)) ? atoi(v) : -1; }();
+        return forced >= 0 ? forced : Settings().upscaling.load();
+    }
+
+    // 0 plain filtering, 1 FSR 1, 2 temporal (the FSR 3.1 and FSR 4 settings: TemporalWantsNewest).
+    int UpscalingMode()
+    {
         if (gResTwelfths >= gDisplayTwelfths) return 0;
-        const int mode = forced >= 0 ? forced : Settings().upscaling.load();
+        const int mode = std::min(UpscalingSetting(), 2);
         if (mode == 2 && !TemporalLoaded()) return 1;
         return mode;
+    }
+
+    bool TemporalWantsNewest() { return UpscalingSetting() >= 3; }
+
+    // The upscaler version to ask the FSR loader for. Left to itself it picks the newest it can find,
+    // and an AMD driver supplies FSR 4 in place of 3.1: a far heavier upscaler, which on an integrated
+    // GPU costs more than rendering fewer pixels saves. So the FSR 3.1 setting asks for the newest
+    // 3.x, and only the FSR 4 setting takes a 4.x (3.1 when the driver has none). 0: no choice made.
+    uint64_t TemporalVersion(bool newest)
+    {
+        TemporalState& t = gTemporal;
+        uint64_t count = 0;
+        ffxQueryDescGetVersions versions{};
+        versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+        versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        versions.device = gDevice.Get();
+        versions.outputCount = &count;
+        if (t.query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0) return 0;
+        std::vector<uint64_t> ids(count);
+        std::vector<const char*> names(count);
+        versions.versionIds = ids.data();
+        versions.versionNames = names.data();
+        if (t.query(nullptr, &versions.header) != FFX_API_RETURN_OK) return 0;
+        std::string listed;
+        uint64_t chosen = 0, fallback = 0;
+        int chosenRank[3] = { -1, -1, -1 }, fallbackRank[3] = { -1, -1, -1 };
+        for (uint64_t i = 0; i < count; i++)
+        {
+            const char* name = names[i] ? names[i] : "";
+            listed += listed.empty() ? "" : ", ";
+            listed += name;
+            int rank[3] = { 0, 0, 0 };
+            sscanf(name, "%d.%d.%d", &rank[0], &rank[1], &rank[2]);
+            const bool wanted = newest ? rank[0] >= 4 : rank[0] == 3;
+            int* best = wanted ? chosenRank : fallbackRank;
+            if (wanted || rank[0] == 3)
+                if (std::lexicographical_compare(best, best + 3, rank, rank + 3))
+                {
+                    memcpy(best, rank, sizeof(rank));
+                    (wanted ? chosen : fallback) = ids[i];
+                }
+        }
+        static std::string logged;
+        if (logged != listed) { Log("[fsr3] upscaler versions on this system: %s\n", listed.c_str()); logged = listed; }
+        if (!chosen && newest) Log("[fsr3] no FSR 4 on this system (it comes with the AMD driver, for GPUs that support it): using FSR 3.1\n");
+        return chosen ? chosen : fallback;
     }
 
     float Halton(uint32_t index, uint32_t base)
@@ -2433,7 +2496,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const uint32_t outWidth = (surface.width * gDisplayTwelfths + 6) / 12, outHeight = (surface.height * gDisplayTwelfths + 6) / 12;
         if (gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return nullptr;
 
-        if (!t.context || t.renderWidth != renderWidth || t.renderHeight != renderHeight || t.outWidth != outWidth || t.outHeight != outHeight)
+        const bool newest = TemporalWantsNewest();
+        if (!t.context || t.renderWidth != renderWidth || t.renderHeight != renderHeight || t.outWidth != outWidth || t.outHeight != outHeight || t.newest != newest)
         {
             if (t.context) { WaitForGpu(); t.destroy(&t.context, nullptr); t.context = nullptr; }
             if (t.motion) gRetired.push_back(std::move(t.motion));
@@ -2444,6 +2508,11 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             ffxCreateContextDescUpscale create{};
             create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
             create.header.pNext = &backend.header;
+            ffxOverrideVersion pinned{};
+            pinned.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+            pinned.versionId = TemporalVersion(newest);
+            if (pinned.versionId) backend.header.pNext = &pinned.header;
+            t.newest = newest;
             create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
             create.maxRenderSize = { renderWidth, renderHeight };
             create.maxUpscaleSize = { outWidth, outHeight };
@@ -2484,6 +2553,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             t.outHeight = outHeight;
             t.history = false;
             Log("[fsr3] upscaler ready: %s, %ux%u -> %ux%u\n", provider.versionName ? provider.versionName : "unknown version", renderWidth, renderHeight, outWidth, outHeight);
+            gTemporalName = std::string("FSR ") + (provider.versionName ? provider.versionName : "3.1");
         }
 
         // Motion vectors: last frame's camera applied to this frame's positions.
@@ -2599,6 +2669,73 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         return t.output.Get();
     }
 
+    // GPU time by stage: a timestamp is written into the command list wherever the stage changes, and
+    // the differences are summed per stage once the frame is done (the render thread waits for it).
+    enum GpuStage : int { kStageOther, kStageShadows, kStageScene, kStagePost, kStageData, kStageUpscale, kStageFlat, kStagePresent };
+    const char* const kStageNames[kRendererPerfStages] = { "other", "shadows", "scene", "post", "exposure", "upscaling", "2D", "present" };
+    struct StageTimer
+    {
+        static const UINT kMax = 256;
+        ComPtr<ID3D12QueryHeap> heap;
+        ComPtr<ID3D12Resource> readback;
+        UINT used = 0;
+        int stages[kMax] = {};
+        int current = kStageOther;
+        bool tried = false, ok = false;
+        UINT64 frequency = 0;
+    } gStages;
+
+    void StageBegin()
+    {
+        StageTimer& t = gStages;
+        if (!t.tried)
+        {
+            t.tried = true;
+            D3D12_QUERY_HEAP_DESC desc{};
+            desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            desc.Count = StageTimer::kMax;
+            t.readback = MakeBuffer(StageTimer::kMax * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            t.ok = SUCCEEDED(gDevice->CreateQueryHeap(&desc, IID_PPV_ARGS(&t.heap))) && t.readback && SUCCEEDED(gQueue->GetTimestampFrequency(&t.frequency)) && t.frequency;
+            if (!t.ok) Log("[perf] no GPU timestamps on this system: the stage times stay at zero\n");
+        }
+        t.used = 0;
+        t.current = kStageOther;
+        if (t.ok) gList->EndQuery(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.used++);
+    }
+
+    void StageMark(int stage)
+    {
+        StageTimer& t = gStages;
+        if (!t.ok || stage == t.current || t.used == 0 || t.used >= StageTimer::kMax - 1) return;
+        t.stages[t.used - 1] = t.current;
+        gList->EndQuery(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.used++);
+        t.current = stage;
+    }
+
+    void StageEnd()
+    {
+        StageTimer& t = gStages;
+        if (!t.ok || t.used == 0) return;
+        t.stages[t.used - 1] = t.current;
+        gList->EndQuery(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.used++);
+        gList->ResolveQueryData(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, t.used, t.readback.Get(), 0);
+    }
+
+    // After the frame's GPU work is complete: adds each stage's milliseconds to `ms`.
+    void StageCollect(double ms[kRendererPerfStages])
+    {
+        StageTimer& t = gStages;
+        if (!t.ok || t.used < 2) return;
+        void* mapped = nullptr;
+        D3D12_RANGE range{ 0, SIZE_T(t.used) * sizeof(UINT64) };
+        if (FAILED(t.readback->Map(0, &range, &mapped))) return;
+        const UINT64* stamps = static_cast<const UINT64*>(mapped);
+        for (UINT i = 0; i + 1 < t.used; i++)
+            if (stamps[i + 1] > stamps[i]) ms[t.stages[i]] += double(stamps[i + 1] - stamps[i]) * 1000.0 / double(t.frequency);
+        D3D12_RANGE none{ 0, 0 };
+        t.readback->Unmap(0, &none);
+    }
+
     // Before a draw of the 2D pass: the scene-sized resolved surfaces it samples get their upscaled
     // stand-ins (WriteTextureDescriptor binds them).
     void PrepareUpscaledTextures(const RendererDraw& draw)
@@ -2612,10 +2749,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             auto found = gResolved.find(binding.resolvedBase);
             if (found == gResolved.end() || found->second.depth || !found->second.texture || found->second.twelfths != gResTwelfths) continue;
             if (found->second.width < 1024 || found->second.height < 576) continue;   // the scene, not a small effect buffer
+            StageMark(kStageUpscale);
             ID3D12Resource* upscaled = mode == 2 ? TemporalUpscaled(binding.resolvedBase, found->second) : nullptr;
             if (!upscaled) upscaled = Upscaled(binding.resolvedBase, found->second);
             if (upscaled) gUpscaledNow[binding.resolvedBase] = upscaled;
         }
+        StageMark(kStageFlat);
     }
 
     void ExecuteGuestCommands(const RendererFrame& frame)
@@ -2636,9 +2775,26 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const std::vector<std::pair<size_t, size_t>> dataPasses = DataPasses(frame);
         size_t dataPass = 0;
         TemporalBeginFrame(frame, shadowPasses, flatStart);
+        // For the stage times the passes are found whether or not they need their own treatment, so
+        // the same work is counted under the same stage at every setting.
+        const std::vector<std::pair<size_t, size_t>> timedShadows = shadowPasses.empty() ? ShadowPasses(frame, true) : shadowPasses;
+        const std::vector<std::pair<size_t, size_t>> timedData = dataPasses.empty() ? DataPasses(frame, true) : dataPasses;
+        RenderTargetKey timedFlatTarget = flatTarget;
+        const size_t timedFlatStart = hasFlat ? flatStart : FindFlatPhase(frame, timedFlatTarget, true);
+        size_t timedShadow = 0, timedDataPass = 0;
         for (size_t index = 0; index < frame.commands.size(); index++)
         {
             const auto& command = frame.commands[index];
+            {
+                while (timedShadow < timedShadows.size() && index > timedShadows[timedShadow].second) timedShadow++;
+                while (timedDataPass < timedData.size() && index > timedData[timedDataPass].second) timedDataPass++;
+                const RendererDraw* draw = std::get_if<RendererDraw>(&command);
+                if (timedShadow < timedShadows.size() && index >= timedShadows[timedShadow].first) StageMark(kStageShadows);
+                else if (timedDataPass < timedData.size() && index >= timedData[timedDataPass].first) StageMark(kStageData);
+                else if (index >= timedFlatStart && (draw ? draw->hasColor && SameTarget(draw->target, timedFlatTarget) : SameTarget(std::get<RendererResolve>(command).source, timedFlatTarget)))
+                    StageMark(kStageFlat);
+                else if (draw) StageMark(draw->rectList ? kStagePost : kStageScene);   // full-screen passes are rectangles
+            }
             gActiveTwelfths = gResTwelfths;
             gInShadowPass = gInFlatPass = false;
             while (shadowPass < shadowPasses.size() && index > shadowPasses[shadowPass].second) shadowPass++;
@@ -2781,11 +2937,75 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         gList->DrawInstanced(3, 1, 0, 0);
     }
 
+    // The system's load, for the readout beside the frame rate counter: processor use (the whole system's), GPU use (the
+    // busiest of the 3D engines' totals, as Task Manager shows it; from the system's performance
+    // counters), and the memory and video memory this process holds.
+    struct Load { double cpu = -1, gpu = -1, ramGb = 0, vramGb = 0; };
+    Load SampleLoad()
+    {
+        Load load;
+        static ULONGLONG idleBefore = 0, busyBefore = 0;
+        FILETIME idle, kernel, user;
+        if (GetSystemTimes(&idle, &kernel, &user))
+        {
+            const auto value = [](const FILETIME& t) { return (ULONGLONG(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+            const ULONGLONG idleNow = value(idle), allNow = value(kernel) + value(user);   // kernel time includes idle
+            if (busyBefore && allNow > busyBefore) load.cpu = 100.0 * (1.0 - double(idleNow - idleBefore) / double(allNow - busyBefore));
+            idleBefore = idleNow;
+            busyBefore = allNow;
+        }
+        static PDH_HQUERY query = nullptr;
+        static PDH_HCOUNTER counter = nullptr;
+        static bool tried = false;
+        if (!tried)
+        {
+            tried = true;
+            if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS || PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &counter) != ERROR_SUCCESS)
+            {
+                Log("[perf] no GPU use counters on this system\n");
+                query = nullptr;
+            }
+            else PdhCollectQueryData(query);
+        }
+        else if (query && PdhCollectQueryData(query) == ERROR_SUCCESS)
+        {
+            DWORD size = 0, count = 0;
+            if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &size, &count, nullptr) == PDH_MORE_DATA)
+            {
+                std::vector<uint8_t> buffer(size);
+                auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+                if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &size, &count, items) == ERROR_SUCCESS)
+                {
+                    // Instances are "pid_N_luid_..._phys_P_eng_E_engtype_3D": every process's share of each engine.
+                    std::unordered_map<std::wstring, double> engines;
+                    for (DWORD i = 0; i < count; i++)
+                    {
+                        const std::wstring name = items[i].szName;
+                        if (name.find(L"engtype_3D") == std::wstring::npos || items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+                        const size_t luid = name.find(L"luid_");
+                        engines[luid == std::wstring::npos ? name : name.substr(luid)] += items[i].FmtValue.doubleValue;
+                    }
+                    double most = 0;
+                    for (const auto& [engine, use] : engines) most = (std::max)(most, use);
+                    load.gpu = (std::min)(most, 100.0);
+                }
+            }
+        }
+        PROCESS_MEMORY_COUNTERS memory{};
+        memory.cb = sizeof(memory);
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) load.ramGb = double(memory.WorkingSetSize) / (1024.0 * 1024.0 * 1024.0);
+        DXGI_QUERY_VIDEO_MEMORY_INFO video{};
+        if (gAdapter3 && SUCCEEDED(gAdapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &video))) load.vramGb = double(video.CurrentUsage) / (1024.0 * 1024.0 * 1024.0);
+        return load;
+    }
+
     // Frame rate counter (PC Settings; NIER_SHOW_FPS=1 forces it on): the game frames presented a
-    // second, counted here and redrawn twice a second, in the top left corner of the picture.
+    // second, counted here and redrawn twice a second, in the top left corner of the picture. With
+    // NIER_SHOW_LOAD=1 it also shows the system's load.
     void DrawFpsCounter()
     {
-        static const bool forced = GetEnvironmentVariableA("NIER_SHOW_FPS", nullptr, 0) > 0;
+        static const bool showLoad = GetEnvironmentVariableA("NIER_SHOW_LOAD", nullptr, 0) > 0;
+        static const bool forced = showLoad || GetEnvironmentVariableA("NIER_SHOW_FPS", nullptr, 0) > 0;
         static uint32_t frames = 0;
         static LARGE_INTEGER since{};
         static std::shared_ptr<DecodedTexture> label;
@@ -2798,8 +3018,24 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const double elapsed = double(now.QuadPart - since.QuadPart) / double(frequency.QuadPart);
         if (elapsed >= 0.5)
         {
-            char text[32];
-            snprintf(text, sizeof(text), "%.0f fps", frames / elapsed);
+            char text[128];
+            int length = snprintf(text, sizeof(text), "%.0f fps", frames / elapsed);
+            if (showLoad)
+            {
+                const Load load = SampleLoad();
+                if (load.cpu >= 0) length += snprintf(text + length, sizeof(text) - length, "   CPU %.0f%%", load.cpu);
+                if (load.gpu >= 0) length += snprintf(text + length, sizeof(text) - length, "   GPU %.0f%%", load.gpu);
+                length += snprintf(text + length, sizeof(text) - length, "   RAM %.1f GB   VRAM %.1f GB", load.ramGb, load.vramGb);
+                if (load.cpu >= 0 && load.gpu >= 0)
+                {
+                    std::lock_guard lock(gPerfMutex);
+                    gPerfTotals.loadSamples++;
+                    gPerfTotals.cpuPercent += load.cpu;
+                    gPerfTotals.gpuPercent += load.gpu;
+                    gPerfTotals.ramGb = (std::max)(gPerfTotals.ramGb, load.ramGb);
+                    gPerfTotals.vramGb = (std::max)(gPerfTotals.vramGb, load.vramGb);
+                }
+            }
             auto made = std::make_shared<DecodedTexture>();
             if (DrawSmallLabel(text, made->data, made->width, made->height))
             {
@@ -2865,6 +3101,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         DXGI_ADAPTER_DESC1 adapterDesc;
         adapter->GetDesc1(&adapterDesc);
         Log("[d3d12] adapter: %ls\n", adapterDesc.Description);
+        {
+            char name[128] = "";
+            WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+            gAdapterName = name;
+            adapter.As(&gAdapter3);
+        }
         if (!Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&gDevice)), "device")) return false;
         if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
         {
@@ -3082,9 +3324,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     {
         WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
         ApplyResolutionSetting();
+        LARGE_INTEGER perfStart;
+        QueryPerformanceCounter(&perfStart);
 
         gAllocator->Reset();
         gList->Reset(gAllocator.Get(), nullptr);
+        StageBegin();
 
         if (movie)
         {
@@ -3127,6 +3372,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         }
 
         if (guest) ExecuteGuestCommands(*guest);
+        StageMark(kStagePresent);
 
         const UINT index = gSwapChain->GetCurrentBackBufferIndex();
         ID3D12Resource* backBuffer = gBackBuffers[index].Get();
@@ -3198,7 +3444,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             for (int i = 0; i < 3; i++) toCopyDest[i] = Transition(gTextures[i].Get(), kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
             gList->ResourceBarrier(3, toCopyDest);
         }
+        StageEnd();
         gList->Close();
+        LARGE_INTEGER perfRecorded;
+        QueryPerformanceCounter(&perfRecorded);
 
         ID3D12CommandList* lists[] = { gList.Get() };
         gQueue->ExecuteCommandLists(1, lists);
@@ -3248,8 +3497,56 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         }
         gPresented++;
         if (movie) RecordImageTiming(planes[0]);
+        LARGE_INTEGER perfPresented;
+        QueryPerformanceCounter(&perfPresented);
         WaitForGpu();
         gRetired.clear();   // the frame's GPU work is complete
+        {
+            // Every 600 frames: the frame rate and where the time went, on average: the render thread's
+            // (it waits for the GPU to finish each frame, so that wait is the GPU's time unless the
+            // present itself waited: VSync) and the GPU's by stage. The same sums feed RendererPerfTake.
+            static LARGE_INTEGER frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+            static int64_t since = 0, slowest = 0;
+            static RendererPerf logged;
+            LARGE_INTEGER perfDone;
+            QueryPerformanceCounter(&perfDone);
+            const double ms = 1000.0 / double(frequency.QuadPart);
+            double stages[kRendererPerfStages] = {};
+            StageCollect(stages);
+            const int mode = UpscalingMode();
+            {
+                std::lock_guard lock(gPerfMutex);
+                for (RendererPerf* perf : { &logged, &gPerfTotals })
+                {
+                    perf->frames++;
+                    perf->recordMs += double(perfRecorded.QuadPart - perfStart.QuadPart) * ms;
+                    perf->presentMs += double(perfPresented.QuadPart - perfRecorded.QuadPart) * ms;
+                    perf->gpuWaitMs += double(perfDone.QuadPart - perfPresented.QuadPart) * ms;
+                    for (int i = 0; i < kRendererPerfStages; i++) perf->stageMs[i] += stages[i];
+                    perf->slowestMs = (std::max)(perf->slowestMs, double(perfDone.QuadPart - perfStart.QuadPart) * ms);
+                }
+                gPerfTotals.renderWidth = Scaled(1280);
+                gPerfTotals.renderHeight = Scaled(720);
+                gPerfTotals.windowWidth = gWidth;
+                gPerfTotals.windowHeight = gHeight;
+                snprintf(gPerfTotals.upscaler, sizeof(gPerfTotals.upscaler), "%s", mode == 0 ? "-" : mode == 1 || !gTemporal.history ? "FSR 1" : gTemporalName.c_str());
+            }
+            slowest = std::max<int64_t>(slowest, perfDone.QuadPart - perfStart.QuadPart);
+            if (since == 0) since = perfStart.QuadPart;
+            if (logged.frames == 600)
+            {
+                char gpu[256] = "";
+                for (int i = 0, at = 0; i < kRendererPerfStages; i++)
+                    if (logged.stageMs[i] / 600.0 >= 0.005) at += snprintf(gpu + at, sizeof(gpu) - at, "%s%s %.2f", at ? ", " : "", kStageNames[i], logged.stageMs[i] / 600.0);
+                Log("[perf] frame %llu: %.1f fps; render thread %.2f ms a frame (recording %.2f, present %.2f, waiting for the GPU %.2f; slowest %.1f); GPU: %s; %ux%u shown at %ux%u, upscaling %s\n",
+                    frame, 600.0 * double(frequency.QuadPart) / double(perfDone.QuadPart - since), (logged.recordMs + logged.presentMs + logged.gpuWaitMs) / 600.0,
+                    logged.recordMs / 600.0, logged.presentMs / 600.0, logged.gpuWaitMs / 600.0, double(slowest) * ms, gpu,
+                    Scaled(1280), Scaled(720), gWidth, gHeight, gPerfTotals.upscaler);
+                since = perfDone.QuadPart;
+                slowest = 0;
+                logged = RendererPerf{};
+            }
+        }
         if (!gPendingWriteBacks.empty())
         {
             void* mapped = nullptr;
@@ -3576,3 +3873,39 @@ void RendererPrewarmPipeline(const std::shared_ptr<GuestShader>& vs, const std::
     gPrewarmedPipelines++;
     QueuePipeline(state, PipelineKey(state), false);
 }
+
+bool RendererFsr4Available()
+{
+    if (!gDevice) return false;
+    static const bool available = [] {
+        HMODULE library = LoadLibraryA("amd_fidelityfx_loader_dx12.dll");
+        const PfnFfxQuery query = library ? (PfnFfxQuery)GetProcAddress(library, "ffxQuery") : nullptr;
+        if (!query) return false;
+        uint64_t count = 0;
+        ffxQueryDescGetVersions versions{};
+        versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+        versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        versions.device = gDevice.Get();
+        versions.outputCount = &count;
+        if (query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0) return false;
+        std::vector<const char*> names(count);
+        versions.versionNames = names.data();
+        if (query(nullptr, &versions.header) != FFX_API_RETURN_OK) return false;
+        bool found = false;
+        for (uint64_t i = 0; i < count; i++) found = found || (names[i] && atoi(names[i]) >= 4);
+        Log("[fsr3] FSR 4 %s on this system\n", found ? "is available" : "is not available: the Upscaling setting leaves it out");
+        return found;
+    }();
+    return available;
+}
+
+RendererPerf RendererPerfTake()
+{
+    std::lock_guard lock(gPerfMutex);
+    RendererPerf taken = gPerfTotals;
+    snprintf(taken.adapter, sizeof(taken.adapter), "%s", gAdapterName.c_str());
+    gPerfTotals = RendererPerf{};
+    return taken;
+}
+
+const char* RendererPerfStageName(int stage) { return stage >= 0 && stage < kRendererPerfStages ? kStageNames[stage] : ""; }

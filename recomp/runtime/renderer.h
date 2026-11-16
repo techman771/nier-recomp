@@ -157,6 +157,27 @@ struct RendererFrame
 void RendererInit(void* nativeWindow, uint32_t width, uint32_t height);
 void RendererResize(uint32_t width, uint32_t height);
 uint32_t RendererDisplayHz();        // the refresh rate of the display the window is on
+// Frame timing, summed over the frames rendered since the last call (which starts a new sum): the
+// render thread's time (recording the commands, the present, waiting for the GPU to finish the frame)
+// and the GPU's time by stage (RendererPerfStageName), all in milliseconds.
+enum { kRendererPerfStages = 8 };
+struct RendererPerf
+{
+    uint32_t frames = 0;
+    double recordMs = 0, presentMs = 0, gpuWaitMs = 0, stageMs[kRendererPerfStages] = {};
+    double slowestMs = 0;      // the longest the render thread took over one frame
+    uint32_t renderWidth = 0, renderHeight = 0, windowWidth = 0, windowHeight = 0;
+    char upscaler[32] = "";    // what enlarged the picture in the last frame ("-" for nothing)
+    // The system's load while the load readout is on: sums over `loadSamples` samples (two a
+    // second) of the processor and GPU use in percent, and the most memory this process held, in GB.
+    uint32_t loadSamples = 0;
+    double cpuPercent = 0, gpuPercent = 0, ramGb = 0, vramGb = 0;
+    char adapter[128] = "";
+};
+RendererPerf RendererPerfTake();
+const char* RendererPerfStageName(int stage);
+// Whether this system has an FSR 4 upscaler (it comes with the AMD driver, for the GPUs it supports).
+bool RendererFsr4Available();
 bool RendererWaitDisplayVblank();   // waits one 60 Hz period of the display's own refreshes; false if it can't
 bool RendererReady();
 // A picture of ours drawn over the game's, alpha-blended, in the largest 16:9 area of the window

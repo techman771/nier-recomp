@@ -29,6 +29,8 @@
 #include "input.h"
 #include "glyphs.h"
 
+bool RendererFsr4Available();   // renderer.h
+
 extern "C" PPC_FUNC(__imp__sub_824197A8);
 extern "C" PPC_FUNC(__imp__sub_824178D0);
 extern "C" PPC_FUNC(__imp__sub_82416168);
@@ -57,7 +59,7 @@ namespace
             { "vsync", &gSettings.vsync, 0, 1 },
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
-            { "upscaling", &gSettings.upscaling, 0, 2 },
+            { "upscaling", &gSettings.upscaling, 0, 3 },
             { "save_page", &gSettings.savePage, 1, 10 },
             { "show_fps", &gSettings.showFps, 0, 1 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
@@ -82,7 +84,7 @@ namespace
         T_Icons, T_IconsHelp, T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal,
         T_Resolution, T_ResolutionHelp, T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880,
         T_Shadows, T_ShadowsHelp, T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra,
-        T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3,
+        T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4, T_UpscalingHelp4,
         T_Uncapped, T_90fps, T_120fps, T_144fps, T_240fps,
         T_FpsCounter, T_FpsCounterHelp,
         T_Count
@@ -111,7 +113,8 @@ namespace
         "Shadow Quality", "Choose how detailed shadows are.\nOriginal is the game's own, with blocky edges.",
         "Original", "High", "Very High", "Ultra",
         "Upscaling", "Choose how a resolution below the screen's is enlarged.\nFSR 3.1 rebuilds detail over several frames.",
-        "Off", "FSR 1", "FSR 3.1",
+        "Off", "FSR 1", "FSR 3.1", "FSR 4",
+        "Choose how a resolution below the screen's is enlarged.\nFSR 4 looks best and costs the most.",
         "Uncapped", "90 fps", "120 fps", "144 fps", "240 fps",
         "Frame Rate Counter", "Show the current frame rate in the top left corner.",
     };
@@ -159,13 +162,20 @@ namespace
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
-        { 69, 4, &gSettings.upscaling, 2, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3 } },
+        { 69, 4, &gSettings.upscaling, 3, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4 } },
         { 68, 4, &gSettings.shadowQuality, 3, T_Shadows, T_ShadowsHelp, { T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },
         { 65, 6, &gSettings.mouseSensitivity, 10, T_MouseSensitivity, T_MouseSensitivityHelp, {} },
         { 66, 4, &gSettings.buttonIcons, 5, T_Icons, T_IconsHelp, { T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal } },
     };
+    // The number of the item's last value: Upscaling ends with FSR 4 only on a system that has it.
+    int ItemMax(const Item& item)
+    {
+        if (item.value == &gSettings.upscaling && !RendererFsr4Available()) return 2;
+        return item.max;
+    }
+
     const Item* FindItem(uint32_t id)
     {
         for (const Item& item : kItems) if (item.id == id) return &item;
@@ -204,7 +214,11 @@ namespace
         const uint32_t first = menu + kRecords;
         uint32_t n = 0;
         for (const Item& item : kItems)
-            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t(item.value->load()), 0, item.max, (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, item.help);
+        {
+            const int max = ItemMax(item);
+            const Text help = item.value == &gSettings.upscaling && max == 3 ? Text(T_UpscalingHelp4) : item.help;
+            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t((std::min)(item.value->load(), max)), 0, uint8_t(max), (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, help);
+        }
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysButtons, T_KeysButtons, T_KeysButtonsHelp);
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysMove, T_KeysMove, T_KeysMoveHelp);
         WriteRecord(first + n++ * kRecordSize, 8, 0, 0, 0, 0, kItemSpacer, 0xFFFFFFFF, 0xFFFFFFFF);
@@ -249,7 +263,7 @@ namespace
             const uint32_t record = menu + kRecords + i * kRecordSize;
             const Item* item = FindItem(R32(record + 40));
             if (!item || (!includeDisplayMode && item->value == &gSettings.borderless)) continue;
-            item->value->store(std::clamp(int(int8_t(R8(record + 1))), 0, int(item->max)));
+            item->value->store(std::clamp(int(int8_t(R8(record + 1))), 0, ItemMax(*item)));
         }
     }
 
@@ -388,7 +402,7 @@ bool PcSettingsValueText(PPCRegister& r3)
     }
     const Item* item = FindItem(id);
     if (!item || (item->type != 2 && item->type != 4)) return false;
-    const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, int(item->max));
+    const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, ItemMax(*item));
     r3.u64 = GuestText(item->values[value]);
     return true;
 }

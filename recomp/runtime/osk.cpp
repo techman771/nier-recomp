@@ -216,7 +216,7 @@ namespace
 bool DrawSmallLabel(const std::string& text, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
 {
     if (!StartGdiplus()) return false;
-    width = 240;
+    width = std::max<uint32_t>(240, (uint32_t(text.size()) * 25 + 40 + 3) & ~3u);   // the frame rate alone, or the longer line with the system's load
     height = 64;
     Bitmap bitmap(INT(width), INT(height), PixelFormat32bppARGB);
     {

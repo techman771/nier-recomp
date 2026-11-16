@@ -196,6 +196,11 @@ namespace
         }
         gWindow = CreateWindowA("NierRecompWindow", "NieR (recompiled)", WS_OVERLAPPEDWINDOW, x, y, width, height,
             nullptr, nullptr, windowClass.hInstance, nullptr);
+        // The frame's thickness follows the scaling of the monitor the window landed on (the process
+        // is DPI-aware): make the inside 1280x720 real pixels whatever it is.
+        RECT inside{};
+        if (GetClientRect(gWindow, &inside) && (inside.right != 1280 || inside.bottom != 720))
+            SetWindowPos(gWindow, nullptr, 0, 0, width + 1280 - inside.right, height + 720 - inside.bottom, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         RendererInit(gWindow, 1280, 720);
         RAWINPUTDEVICE mouse{ 0x01, 0x02, 0, gWindow };   // generic desktop, mouse
         RegisterRawInputDevices(&mouse, 1, sizeof(mouse));

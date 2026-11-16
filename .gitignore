@@ -47,3 +47,10 @@ __pycache__/
 
 # Zipped test builds (tools: see README in the zip)
 /dist/
+/benchmark/
+/benchmark_results.txt
+/recomp/benchmark_results.txt
+/recomp/benchmark_save/
+/recomp/benchmark_settings.ini
+/recomp/benchmark.log
+/recomp/benchmark.log.err

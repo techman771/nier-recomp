@@ -552,6 +552,10 @@ int main(int argc, char** argv)
         return 1;
     }
 #endif
+    // The window's size is in real pixels. Without this, on a display with Windows scaling above
+    // 100% (a 1080p handheld at 150%) the game is told the screen is smaller (1280x720), draws at
+    // that size, and Windows stretches the picture to the panel.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::string gameDir = argc > 1 ? argv[1] : "..\\..\\Nier";
     char* trace = nullptr;
     size_t length = 0;

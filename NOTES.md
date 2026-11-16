@@ -1300,3 +1300,19 @@ writing the outputs, so the game read stale memory as "the user's own soundtrack
 muted its music. It now writes 0 to both (the title controls playback, as Xenia does), and
 `XMPGetStatus` (0x70009) reports idle. `NIER_AUDIO_DUMP=<frame>,<seconds>` records the mix to
 `captures/audio.wav` for checks like this.
+
+## Handheld test (ROG Xbox Ally X, Radeon 890M), 2026-11-14
+
+- The process is DPI-aware (`SetProcessDpiAwarenessContext`, main.cpp). Before, Windows scaling above
+  100% made the game see a smaller screen (1280x720 on the 1080p panel at 150%) and Windows stretched it.
+- `[perf]` log line every 600 frames (RenderFrame): frame rate, and the render thread's time a frame split
+  into recording, present and waiting for the GPU, with the render and window sizes.
+- The FSR loader takes the newest upscaler it finds, and the AMD driver there supplied FSR 4.1.2 for the
+  FSR 3.1 setting. The FSR 3.1 setting now asks for the newest 3.x (`TemporalVersion`, ffxOverrideVersion);
+  the new FSR 4 setting (`upscaling = 3`) takes a 4.x, or 3.1 when the system has none.
+- GPU time by stage: timestamps go into the command list where the stage changes (`StageMark`: shadows,
+  scene, post, exposure, upscaling, 2D, present) and the `[perf]` line lists the averages. The passes are
+  found for timing even at settings where they need no treatment of their own (`always` on ShadowPasses,
+  DataPasses, FindFlatPhase), so the split is the same at every setting. `RendererPerfTake` hands the sums out.
+- System load beside the frame rate counter (`NIER_SHOW_LOAD=1`, SampleLoad in renderer_d3d12.cpp): the
+  system's CPU and GPU use and the game's RAM and VRAM, sampled twice a second.
