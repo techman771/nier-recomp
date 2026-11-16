@@ -1996,6 +1996,18 @@ void GpuWriteResolvedPixels(const RendererResolve& resolve, const uint8_t* rgba,
     static std::set<uint32_t> loggedFormats;
     if (loggedFormats.size() < 8 && loggedFormats.insert(resolve.destFormat).second)
         Log("[gpu] writing resolves back to guest memory (destination format %u, endian %u, e.g. %08X %ux%u)\n", resolve.destFormat, resolve.destEndian, resolve.destBase, resolve.width, resolve.height);
+    // NIER_LOG_WRITEBACK=1: which guest frame is being built when each read-back arrives, and its average.
+    static const bool logged = GetEnvironmentVariableA("NIER_LOG_WRITEBACK", nullptr, 0) > 0;
+    if (logged && resolve.width * resolve.height <= 64)
+    {
+        uint32_t sum[4] = {};
+        for (uint32_t y = 0; y < resolve.height; y++)
+            for (uint32_t x = 0; x < resolve.width; x++)
+                for (int k = 0; k < 4; k++) sum[k] += rgba[size_t(y) * rowPitch + x * 4 + k];
+        const float n = float(resolve.width * resolve.height);
+        Log("[writeback] %08X %ux%u arrives while guest frame %llu is built: average %.1f %.1f %.1f %.1f\n", resolve.destBase, resolve.width, resolve.height,
+            (unsigned long long)gFrames.load() + 1, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+    }
     const uint32_t pitch = (resolve.width + 31) & ~31u;
     uint8_t* destination = g_base + PhysicalToGuest(resolve.destBase);
     for (uint32_t y = 0; y < resolve.height; y++)

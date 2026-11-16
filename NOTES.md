@@ -1035,6 +1035,34 @@ From the user's playthrough (open unless marked):
   vblank follows the display`. Test run at 120 Hz with the user's 4K playtest running beside
   it: 604 of 607 frames on time. Awaiting the user's verdict. The user plays at 3840x2160
   internal with shadow maps x3, so GPU time is the next suspect if stutters remain (F9).
+- Stutter in the cutscene after leaving the library, and "the light does not come in smoothly"
+  when the home appears after the prologue (user, 60 Hz display, recordings seq_f56943 = home,
+  seq_f63744 / seq_f64736 = the cutscene). OPEN, two changes awaiting the user's playtest.
+  What the recordings show: (a) the cutscene has about 20 frames of 33.3 ms in 10 s with no new
+  shaders, pipelines or textures, render thread 11-13 ms and GPU 6 ms: frames the game itself
+  was late with, not the renderer. (b) In the home the game's exposure value (the clear colour
+  it resolves to 0767A000: pixel constant c256 of the D0C7E9595FC160B9 draw into the 80-wide
+  target) is run down to a floor of 0.042 during the fade to black, stays there for 2 s while
+  the fade lifts (only the candle flames show), then climbs x3.6 a frame for six frames to 114
+  and falls back to 6 over twenty: a white flash. Found on the way (NIER_LOG_WRITEBACK=1): on a
+  display at the game's own rate the frame queue, once full after a load, never drained (the
+  "show queued frames for one refresh" rule only helped at 120-240 Hz), so the game ran 4-5
+  frames ahead of the picture: input lag, exposure set from a measurement that old, and the
+  game paced by the renderer's pops instead of the vblank (in a test run every frame took 33 ms
+  for a while after the load). Changed: (1) a frame presented while others wait, at interval 1,
+  is presented at interval 0 (NIER_KEEP_QUEUE=1: as before); the game is now 1 frame ahead in
+  561 of 586 frames. (2) Read-back resolves are written to guest memory before Present instead
+  of after (NIER_LATE_WRITEBACK=1: as before). NOT shown to fix the flash: loading Game 3, the
+  exposure ramp (0.547 x1.25 a frame to 1.66, then back to 0.91) is identical to three digits
+  with the game 1 or 5 frames ahead, so that overshoot is the game's own behaviour, and the
+  home's may be too (not reproducible without playing the prologue again). Test runs in a
+  window on the 60 Hz display still show 59.3-59.6 fps in Game 3 with old and new alike (3-4
+  late frames in 10 s; the playtest's light scenes logged 60.0): not looked into.
+  User, after playing the new build and checking reference footage of the console version: "it
+  look to be correct", so the light's behaviour is taken to be the game's own. Which of the two
+  that covers, and whether the cutscene stutter is gone, is not yet confirmed.
+  `NIER_REPLAY_CONSTANTS=<ps hash>,<first>,<count>[,<target width>][;...]` lists those
+  constants for every frame of a recording in replay.log.
 - FIXED (confirmed by the user in play): the Aerie boss's red orbs
   showed their whole quad as a square. Not the resolution work (it shows at 1x with the 2D pass
   off): the renderer had no alpha test. The orbs are 19 quads drawn with the 2D shader (vs

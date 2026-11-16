@@ -800,6 +800,29 @@ void FrameReplayRunIfRequested()
             const RendererFrame frame = BuildFrame(sequence, i, &ms);
             Log("[replay] recorded frame %zu (game frame %llu): %.1f ms after the one before, %zu commands\n", i + 1, frame.frame, ms - before, frame.commands.size());
             before = ms;
+            // NIER_REPLAY_CONSTANTS=<pixel shader hash>,<first>,<count>[,<target width>][;...]: those constants of the
+            // frame's first draw with that pixel shader, for following a value through a recording.
+            char wanted[256];
+            if (GetEnvironmentVariableA("NIER_REPLAY_CONSTANTS", wanted, sizeof(wanted)))
+                for (const char* at = wanted; at && *at; at = strchr(at, ';') ? strchr(at, ';') + 1 : nullptr)
+                {
+                    unsigned long long hash = 0; unsigned first = 0, count = 0, width = 0;   // width: only a draw into a target that wide
+                    if (sscanf(at, "%llx,%u,%u,%u", &hash, &first, &count, &width) < 3) continue;
+                    for (const RendererCommand& command : frame.commands)
+                    {
+                        const RendererDraw* d = std::get_if<RendererDraw>(&command);
+                        if (!d || !d->ps || d->ps->hash != hash || (width && d->target.width != width)) continue;
+                        std::string text;
+                        for (unsigned c = first; c < first + count && c < 512; c++)
+                        {
+                            char one[96];
+                            snprintf(one, sizeof(one), " c%u(%g %g %g %g)", c, d->constants[c * 4], d->constants[c * 4 + 1], d->constants[c * 4 + 2], d->constants[c * 4 + 3]);
+                            text += one;
+                        }
+                        Log("[replay]   frame %zu ps %016llX:%s\n", i + 1, hash, text.c_str());
+                        break;
+                    }
+                }
         }
         while (!RendererReady()) Sleep(10);
         for (const StoredShader& stored : sequence.shaders) RendererPrepareShader(stored.shader);

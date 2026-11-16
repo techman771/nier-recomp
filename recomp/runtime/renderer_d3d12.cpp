@@ -3462,6 +3462,61 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
         ID3D12CommandList* lists[] = { gList.Get() };
         gQueue->ExecuteCommandLists(1, lists);
+        // Resolves the game reads back (its luminance reduction, from which it sets the exposure of the
+        // frames after) go into guest memory as soon as the GPU has made them, before the frame is
+        // presented: Present can wait a whole refresh, and with the pixels arriving that much later
+        // the game corrected its exposure against a picture several frames old and overshot (a room
+        // faded in from black flashed white before settling).
+        // NIER_LATE_WRITEBACK=1: after the present, as it used to be (for comparing).
+        static const bool lateWriteBack = GetEnvironmentVariableA("NIER_LATE_WRITEBACK", nullptr, 0) > 0;
+        LARGE_INTEGER perfWrittenBack = perfRecorded;
+        const auto deliverWriteBacks = [&]
+        {
+            if (!gPendingWriteBacks.empty()) WaitForGpu();
+            static const bool logged = GetEnvironmentVariableA("NIER_LOG_WRITEBACK", nullptr, 0) > 0;
+            if (logged && !gPendingWriteBacks.empty()) Log("[writeback] from guest frame %llu:\n", gExecutingFrame);
+            if (!gPendingWriteBacks.empty())
+            {
+                void* mapped = nullptr;
+                D3D12_RANGE range{ 0, SIZE_T(gWriteBackUsed) };
+                if (SUCCEEDED(gWriteBack->Map(0, &range, &mapped)))
+                {
+                    for (const PendingWriteBack& pending : gPendingWriteBacks)
+                    {
+                        const uint8_t* host = static_cast<const uint8_t*>(mapped) + pending.offset;
+                        const uint32_t width = pending.resolve.width, height = pending.resolve.height;
+                        const uint32_t hostWidth = pending.hostWidth, hostHeight = pending.hostHeight;
+                        if (hostWidth == width && hostHeight == height) { GpuWriteResolvedPixels(pending.resolve, host, pending.rowPitch); continue; }
+                        // The game expects its own size (it reads the luminance reduction to set exposure):
+                        // each guest pixel is the average of the host pixels it covers.
+                        std::vector<uint8_t> guest(size_t(width) * height * 4);
+                        for (uint32_t y = 0; y < height; y++)
+                        {
+                            const uint32_t y0 = y * hostHeight / height, y1 = (std::min)((std::max)((y + 1) * hostHeight / height, y0 + 1), hostHeight);
+                            for (uint32_t x = 0; x < width; x++)
+                            {
+                                const uint32_t x0 = x * hostWidth / width, x1 = (std::min)((std::max)((x + 1) * hostWidth / width, x0 + 1), hostWidth);
+                                uint32_t sum[4] = {}, count = 0;
+                                for (uint32_t sy = (std::min)(y0, hostHeight - 1); sy < (std::max)(y1, (std::min)(y0, hostHeight - 1) + 1); sy++)
+                                    for (uint32_t sx = (std::min)(x0, hostWidth - 1); sx < (std::max)(x1, (std::min)(x0, hostWidth - 1) + 1); sx++)
+                                    {
+                                        const uint8_t* texel = host + size_t(sy) * pending.rowPitch + size_t(sx) * 4;
+                                        for (int k = 0; k < 4; k++) sum[k] += texel[k];
+                                        count++;
+                                    }
+                                for (int k = 0; k < 4; k++) guest[(size_t(y) * width + x) * 4 + k] = uint8_t((sum[k] + count / 2) / count);
+                            }
+                        }
+                        GpuWriteResolvedPixels(pending.resolve, guest.data(), width * 4);
+                    }
+                    D3D12_RANGE none{ 0, 0 };
+                    gWriteBack->Unmap(0, &none);
+                }
+                gPendingWriteBacks.clear();
+            }
+            gWriteBackUsed = 0;
+        };
+        if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); }
         const bool vsync = Settings().vsync != 0;
         const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
         // Even frame pacing: on a display refreshing at a multiple of 60 Hz (120, 180, 240) a 60 fps
@@ -3498,6 +3553,14 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 waiting = !gFrameQueue.empty();
             }
             if (!waiting && Settings().frameRate60) interval = multiple;
+            // With the game's rate the display's own (60 on 60 Hz), "one refresh" is all a frame ever
+            // gets, and frames that queued up while the renderer was held (a load, a slow frame) stayed
+            // queued for good: the game then ran 4 to 5 frames ahead of the picture, so its controls
+            // lagged and it set its exposure from a measurement that old (it overshot: a room fading in
+            // flashed white). Such a frame is presented without waiting for the refresh, which drops
+            // one from view and brings the game back level. NIER_KEEP_QUEUE=1 leaves them queued.
+            static const bool keepQueue = GetEnvironmentVariableA("NIER_KEEP_QUEUE", nullptr, 0) > 0;
+            if (waiting && interval == 1 && !keepQueue) interval = 0;
         }
         HRESULT presented = gSwapChain->Present(interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(presented))
@@ -3512,6 +3575,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         QueryPerformanceCounter(&perfPresented);
         WaitForGpu();
         gRetired.clear();   // the frame's GPU work is complete
+        if (lateWriteBack) deliverWriteBacks();
         {
             // Every 600 frames: the frame rate and where the time went, on average: the render thread's
             // (it waits for the GPU to finish each frame, so that wait is the GPU's time unless the
@@ -3531,8 +3595,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 {
                     perf->frames++;
                     perf->recordMs += double(perfRecorded.QuadPart - perfStart.QuadPart) * ms;
-                    perf->presentMs += double(perfPresented.QuadPart - perfRecorded.QuadPart) * ms;
-                    perf->gpuWaitMs += double(perfDone.QuadPart - perfPresented.QuadPart) * ms;
+                    perf->presentMs += double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * ms;
+                    perf->gpuWaitMs += double(perfDone.QuadPart - perfPresented.QuadPart + perfWrittenBack.QuadPart - perfRecorded.QuadPart) * ms;
                     for (int i = 0; i < kRendererPerfStages; i++) perf->stageMs[i] += stages[i];
                     perf->slowestMs = (std::max)(perf->slowestMs, double(perfDone.QuadPart - perfStart.QuadPart) * ms);
                 }
@@ -3558,46 +3622,6 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 logged = RendererPerf{};
             }
         }
-        if (!gPendingWriteBacks.empty())
-        {
-            void* mapped = nullptr;
-            D3D12_RANGE range{ 0, SIZE_T(gWriteBackUsed) };
-            if (SUCCEEDED(gWriteBack->Map(0, &range, &mapped)))
-            {
-                for (const PendingWriteBack& pending : gPendingWriteBacks)
-                {
-                    const uint8_t* host = static_cast<const uint8_t*>(mapped) + pending.offset;
-                    const uint32_t width = pending.resolve.width, height = pending.resolve.height;
-                    const uint32_t hostWidth = pending.hostWidth, hostHeight = pending.hostHeight;
-                    if (hostWidth == width && hostHeight == height) { GpuWriteResolvedPixels(pending.resolve, host, pending.rowPitch); continue; }
-                    // The game expects its own size (it reads the luminance reduction to set exposure):
-                    // each guest pixel is the average of the host pixels it covers.
-                    std::vector<uint8_t> guest(size_t(width) * height * 4);
-                    for (uint32_t y = 0; y < height; y++)
-                    {
-                        const uint32_t y0 = y * hostHeight / height, y1 = (std::min)((std::max)((y + 1) * hostHeight / height, y0 + 1), hostHeight);
-                        for (uint32_t x = 0; x < width; x++)
-                        {
-                            const uint32_t x0 = x * hostWidth / width, x1 = (std::min)((std::max)((x + 1) * hostWidth / width, x0 + 1), hostWidth);
-                            uint32_t sum[4] = {}, count = 0;
-                            for (uint32_t sy = (std::min)(y0, hostHeight - 1); sy < (std::max)(y1, (std::min)(y0, hostHeight - 1) + 1); sy++)
-                                for (uint32_t sx = (std::min)(x0, hostWidth - 1); sx < (std::max)(x1, (std::min)(x0, hostWidth - 1) + 1); sx++)
-                                {
-                                    const uint8_t* texel = host + size_t(sy) * pending.rowPitch + size_t(sx) * 4;
-                                    for (int k = 0; k < 4; k++) sum[k] += texel[k];
-                                    count++;
-                                }
-                            for (int k = 0; k < 4; k++) guest[(size_t(y) * width + x) * 4 + k] = uint8_t((sum[k] + count / 2) / count);
-                        }
-                    }
-                    GpuWriteResolvedPixels(pending.resolve, guest.data(), width * 4);
-                }
-                D3D12_RANGE none{ 0, 0 };
-                gWriteBack->Unmap(0, &none);
-            }
-            gPendingWriteBacks.clear();
-        }
-        gWriteBackUsed = 0;
         if (saving)
         {
             WriteSavedFrame(saveLabel, saveFootprint);
