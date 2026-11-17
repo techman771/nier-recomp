@@ -1087,6 +1087,210 @@ From the user's playthrough (open unless marked):
   seen: something drawn once into a surface that is kept (it would stay missing); a quad with
   more than 6 vertices that a later pass depends on. Not covered: the motion-vector form of a
   vertex shader (FSR 3 only) is still compiled and its pipeline built on the render thread.
+- The stutter in the cutscene after leaving the library, looked at again with the recordings
+  (seq_f63744, seq_f64736; seq_f57737 from the same morning is as heavy). CAUSE FOUND, not
+  fixed. All thirteen recordings side by side: the ones made at home on 14-15 November have 0-2
+  frames of 33 ms in 600; the three heavy cutscene recordings of 16 November have 4, 7 and 19,
+  the light home scene of the same session 1. In seq_f64736 the late frames come in runs with
+  a fixed spacing (65149, 65153, 65157, 65161: every fourth frame, right after a camera cut
+  that takes the frame's data from 733 to 831 KB), which is what a stage needing a little more
+  than one refresh per frame looks like, not the virtual display's scattered late vblanks.
+  Replayed at the user's settings (resolution_scale 8 = 3840x2160 internal, shadow_quality 3 =
+  shadow maps x4, `NIER_SETTINGS_FILE` pointed at a copy of recomp\build\settings.ini) with
+  NIER_LOG_PACING=1, which now also gives the wait for the GPU after Present: recording the
+  frame takes 4.7-5.8 ms and the GPU 8-11.7 ms (average 10.5, up to 15.5), and the render
+  thread does the two one after the other, so a frame costs it 15.6 ms on average and more
+  than 16.7 ms in 131 of 576 frames; from frame 65141 on the average is 17 ms. The other
+  cutscene recordings: 12.8 ms (27 frames over) and 14.8 ms (73 over); the home scene 6.4 ms
+  (2 over). Shadow maps at x1 take 1.5 ms off, not enough. Playing over Parsec adds the
+  stream's own use of the GPU on top (not measured). So the renderer is the limit there: the
+  render thread waits for the GPU to finish a frame (WaitForGpu after Present, and before it
+  for the read-backs) before it starts recording the next, where the two could overlap (the
+  limit would be the larger of the two, 11 ms, instead of their sum). That needs per-frame
+  resources in two sets (command allocator, upload arena, retired list, read-back buffers) and
+  the read-backs delivered a frame later. The replay's own time between presents (33 ms at any
+  resolution, even 640x360) is the cost of reading the recording, and says nothing.
+  FIXED another way (awaiting the user's playtest): the frame goes to the GPU in pieces while
+  the rest of it is still being recorded (ExecuteGuestCommands: every 0.25 ms of recording the
+  command list is closed, executed and reset; `NIER_SUBMIT_MS=<ms>`, 0 = the whole frame at
+  once as before). Every draw sets all of its own state, so a list can end between any two
+  commands and only the descriptor heaps are set again; one set of per-frame resources stays
+  enough, because the frame is still finished before the next begins. Replayed at the user's
+  settings, ms a frame (recording + waiting for the GPU), whole then in pieces: seq_f64736
+  14.8 -> 9.4 (frames over 16.7 ms: 70 -> 5 of 576), seq_f63744 11.9 -> 8.5 (16 -> 1),
+  seq_f57737 13.3 -> 9.1 (36 -> 2), the home scene 6.2 -> 5.1. Recording itself gets 0.3-0.9
+  ms longer (about twenty submissions a frame). Pictures: ten frames of seq_f64736 rendered
+  both ways are byte for byte the same. Live: loading Game 3, 60 fps, no crash. Not tried:
+  the cutscene itself in play, and a GPU other than this one.
+- The display-locked vblank ran the game too fast on a monitor whose rate Windows misreports
+  (found in a test window on the user's second monitor at home: reported 120 Hz, a vblank every
+  6.94 ms = 144 Hz, so "every 2 refreshes" made 72 frames a second; the same with the old
+  submission, so not from the change above). FIXED: RendererWaitDisplayVblank compares the
+  middle one of every 31 waits with the period expected and, more than 4% off, leaves the
+  vblank to the timer for as long as the display's mode and the divider stay the same. Log:
+  `[present] the display reported as 120 Hz gives a vblank every 6.94 ms where 8.33 was
+  expected`. After it: 60.0 fps there. The middle value, so that a virtual display's
+  occasional missed refresh does not count.
+  Playtest at home after it (50,400 frames, primary 3840x2160 at 240 Hz, fullscreen). With
+  VSync off (the setting left from the Parsec session) frames 1-42,000 logged 60.0 in every
+  window but two. At frame 42,000 the user turned VSync on: "each frame is held for 4
+  refreshes", the vblank followed the display, and the game ran at 58.5; then the guard
+  reported "a vblank every 4.59 ms where 4.17 was expected" (four waits took 18.4 ms), went to
+  the timer, and it got worse: 51, 39 and 46 fps for three windows, 857 frames skipped from
+  view, the user's recording seq_f43609 (386 frames in 10 s, a 100 ms stall about every tenth
+  frame, a light scene, no renderer waits). Measured on its own afterwards (a small program
+  timing 480 WaitForVBlank on each output, no game running) that monitor ticks at 240.1 Hz and
+  the second one at 144.0 (reported 120). So in the fullscreen game with VSync on the
+  refreshes did not come at 240 Hz: most likely a variable refresh rate, where the display's
+  refreshes follow the game's presents and are no clock (the user has since confirmed that
+  G-SYNC is on for that monitor). Two things were wrong: the display-locked vblank on such a
+  display (the guard caught that), and what the guard fell back to, the timer with frames
+  still held for 4 refreshes each. Changed: the guard now needs three readings in a row more
+  than 4% off, and once it has tripped frames are presented at the next refresh
+  (gDisplayTicksOff) instead of being held for a count of them. Tested only on the second
+  monitor (60.0 fps, the guard trips, no skips after the load); NOT tested on the primary with
+  VSync on, which is where it went wrong. The other recording of that session, seq_f48136
+  (a heavy scene, 752 KB of data a frame, VSync off again), has 591 of 596 frames at 16.7 ms,
+  and the log there shows the pieces at work: render thread 7.7-7.9 ms a frame (recording
+  3.8-5.1, waiting for the GPU 2.6-3.7).
+  The playtest after the change did not try it: the game started at 60 with VSync on for the
+  first 900 frames (menus), then the user set Frame Rate to uncapped and played 87,600 frames
+  that way, most windows at 240 fps, 100-190 in heavy places, no crash, no pipeline waits, no
+  F9. In the heavy places the render thread takes 7.4 ms (recording 5.4, GPU 1.8) while the
+  game delivers a frame every 10 ms, so there the limit is the game or the GPU emulation
+  thread, not the renderer. (The "skipped from view" count read 600 of 600 in that mode: every
+  uncapped frame is presented at once and none is lost; it now counts only at a locked rate.)
+  So 60 fps with VSync on, on the G-SYNC monitor, is still NOT verified.
+  CORRECTION after the next playtest (60 fps, VSync on, 240 Hz primary: 58.6, 59, 53.9, then
+  40 fps for three windows with 442-444 of 600 frames "skipped from view", recording
+  seq_f8550, and the guard silent). The user: "might need to revert back to the previous vsync
+  behavior". They were right, and the variable refresh rate theory above is NOT established:
+  the cause in plain sight is the queue change committed that morning (1ca514c). It was meant
+  for a display at the game's own rate, but its test was `waiting && interval == 1`, and on a
+  faster display a queued frame has interval 1 precisely because it is queued (frames not
+  queued get the multiple, 4 at 240 Hz). So on 240 Hz every queued frame was presented at
+  interval 0 and never seen, where before it was shown for one refresh: the catch-up that had
+  always worked there. The recordings made at home on 14-15 November, before any of this, have
+  0-2 late frames in 600 with VSync on. Changed: frames are dropped only when the multiple is
+  1; on faster displays the behaviour is the previous one again. The guard is now only for a
+  display that steadily runs at another rate than reported (refreshes counted against the
+  real clock a second at a time; two seconds in a row more than 2% off and equal to each other
+  within 0.5%): it trips on the second monitor (`reported as 120 Hz refreshes 144.0 times a
+  second`, then 60.0 fps and 0 skipped) and leaves a display whose count wanders alone.
+  Whether the earlier "4.59 ms" reading on the primary was the display or a product of the
+  dropped frames is not known. Awaiting a playtest at 60 fps with VSync on.
+  SETTLED by testing on the primary monitor itself (the user: "I think you should test on the
+  primary monitor since that's what we are checking"; scratch script primary_test.ps1: muted,
+  fullscreen, a copy of the user's settings, the copied Game 3 save; note NIER_MONITOR=primary
+  means the SECOND monitor, atoi gives 0: leave the variable unset for the primary). Three
+  things were wrong, all of them real:
+  (1) the queue change dropping frames on displays faster than the game (above; fixed);
+  (2) the G-SYNC display's refreshes are no clock after all: with VSync on, frames held for 4
+  refreshes and the vblank following the display, the display was counted at 85.6-88.5
+  refreshes a second (155.6 in the user's playtest), four waits took 46 ms, and the game ran at
+  35 and then 21 fps. The game's clock followed the display, which refreshes when a frame is
+  presented, which happens when the game's clock ticks: nothing in the circle keeps time;
+  (3) the guard said "use the timer" only AFTER waiting for the display's four refreshes, so
+  the fallback never ran on the timer either (frames 46 ms apart with interval 1).
+  Now: a refused display is not waited for at all; the count is taken a quarter of a second at
+  a time and two in a row more than 5% off refuse it (so within about half a second of the
+  first game frames); then the timer and Present at the next refresh. Result on the primary,
+  60 fps, VSync on, 3840x2160 internal: 60.0 fps in every gameplay window, 0 frames skipped,
+  and with NIER_LOG_PACING 1608 of 1611 gameplay frames 15.5-17.9 ms after the one before, none
+  over 25 ms, no late vblanks. The second monitor (reported 120, really 144) is refused the
+  same way and runs at 60.0. A Parsec display's 1-3% of missed refreshes stays under the 5%.
+  Not checked: a fixed-refresh 120 or 240 Hz display, where the lock should stay on (none
+  here to test with).
+  The user's playtest after it (7,200 frames, 60 fps, VSync on): "fix worked but now the
+  cutscene reverted back to stuttering", "even though it reports 60fps". The log agrees with
+  the second half: the cutscene's windows (frames 5,400-7,200, recording 2.5-4.8 ms) read
+  59.8-60.0 fps, slowest frame 8.8-18.2 ms, nothing skipped, nothing queued. So the frames are
+  all made and none is late by a refresh; what is uneven must be WHEN each is shown, which the
+  log does not record without NIER_LOG_PACING. Suspected, not measured: with the timer and
+  Present at the next refresh on a G-SYNC display a frame appears when it is finished, and in
+  that cutscene the time to finish one varies by several ms from frame to frame (recording 1
+  to 5 ms, GPU 3 to 6), where holding each frame for a count of refreshes used to even that
+  out. OPEN: needs a playtest of the cutscene with the trace on.
+  Traced playtest (7,909 frames, 60 fps, VSync on throughout): that suspicion was WRONG. In
+  the cutscene (frames 4,848-7,248) 582-590 of every 600 frames come within 1 ms of 16.7 ms
+  after the one before; what stands out is 12 frames at 33 ms, each alone (5694, 5730, 5764,
+  5782, 5913, 6470, 6500, 6530, 6834, 7014, 7087, 7142; plus two at the scene's start with new
+  shaders). For each of them the vblank came on time (no late vblank line), nothing was queued,
+  and the render thread's own work was as usual (recording 5 ms, GPU 2.5 ms): the frame simply
+  reached the renderer one tick late. So it is the game's side, the game thread or the GPU
+  emulation's command thread, about once in 200 frames; the rate is about what seq_f48136
+  showed with VSync off (5 in 596), so "reverted" may be the same thing noticed again rather
+  than something the VSync fix brought back (not established). New for the next pass:
+  NIER_LOG_PACING also logs, for every frame over 1.5 vblanks and every 100th other one,
+  `[pace] command thread, frame N (late|on time): T ms = W waiting (WAIT_REG_MEM) + I idle (no
+  commands from the game) + K working`. In Game 3's gameplay that reads 16.7 = 11-12 waiting +
+  0 idle + 4.2-5.6 working: the command thread is never short of commands there and has 11 ms
+  to spare. The cutscene sends about four times the data a frame (750-830 KB against 100-200),
+  so its working time may be near the whole 16.7 ms; that is the thing to measure.
+  Measured (second traced playtest): in the cutscene the command thread works 9.2-9.9 ms a
+  frame (most 12.7) and waits 7 in WAIT_REG_MEM, idle 0: not near the limit on a normal frame.
+  The late frames are that thread working 17-29 ms. Two kinds. (a) With a dozen new shaders
+  logged in the frame before (scene starts; 61 ms at frame 2329): ShaderFor and StoreShader
+  wrote each new shader's dumps (recomp\shaders\*.bin and *.hlsl) to disk there and then. (b)
+  With nothing new (6024, 6973, 7098; in the first traced session 5694/5730/5764/5782 and then
+  6470/6500/6530, the same group about 770 frames later): the periodic full hash of block
+  compressed textures in DecodeTexture ("every ten seconds or so regardless"). Its stagger was
+  `600 + (key & 255)`, but the key's low bits are the same for nearly every texture, so all the
+  textures first seen in one frame, a scene's worth (88 MB in the first frame of seq_f64736),
+  came due in the same frame again and again. FIXED, (b) awaiting the user's pass through the
+  cutscene: (a) the dumps go to a writer thread (WriteDumpLater); (b) the stagger is a hash of
+  the key (600-1111 frames) and at most 2 MB of due textures are hashed in a frame, the rest
+  staying due (one larger than that still gets its turn). Loading Game 3 on the primary, the
+  command thread's work in the late frames around the load went from 363 ms in all (106, 60,
+  six of 19-25, 64) to 236 (52, 57, 36, three of 18-22, 31); what is left there is not looked
+  into (texture decoding is the likely part), and it falls on the loading screen.
+  Third traced playtest, the cutscene watched twice: NOT fixed. 7 late frames the first time
+  (5536, 5595, 6219, 6398, 6460, 6792, 6857), 3 the second (13463, 14238, 14825), none with
+  new shaders, each "33.3 ms = 16 waiting + 17-19.5 working" against a normal 7 + 9.5: the
+  work ran past the tick by a little and the thread then waited out the next one. So the
+  periodic hash was not it, or not all of it. The trace now also gives, per late frame,
+  textures converted (count, KB, ms) and KB hashed in full with its ms. At the Game 3 load:
+  83 textures, 42 MB converted in 29.6 ms (1.4 GB/s: the per-block TiledOffset + CopySwapped
+  loop), 67 textures, 25 MB in 13.3 ms; hashing is cheap (44 MB in 1.6 ms) but 31 MB is hashed
+  in full EVERY frame in gameplay there (textures in plain formats over 64 KB: not looked into
+  which). Frames 1379-1382 of that load are 18-57 ms of work with nothing converted, so there
+  is a third cost not yet named. The sampling profiler (NIER_PROFILE=<frame>,<seconds>) on
+  Game 3's gameplay: command thread busy 37%, of the process's samples CopySwapped 8.6%
+  (vertex data in BuildDraw), XXH3 5.4%, BuildDraw itself 3.9%, ReadIndices 2.3%; and one guest
+  thread is busy 100% of the time in sub_82579D50 / sub_82573758 (a wait loop of the game's).
+  Next: a pass through the cutscene with both the trace and the profiler on.
+  Fourth traced playtest (the profiler's window, frames 5000-7100, missed the cutscene, which
+  came at 6833-9400 this time): 6 late frames in it, one with 22 textures converted (7.6 MB,
+  4.7 ms), the other five with nothing converted and 1 ms of hashing, each again "16 waiting +
+  16.7-17.6 working". That narrow range, always just past one tick, says the thread is not
+  doing 8 ms more work but is HELD until about the next tick somewhere inside what is counted
+  as work. The trace now times every kind of packet (`[pace]   packets: 0x64 x1 30.4 ms, ...`
+  after a late frame's line; 0x22 draws, 0x27 shader loads, 0x64 the swap) and the hand-over
+  of a finished frame (`[pace] frame N: handing it to the renderer took X ms (L for the lock,
+  R for room: Q frames were queued)`). At the Game 3 load the late frames are of two kinds:
+  draws (52 ms with 42 MB of textures converted) and the swap packet, 14-58 ms, which is
+  RendererSubmitFrame waiting for room in the frame queue (3 queued) while the render thread
+  is behind with the scene's uploads. Whether the cutscene's late frames are that same wait
+  is what the next pass shows.
+  Fifth traced playtest: it is NOT the hand-over. The cutscene's nine late frames (7429, 7496,
+  7630, 8064, 8169, 8229, 8495, 8561, and 6540 with 22 textures converted) are all draws:
+  860-965 draw packets taking 15.1-17.4 ms where the scene's usual frame spends about 9 on
+  them; nothing converted, 1 ms hashed, shader loads 0.3 ms, the swap 0.0, no hand-over wait
+  anywhere in the scene. So the command thread's draw handling (BuildDraw) is what runs
+  long, by 6-8 ms, a few times a minute; why those frames and not their neighbours is not
+  known (the "held until the tick" reading above was wrong: the 16.7-17.6 range is just where
+  a frame becomes late). Two ideas tried on Game 3's gameplay and TAKEN OUT again, since
+  neither changed the thread's 3.9 ms a frame: sharing one vertex copy between a mesh's draws
+  in a frame (only 1.1 of 11.5 MB a frame were repeats there; verified correct with a copy
+  and compare, 0 mismatches) and cutting the vertex bytes from recycled blocks instead of a
+  fresh allocation per draw. What the trace says about that thread in Game 3's gameplay: 375
+  draws in 3.4 ms (9 microseconds each, the longest 0.5 ms), of which 0.9 ms is hashing 28.7
+  MB of textures in full every frame, and 11.5 MB of vertex data copied. The packets line now
+  gives the longest single packet of each kind and is also written for every 100th on-time
+  frame, so the next pass through the cutscene shows whether a late frame is one draw taking
+  7 ms or all of them taking longer, and what an ordinary frame there looks like.
+  OPEN. Still to try: finding what the 28.7 MB hashed every frame is (a fifth of the thread's
+  work in gameplay), and the sampling profiler over the cutscene itself.
 - Vertex shaders nobody has drawn yet are on the pipeline list too (awaiting the user's
   playtest; nothing in play is expected to look different, only first-use builds get shorter).
   The archives' model and effect files (X.MDV/X.MDP, X.EFV/X.EFP, X.2DV/X.2DP) hold 627

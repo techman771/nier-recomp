@@ -124,6 +124,7 @@ float4 PSMain(Interpolated input) : SV_Target
     uint64_t gGapBins[8];
     std::atomic<UINT> gDisplayHz{ 60 };   // the refresh rate of the display the window is on
     std::atomic<UINT> gVblankDivider{ 0 };   // display refreshes in a 60 Hz period when the display's rate is a multiple of 60 (and vsync is on); else 0
+    std::atomic<bool> gDisplayTicksOff{ false };   // the display's refreshes don't come at its reported rate (RendererWaitDisplayVblank)
     uint64_t gLastHash = 0;
     LARGE_INTEGER gLastImage{};
     double gWorstGap = 0;
@@ -2851,8 +2852,35 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         RenderTargetKey timedFlatTarget = flatTarget;
         const size_t timedFlatStart = hasFlat ? flatStart : FindFlatPhase(frame, timedFlatTarget, true);
         size_t timedShadow = 0, timedDataPass = 0;
+        // The frame goes to the GPU in pieces while the rest of it is still being recorded. Handed
+        // over whole at the end, the GPU sat idle for all of the recording and the render thread
+        // then sat waiting for all of the GPU's work: the two times added up (5 + 11 ms in the
+        // cutscene after the library at 3840x2160, over one 60 Hz refresh in a quarter of its
+        // frames). Every draw sets all of its own state, so a list can end between any two
+        // commands; the next one only needs the descriptor heaps again.
+        // NIER_SUBMIT_MS=<ms>: how much recording goes into a piece (default 0.25; 0: the whole
+        // frame at once, as before).
+        static const double submitMs = [] { char v[16]; return GetEnvironmentVariableA("NIER_SUBMIT_MS", v, sizeof(v)) ? atof(v) : 0.25; }();
+        LARGE_INTEGER submitFrequency, submitted;
+        QueryPerformanceFrequency(&submitFrequency);
+        QueryPerformanceCounter(&submitted);
+        const int64_t submitTicks = int64_t(submitMs * double(submitFrequency.QuadPart) / 1000.0);
         for (size_t index = 0; index < frame.commands.size(); index++)
         {
+            if (submitTicks > 0 && (index & 7) == 7)
+            {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (now.QuadPart - submitted.QuadPart >= submitTicks)
+                {
+                    gList->Close();
+                    ID3D12CommandList* lists[] = { gList.Get() };
+                    gQueue->ExecuteCommandLists(1, lists);
+                    gList->Reset(gAllocator.Get(), nullptr);
+                    gList->SetDescriptorHeaps(2, heaps);
+                    QueryPerformanceCounter(&submitted);
+                }
+            }
             const auto& command = frame.commands[index];
             {
                 while (timedShadow < timedShadows.size() && index > timedShadows[timedShadow].second) timedShadow++;
@@ -3393,6 +3421,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     // the swap chain to take another frame, recording, the read-backs, Present, the rest; how many
     // frames were queued behind this one and the present interval used.
     int gPaceQueued = -1, gPaceInterval = -1;
+    double gPaceGpuMs = 0;   // the frame before: waiting for the GPU after Present
 
     void RenderFrame(const MailboxPlane planes[3], bool movie, uint64_t frame, const RendererFrame* guest)
     {
@@ -3619,7 +3648,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 queued = gFrameQueue.size();
                 waiting = queued != 0;
             }
-            if (!waiting && Settings().frameRate60) interval = multiple;
+            // (Not on a display whose refreshes are no clock, RendererWaitDisplayVblank: the next one will do.)
+            if (!waiting && Settings().frameRate60 && !gDisplayTicksOff) interval = multiple;
             // With the game's rate the display's own (60 on 60 Hz), "one refresh" is all a frame ever
             // gets, and frames that queued up while the renderer was held (a load, a slow frame) stayed
             // queued for good: the game then ran 4 to 5 frames ahead of the picture, so its controls
@@ -3632,7 +3662,11 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             static const bool keepQueue = GetEnvironmentVariableA("NIER_KEEP_QUEUE", nullptr, 0) > 0;
             static const size_t cushion = [] { char v[8]; return GetEnvironmentVariableA("NIER_QUEUE_CUSHION", v, sizeof(v)) ? size_t(atoi(v)) : size_t(0); }();
             static uint32_t skipped = 0, starved = 0, counted = 0;
-            if (queued > cushion && interval == 1 && !keepQueue) { interval = 0; skipped++; }
+            // Only where one refresh is all a frame ever gets. On a faster display (each frame held for
+            // 2-4 refreshes) a queued frame is shown for one refresh, as it always was, and nothing is
+            // dropped: dropping them there too, as this did for a day, threw most frames away on a
+            // 240 Hz display with VSync on (443 of 600, 40 frames a second shown).
+            if (queued > cushion && interval == 1 && multiple == 1 && !keepQueue) { interval = 0; skipped += GuestRefreshHz() != 0; }   // (uncapped, every frame comes this way and none is lost)
             if (queued == 0) starved++;
             gPaceQueued = int(queued);
             gPaceInterval = int(interval);
@@ -3659,13 +3693,20 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             static LARGE_INTEGER last{}, frequency{};
             if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
             const double k = 1000.0 / double(frequency.QuadPart);
-            Log("[pace] %llu: %.1f since the last present; swap chain %.1f, recording %.1f, read-backs %.1f, present %.1f; %d queued, interval %d\n", (unsigned long long)frame,
+            Log("[pace] %llu: %.1f since the last present; swap chain %.1f, recording %.1f, read-backs %.1f, present %.1f; %d queued, interval %d; the frame before waited %.1f for the GPU after its present\n", (unsigned long long)frame,
                 last.QuadPart ? double(perfPresented.QuadPart - last.QuadPart) * k : 0.0, double(perfStart.QuadPart - perfEntered.QuadPart) * k,
                 double(perfRecorded.QuadPart - perfStart.QuadPart) * k, double(perfWrittenBack.QuadPart - perfRecorded.QuadPart) * k,
-                double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * k, gPaceQueued, gPaceInterval);
+                double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * k, gPaceQueued, gPaceInterval, gPaceGpuMs);
             last = perfPresented;
         }
         WaitForGpu();
+        if (logPacing)
+        {
+            LARGE_INTEGER waited, frequency;
+            QueryPerformanceCounter(&waited);
+            QueryPerformanceFrequency(&frequency);
+            gPaceGpuMs = double(waited.QuadPart - perfPresented.QuadPart) * 1000.0 / double(frequency.QuadPart);
+        }
         gRetired.clear();   // the frame's GPU work is complete
         if (lateWriteBack) deliverWriteBacks();
         {
@@ -3860,9 +3901,24 @@ void RendererSubmitFrame(RendererFrame&& frame)
 {
     gSubmitted++;
     {
+        // NIER_LOG_PACING=1: a hand-over that had to wait (for the lock, or for room in the queue).
+        static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
+        LARGE_INTEGER begin{}, locked{}, end{}, frequency{};
+        if (logPacing) QueryPerformanceCounter(&begin);
         std::unique_lock lock(gMailboxMutex);
+        const size_t queuedOnEntry = gFrameQueue.size();
+        if (logPacing) QueryPerformanceCounter(&locked);
         gQueueSpace.wait(lock, [] { return gFrameQueue.size() < 3 || !gReady; });
         if (!gReady) return;
+        if (logPacing)
+        {
+            QueryPerformanceCounter(&end);
+            QueryPerformanceFrequency(&frequency);
+            const double k = 1000.0 / double(frequency.QuadPart);
+            if (double(end.QuadPart - begin.QuadPart) * k > 2.0)
+                Log("[pace] frame %llu: handing it to the renderer took %.1f ms (%.1f for the lock, %.1f for room: %zu frames were queued)\n", (unsigned long long)frame.frame,
+                    double(end.QuadPart - begin.QuadPart) * k, double(locked.QuadPart - begin.QuadPart) * k, double(end.QuadPart - locked.QuadPart) * k, queuedOnEntry);
+        }
         gFrameQueue.push_back(std::move(frame));
     }
     gMailboxChanged.notify_one();
@@ -3892,6 +3948,11 @@ bool RendererWaitDisplayVblank()
     static const bool off = GetEnvironmentVariableA("NIER_NO_VBLANK_LOCK", nullptr, 0) > 0;   // debugging
     const UINT divider = gVblankDivider.load();
     if (off || !divider || !gReady || !gSwapChain) return false;
+    // A display found not to keep time (below) is not waited for at all: waiting for its refreshes
+    // first and only then saying "use the timer" left the game ticking at the display's pace.
+    static UINT refusedHz = 0, refusedDivider = 0;
+    if (refusedHz && (refusedHz != gDisplayHz.load() || refusedDivider != divider)) { refusedHz = 0; gDisplayTicksOff = false; }
+    if (refusedHz) return false;
     static ComPtr<IDXGIOutput> output;   // only the vblank thread comes here
     static uint32_t uses = 0;
     if (!output || uses++ % 240 == 0)    // the window can move to another display
@@ -3911,6 +3972,41 @@ bool RendererWaitDisplayVblank()
     // With one refresh to wait for, the wait is as short as the time left to it; only an output that
     // returns at once (no real wait) is refused.
     const double least = divider > 1 ? expected * 0.5 : 0.3;
+    // The display's refreshes are only a clock if they come at the rate Windows reports, whatever
+    // the game does. Seen otherwise twice. A monitor reported as 120 Hz refreshes at 144: with
+    // "every 2 refreshes" the game ran at 72 frames a second. And a 240 Hz monitor with G-SYNC,
+    // which on its own refreshes 240.1 times a second, was counted at 155.6 a second in play
+    // with VSync on, the game running at 39 (a quarter of that): there a refresh happens when a
+    // frame is presented, so the game's clock followed the display, which followed the game's
+    // presents, which followed the game's clock, and whatever delayed one frame slowed all that
+    // came after it. So the refreshes are counted against the real clock, a quarter of a second
+    // at a time: two of those in a row more than 5% off the reported rate and the timer is used for as long
+    // as the display's mode and the divider stay what they are (gDisplayTicksOff: frames are
+    // then presented at the next refresh instead of being held for a count of them).
+    {
+        static LARGE_INTEGER windowBegin{};
+        static uint32_t ticks = 0, off = 0;
+        const UINT hz = gDisplayHz.load();
+        // A gap (the lock was off, or a wait failed) starts the count again.
+        if (!windowBegin.QuadPart || begin.QuadPart - windowBegin.QuadPart > frequency.QuadPart / 2) { windowBegin = begin; ticks = 0; off = 0; }
+        ticks += divider;
+        if (end.QuadPart - windowBegin.QuadPart >= frequency.QuadPart / 4 && hz)
+        {
+            const double rate = double(ticks) * double(frequency.QuadPart) / double(end.QuadPart - windowBegin.QuadPart);
+            windowBegin = end;
+            ticks = 0;
+            off = std::fabs(rate - double(hz)) > double(hz) * 0.05 ? off + 1 : 0;
+            if (off >= 2)
+            {
+                off = 0;
+                refusedHz = hz;
+                refusedDivider = divider;
+                gDisplayTicksOff = true;
+                Log("[present] the display reported as %u Hz refreshes %.1f times a second: the game's vblank uses the timer instead\n", hz, rate);
+                return false;
+            }
+        }
+    }
     if (!logged && ms >= least && ms <= expected * 2.5) { logged = true; Log("[present] the game's vblank follows the display (every %u refresh%s)\n", divider, divider == 1 ? "" : "es"); }
     return ms >= least && ms <= expected * 2.5;   // an output that doesn't really wait returns at once
 }

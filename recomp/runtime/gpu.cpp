@@ -9,6 +9,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <set>
 #include <string>
 #include <thread>
@@ -58,6 +60,15 @@ namespace
     struct FrameTiming { uint64_t frames = 0, total = 0, wait = 0, idle = 0; };
     FrameTiming gOnTime, gLate;
     uint64_t gFrameWaitTicks = 0, gFrameIdleTicks = 0;
+    // For the same trace: textures converted this frame (count, bytes, time) and time spent hashing textures in full.
+    uint64_t gFrameDecodeTicks = 0, gFrameDecodeBytes = 0, gFrameDecodeCount = 0, gFrameHashTicks = 0, gFrameHashBytes = 0;
+    // And the time in each kind of command packet (by opcode; packets inside an indirect buffer count for themselves).
+    uint64_t gFrameOpTicks[256] = {};
+    // Vertex bytes copied for this frame's draws (BuildDraw), and the longest any one packet of each kind took.
+    uint64_t gFrameVertexCopied = 0;
+    uint64_t gFrameOpLongest[256] = {};
+    uint32_t gFrameOpCount[256] = {};
+    const bool gLogPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
     LARGE_INTEGER gLastSwapTime{};
     uint64_t gFrameTimeBins[6] = {};   // frame time in vblanks: <1.25, <1.75, <2.25, <2.75, <3.5, more
 
@@ -76,9 +87,39 @@ namespace
             bucket.total += total;
             bucket.wait += gFrameWaitTicks;
             bucket.idle += gFrameIdleTicks;
+            // NIER_LOG_PACING=1: where the command thread's time went in a frame that took over 1.5
+            // vblanks, and (for comparison) in every 100th frame that did not.
+            static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
+            static uint32_t onTime = 0;
+            if (logPacing && (vblanks > 1.5 || ++onTime % 100 == 0))
+            {
+                const double k = 1000.0 / double(frequency.QuadPart);
+                Log("[pace] command thread, frame %llu (%s): %.1f ms = %.1f waiting (WAIT_REG_MEM) + %.1f idle (no commands from the game) + %.1f working (of that %.1f converting %llu textures, %llu KB, and %.1f hashing %llu KB in full; vertex data %llu KB copied)\n",
+                    (unsigned long long)gFrames.load(), vblanks > 1.5 ? "late" : "on time", double(total) * k, double(gFrameWaitTicks) * k, double(gFrameIdleTicks) * k,
+                    double(total - gFrameWaitTicks - gFrameIdleTicks) * k, double(gFrameDecodeTicks) * k, (unsigned long long)gFrameDecodeCount, (unsigned long long)(gFrameDecodeBytes >> 10),
+                    double(gFrameHashTicks) * k, (unsigned long long)(gFrameHashBytes >> 10), (unsigned long long)(gFrameVertexCopied >> 10));
+                {
+                    // The packet kinds that took the most time.
+                    int order[256];
+                    for (int i = 0; i < 256; i++) order[i] = i;
+                    std::partial_sort(order, order + 5, order + 256, [](int a, int b) { return gFrameOpTicks[a] > gFrameOpTicks[b]; });
+                    char text[256];
+                    int at = 0;
+                    uint64_t sum = 0;
+                    for (int i = 0; i < 256; i++) sum += gFrameOpTicks[i];
+                    for (int i = 0; i < 5 && gFrameOpTicks[order[i]]; i++)
+                        at += snprintf(text + at, sizeof(text) - at, "%s0x%02X x%u %.1f ms (longest %.2f)", i ? ", " : "", order[i], gFrameOpCount[order[i]], double(gFrameOpTicks[order[i]]) * k, double(gFrameOpLongest[order[i]]) * k);
+                    Log("[pace]   packets: %s; all packets %.1f ms\n", at ? text : "-", double(sum) * k);
+                }
+            }
         }
         gLastSwapTime = now;
         gFrameWaitTicks = gFrameIdleTicks = 0;
+        gFrameDecodeTicks = gFrameDecodeBytes = gFrameDecodeCount = gFrameHashTicks = gFrameHashBytes = 0;
+        memset(gFrameOpTicks, 0, sizeof(gFrameOpTicks));
+        gFrameVertexCopied = 0;
+        memset(gFrameOpLongest, 0, sizeof(gFrameOpLongest));
+        memset(gFrameOpCount, 0, sizeof(gFrameOpCount));
     }
     std::atomic<bool> gRunning{ false };
 
@@ -339,6 +380,42 @@ namespace
     ShaderCapture gShaders[2];
     std::map<uint64_t, std::vector<uint32_t>> gShaderLibrary[2];
 
+    // The shader dumps in recomp\shaders (microcode for tools/pipeline_list, HLSL to read) are written
+    // by a thread of their own. Written where the shader was first met, on the command thread, two
+    // files a shader, a scene that brought thirteen new shaders held its first frame for 60 ms.
+    struct DumpQueue
+    {
+        std::mutex mutex;
+        std::condition_variable work;
+        std::deque<std::pair<std::string, std::string>> files;   // path, contents
+        bool started = false;
+    } gDumps;
+
+    void WriteDumpLater(const char* path, const void* data, size_t bytes)
+    {
+        std::lock_guard lock(gDumps.mutex);
+        if (!gDumps.started)
+        {
+            gDumps.started = true;
+            std::thread([] {
+                CreateDirectoryA("..\\shaders", nullptr);
+                for (;;)
+                {
+                    std::pair<std::string, std::string> file;
+                    {
+                        std::unique_lock lock(gDumps.mutex);
+                        gDumps.work.wait(lock, [] { return !gDumps.files.empty(); });
+                        file = std::move(gDumps.files.front());
+                        gDumps.files.pop_front();
+                    }
+                    if (FILE* out = fopen(file.first.c_str(), "wb")) { fwrite(file.second.data(), 1, file.second.size(), out); fclose(out); }
+                }
+            }).detach();
+        }
+        gDumps.files.emplace_back(path, std::string(static_cast<const char*>(data), bytes));
+        gDumps.work.notify_one();
+    }
+
     void StoreShader(uint32_t stage, std::vector<uint32_t> words)
     {
         if (stage > 1) return;
@@ -355,10 +432,9 @@ namespace
         }
         if (!gShaderLibrary[stage].count(hash))
         {
-            CreateDirectoryA("..\\shaders", nullptr);
             char path[96];
             snprintf(path, sizeof(path), "..\\shaders\\%s_%016llX.bin", stage ? "ps" : "vs", hash);
-            if (FILE* file = fopen(path, "wb")) { fwrite(words.data(), 4, words.size(), file); fclose(file); }
+            WriteDumpLater(path, words.data(), words.size() * 4);
             gShaderLibrary[stage][hash] = std::move(words);
         }
     }
@@ -401,7 +477,7 @@ namespace
         if (entry.info.ok) RendererPrepareShader(shader);   // compile in the background, ahead of use
         char path[96];
         snprintf(path, sizeof(path), "..\\shaders\\%s_%016llX.hlsl", stage ? "ps" : "vs", capture.hash);
-        if (FILE* file = fopen(path, "wb")) { fwrite(entry.info.hlsl.data(), 1, entry.info.hlsl.size(), file); fclose(file); }
+        WriteDumpLater(path, entry.info.hlsl.data(), entry.info.hlsl.size());
         return &(gTranslated[stage][capture.hash] = std::move(entry));
     }
 
@@ -684,7 +760,22 @@ namespace
                     else memset(sample + (40 + i) * 64, 0, 64);
                 }
                 signature = XXH3_64bits(sample, sizeof(sample)) | 1;   // never zero
-                unchanged = memo->signature == signature && frameNow - memo->fullFrame < 600 + (key & 255);
+                unchanged = memo->signature == signature;
+                // The full hash "regardless" is a safeguard, so it can wait its turn: each texture's
+                // comes due 600-1111 frames after its last one (by a hash of the key: the key's own
+                // low bits are the same for nearly every texture, which made everything first seen in
+                // one frame, a whole scene's textures, come due together), and no more than 2 MB of
+                // them are done in a frame, the rest staying due. All of a scene's at once held the
+                // command thread for 8 ms or more: one frame late about every ten seconds in a busy
+                // cutscene, in groups that repeated at the same spacing.
+                if (unchanged && frameNow - memo->fullFrame >= 600 + ((key * 0x9E3779B97F4A7C15ull) >> 55))
+                {
+                    static uint64_t budgetFrame = ~0ull, budgetLeft = 0;
+                    const uint64_t budget = 2u << 20;
+                    if (budgetFrame != frameNow) { budgetFrame = frameNow; budgetLeft = budget; }
+                    const uint64_t cost = bytes + (levels > 1 ? mipBytes : 0);
+                    if (budgetLeft == budget || cost <= budgetLeft) { unchanged = false; budgetLeft -= (std::min)(budgetLeft, cost); }   // (one larger than the budget still gets its turn)
+                }
             }
             if (unchanged)
             {
@@ -693,8 +784,13 @@ namespace
             }
             else
             {
+                LARGE_INTEGER hashBegin, hashEnd;
+                QueryPerformanceCounter(&hashBegin);
                 content = XXH3_64bits(source, size_t(bytes));
                 if (levels > 1) content = XXH3_64bits_withSeed(g_base + mipGuest, size_t(mipBytes), content);
+                QueryPerformanceCounter(&hashEnd);
+                gFrameHashTicks += uint64_t(hashEnd.QuadPart - hashBegin.QuadPart);
+                gFrameHashBytes += bytes + (levels > 1 ? mipBytes : 0);
                 if (memo) *memo = { frameNow, content, signature, frameNow };
             }
         }
@@ -728,6 +824,8 @@ namespace
                 sub.rows = ctx1 ? hb * 4 : hb;
                 total += size_t(sub.rowPitch) * sub.rows;
             }
+        LARGE_INTEGER decodeBegin;
+        QueryPerformanceCounter(&decodeBegin);
         decoded->data.resize(total);
 
         for (uint32_t face = 0; face < faces; face++)
@@ -768,6 +866,13 @@ namespace
                     }
                 }
             }
+        {
+            LARGE_INTEGER decodeEnd;
+            QueryPerformanceCounter(&decodeEnd);
+            gFrameDecodeTicks += uint64_t(decodeEnd.QuadPart - decodeBegin.QuadPart);
+            gFrameDecodeBytes += total;
+            gFrameDecodeCount++;
+        }
         // NIER_DUMP_TEX=<physical base>[,...] writes the decoded base level (host layout) to captures/,
         // with a header: format, width, height, row pitch, rows (debugging).
         static const std::set<uint32_t> dumpTextures = [] {
@@ -1134,6 +1239,7 @@ namespace
             totalBytes += last - first;
         }
         draw.vertexData.resize(totalBytes);   // not zero-filled
+        gFrameVertexCopied += totalBytes;
         uint32_t written = 0;
         for (uint32_t i = 0; i < copyCount; i++)
         {
@@ -1392,6 +1498,22 @@ namespace
     {
         Stream after = s;
         after.Skip(count);
+        struct OpTimer
+        {
+            uint32_t opcode;
+            bool on;
+            LARGE_INTEGER begin{};
+            OpTimer(uint32_t opcode, bool on) : opcode(opcode), on(on) { if (on) QueryPerformanceCounter(&begin); }
+            ~OpTimer()
+            {
+                if (!on) return;
+                LARGE_INTEGER end;
+                QueryPerformanceCounter(&end);
+                gFrameOpTicks[opcode & 255] += uint64_t(end.QuadPart - begin.QuadPart);
+                gFrameOpLongest[opcode & 255] = (std::max)(gFrameOpLongest[opcode & 255], uint64_t(end.QuadPart - begin.QuadPart));
+                gFrameOpCount[opcode & 255]++;
+            }
+        } timer(opcode, gLogPacing && opcode != PM4_INDIRECT_BUFFER && opcode != PM4_INDIRECT_BUFFER_PFD && opcode != PM4_WAIT_REG_MEM);
 
         switch (opcode)
         {
