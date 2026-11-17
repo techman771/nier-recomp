@@ -20,8 +20,18 @@
 // on a 4 KB boundary; an effect file (*.EFP) holds several groups in different places. So each
 // header's code is first looked for right after the one before it, and when what is there does not
 // read as microcode (PlausibleMicrocode), the file is searched for a place where it, and the next
-// header's after it, do. Vertex shaders are not listed: what the game draws with is a patched copy
-// (see above), known only once it has been drawn.
+// header's after it, do.
+//
+// Vertex shaders nobody has drawn yet are listed too, in the forms the console would give them
+// (VertexForms). A stored vertex shader's fetch instructions are blank; its header names the vertex
+// inputs it reads (the record's input table: instruction, usage, usage index, a flag), and the
+// console fills the instructions in from the vertex layout of the mesh it is drawn with. The game
+// builds a shader for exactly the inputs its mesh has, laid out in one fixed order (position,
+// blend weights, blend indices, normal, texture coordinates, tangents, colours), so the layout
+// follows from the shader's own inputs, except for two things that are tried both ways: each
+// texture coordinate is two or four half floats, and a tangent the shader reads may be absent from
+// the mesh. Checked against play: every recorded vertex shader found in the archives is among the
+// forms made for its stored copy (the tool prints the count).
 //
 // Usage: pipeline_list <seen.txt> <shader dir> <output> <game dir> <image.bin or -> <archive relative to game dir>...
 #define _CRT_SECURE_NO_WARNINGS
@@ -210,6 +220,134 @@ static bool PlausibleMicrocode(const uint8_t* code, uint32_t words)
     return false;
 }
 
+// A vertex shader in one of the forms the console would give it: the stored copy and the words to change.
+struct StoredVertex
+{
+    uint64_t hash = 0;
+    int64_t container = -1;
+    uint64_t offset = 0;
+    uint32_t words = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> patches;
+};
+
+// The forms of a stored vertex shader (`stored`, host-order words; `header`, its container header).
+// How the console fills in a fetch, worked out from the recorded shaders:
+//   - the fetches are rewritten in the order of the vertex's elements (inputs the mesh lacks first,
+//     as a fetch of constant 0,0,0,1), each keeping the register its input was read into; the last
+//     input stays last when its flag is 3;
+//   - dword 1: the swizzle (16 bit pairs of a half float format come out swapped; components the
+//     element lacks read 0, or 1 for w), bits 8-9 of the declaration type at 12-13, the format at
+//     16, and bit 30 when the data lies in the 8 dwords a full fetch before it brought in;
+//   - dword 2: the stride and the offset, in dwords;
+//   - dword 0 of a full fetch: at bit 27, how many dwords beyond its first its mini fetches reach.
+static void VertexForms(const uint8_t* header, uint32_t headerSize, const std::vector<uint32_t>& stored, std::vector<std::vector<uint32_t>>& forms)
+{
+    struct Input { uint32_t instruction, usage, index, flag; };
+    struct Element { uint32_t offset, type, usage, index; };
+    const auto rank = [](uint32_t usage) { return usage == 0 ? 0 : usage == 1 ? 1 : usage == 2 ? 2 : usage == 3 ? 3 : usage == 5 ? 4 : usage == 6 ? 5 : usage == 10 ? 6 : -1; };
+    if (headerSize < 0x28) return;
+    const uint32_t record = Be(header + 24);
+    if (record + 44 > headerSize) return;
+    const uint32_t count = Be(header + record + 28);
+    if (count == 0 || count > 16 || record + 40 + count * 4 > headerSize) return;
+    std::vector<Input> inputs;
+    std::vector<std::pair<uint32_t, uint32_t>> want;   // usage, index: in the vertex's order
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint32_t entry = Be(header + record + 40 + i * 4);
+        const Input input{ entry & 0xFFF, (entry >> 12) & 0xF, (entry >> 16) & 0xF, (entry >> 20) & 0xF };
+        if (rank(input.usage) < 0 || size_t(input.instruction) * 3 + 3 > stored.size() || (stored[input.instruction * 3] & 0x1F) != 0) return;   // not a vertex fetch
+        inputs.push_back(input);
+        if (std::find(want.begin(), want.end(), std::make_pair(input.usage, input.index)) == want.end()) want.push_back({ input.usage, input.index });
+    }
+    std::sort(want.begin(), want.end(), [&](const auto& a, const auto& b) { return rank(a.first) != rank(b.first) ? rank(a.first) < rank(b.first) : a.second < b.second; });
+    std::vector<uint32_t> slots;
+    for (const Input& input : inputs) slots.push_back(input.instruction);
+    std::sort(slots.begin(), slots.end());
+    uint32_t tangents = 0, coordinates = 0;
+    for (const auto& w : want) { tangents += w.first == 6; coordinates += w.first == 5; }
+    if (tangents > 4 || coordinates > 4) return;
+
+    for (uint32_t dropped = 0; dropped < (1u << tangents); dropped++)
+        for (uint32_t narrow = 0; narrow < (1u << coordinates); narrow++)
+        {
+            // The layout.
+            std::vector<Element> layout;
+            uint32_t bytes = 0, tangent = 0, coordinate = 0;
+            for (const auto& [usage, index] : want)
+            {
+                if (usage == 6 && ((dropped >> tangent++) & 1)) continue;
+                uint32_t type = usage == 0 ? 0x2A23B9 : usage == 1 ? 0x1A2086 : usage == 2 ? 0x1A2286 : usage == 3 ? 0x2A2190 : usage == 6 ? 0x1A2187 : 0x1A2086;
+                if (usage == 5) type = ((narrow >> coordinate++) & 1) ? 0x2C235F : 0x1A2360;
+                layout.push_back({ bytes, type, usage, index });
+                bytes += type == 0x2A23B9 ? 12 : type == 0x1A2360 ? 8 : 4;
+            }
+            const uint32_t stride = bytes / 4;
+
+            struct Fetch { bool present; uint32_t offset, source, type; };
+            std::vector<Fetch> order;
+            for (const Input& input : inputs)
+            {
+                Fetch fetch{ false, 0, input.instruction, 0 };
+                for (const Element& element : layout)
+                    if (element.usage == input.usage && element.index == input.index) { fetch.present = true; fetch.offset = element.offset; fetch.type = element.type; break; }
+                order.push_back(fetch);
+            }
+            std::vector<Fetch> pinned;
+            if (inputs.back().flag == 3) { pinned.push_back(order.back()); order.pop_back(); }
+            std::stable_sort(order.begin(), order.end(), [](const Fetch& a, const Fetch& b) { return a.present != b.present ? !a.present : a.offset < b.offset; });
+            order.insert(order.end(), pinned.begin(), pinned.end());
+
+            std::vector<uint32_t> words = stored;
+            struct Full { uint32_t slot, offset, end; };
+            std::vector<Full> fulls;
+            bool haveWindow = false;
+            uint32_t window = 0;
+            for (size_t i = 0; i < order.size(); i++)
+            {
+                const Fetch& fetch = order[i];
+                const uint32_t slot = slots[i];
+                const uint32_t d0 = (stored[slot * 3] & ~(0x3Fu << 12)) | (stored[fetch.source * 3] & (0x3Fu << 12));
+                uint32_t d1 = 0x00060B24, offset = 0, size = 1;
+                if (fetch.present)
+                {
+                    offset = fetch.offset / 4;
+                    size = fetch.type == 0x2A23B9 ? 3 : fetch.type == 0x1A2360 ? 2 : 1;
+                    const uint32_t components = (fetch.type >> 16) == 0x2A ? 3 : (fetch.type >> 16) == 0x2C ? 2 : 4, format = fetch.type & 0x3F;
+                    const uint32_t swizzle = stored[fetch.source * 3 + 1] & 0xFFF;
+                    d1 = 0;
+                    for (int c = 0; c < 4; c++)
+                    {
+                        uint32_t from = (swizzle >> (c * 3)) & 7;
+                        if (from < 4)
+                        {
+                            if (from >= components) from = from == 3 ? 5 : 4;
+                            else if (format == 31 || format == 32) from ^= 1;
+                        }
+                        d1 |= from << (c * 3);
+                    }
+                    d1 |= ((fetch.type >> 8) & 3) << 12 | format << 16;
+                }
+                if (haveWindow && offset >= window && offset + size <= window + 8)
+                {
+                    d1 |= 0x40000000;
+                    fulls.back().end = std::max(fulls.back().end, offset + size);
+                }
+                else
+                {
+                    haveWindow = true;
+                    window = offset;
+                    fulls.push_back({ slot, offset, 0 });
+                }
+                words[slot * 3] = d0;
+                words[slot * 3 + 1] = d1;
+                words[slot * 3 + 2] = stride | offset << 8;
+            }
+            for (const Full& full : fulls) if (full.end) words[full.slot * 3] |= (full.end - full.offset - 1) << 27;
+            if (std::find(forms.begin(), forms.end(), words) == forms.end()) forms.push_back(std::move(words));
+        }
+}
+
 // A pixel shader found by its header, drawn or not.
 struct Stored
 {
@@ -220,8 +358,10 @@ struct Stored
 };
 
 // Every pixel shader of the V/P file pairs in the archive at `path`.
-static void EnumerateStored(const std::string& path, std::map<uint64_t, Stored>& stored, uint32_t& pairs, uint32_t& headersSeen, std::map<std::string, std::pair<uint32_t, uint32_t>>& byKind)
+static void EnumerateStored(const std::string& path, std::map<uint64_t, Stored>& stored, uint32_t& pairs, uint32_t& headersSeen, std::map<std::string, std::pair<uint32_t, uint32_t>>& byKind,
+                            std::map<uint64_t, StoredVertex>& vertexForms, uint32_t& vertexStored)
 {
+    std::set<uint64_t> vertexDone;   // stored vertex shaders whose forms have been made
     FILE* file = fopen(path.c_str(), "rb");
     if (!file) return;
     auto readAt = [&](uint64_t at, size_t size, std::vector<uint8_t>& out) {
@@ -252,7 +392,7 @@ static void EnumerateStored(const std::string& path, std::map<uint64_t, Stored>&
         else headers = packed;
 
         // The headers, in file order: physical size, and where the microcode is inside that part.
-        struct Header { bool pixel; uint32_t physical, start, size; };
+        struct Header { bool pixel; uint32_t physical, start, size; size_t at; uint32_t virtualSize; };
         std::vector<Header> list;
         uint64_t span = 0;
         for (size_t p = 0; p + 0x28 <= headers.size(); p++)
@@ -260,7 +400,7 @@ static void EnumerateStored(const std::string& path, std::map<uint64_t, Stored>&
             if (headers[p] != 0x10 || headers[p + 1] != 0x2A || headers[p + 2] != 0x11 || headers[p + 3] > 1) continue;
             const uint32_t virtualSize = Be(&headers[p + 4]), physical = Be(&headers[p + 8]), record = Be(&headers[p + 24]);
             if (virtualSize >= 0x8000 || record + 8 > virtualSize || p + record + 8 > headers.size()) continue;
-            list.push_back({ headers[p + 3] == 0, physical, Be(&headers[p + record]), Be(&headers[p + record + 4]) });
+            list.push_back({ headers[p + 3] == 0, physical, Be(&headers[p + record]), Be(&headers[p + record + 4]), p, virtualSize });
             span += (uint64_t(physical) + 31) / 32 * 32;
         }
         if (list.empty()) continue;
@@ -302,7 +442,31 @@ static void EnumerateStored(const std::string& path, std::map<uint64_t, Stored>&
             }
             const uint64_t at = position + header.start;
             position += step;
-            if (!here || !header.pixel) continue;
+            if (!here) continue;
+            if (!header.pixel)
+            {
+                // The forms the console would give this vertex shader.
+                std::vector<uint32_t> words(header.size / 4);
+                uint64_t storedHash = 1469598103934665603ull;
+                for (size_t w = 0; w < words.size(); w++) { words[w] = Be(&plain[size_t(at) + w * 4]); storedHash = (storedHash ^ words[w]) * 1099511628211ull; }
+                if (!vertexDone.insert(storedHash).second) continue;
+                vertexStored++;
+                std::vector<std::vector<uint32_t>> forms;
+                VertexForms(&headers[header.at], uint32_t(std::min<size_t>(header.virtualSize, headers.size() - header.at)), words, forms);
+                for (const std::vector<uint32_t>& form : forms)
+                {
+                    StoredVertex made;
+                    made.hash = 1469598103934665603ull;
+                    for (uint32_t word : form) made.hash = (made.hash ^ word) * 1099511628211ull;
+                    if (vertexForms.count(made.hash)) continue;
+                    made.container = container;
+                    made.offset = container >= 0 ? at : entry.at + at;
+                    made.words = uint32_t(words.size());
+                    for (uint32_t w = 0; w < words.size(); w++) if (form[w] != words[w]) made.patches.push_back({ w, form[w] });
+                    vertexForms[made.hash] = std::move(made);
+                }
+                continue;
+            }
             kind.second++;
             uint64_t hash = 1469598103934665603ull;   // as gpu.cpp StoreShader names shaders
             for (uint32_t w = 0; w < header.size / 4; w++) hash = (hash ^ Be(&plain[size_t(at) + w * 4])) * 1099511628211ull;
@@ -478,12 +642,17 @@ int main(int argc, char** argv)
 
     // Every stored pixel shader, drawn or not (after the recorded ones in the list, without pipelines).
     std::vector<std::pair<int, Stored>> extras;
+    std::vector<std::pair<int, StoredVertex>> vertexExtras;
+    std::set<uint64_t> vertexFormHashes;
+    uint32_t vertexStoredTotal = 0;
     for (int i = 6; i < argc; i++)
     {
         std::map<uint64_t, Stored> stored;
-        uint32_t pairs = 0, headersSeen = 0;
+        uint32_t pairs = 0, headersSeen = 0, vertexStored = 0;
         std::map<std::string, std::pair<uint32_t, uint32_t>> byKind;
-        EnumerateStored(gameDir + "/" + argv[i], stored, pairs, headersSeen, byKind);
+        std::map<uint64_t, StoredVertex> vertexForms;
+        EnumerateStored(gameDir + "/" + argv[i], stored, pairs, headersSeen, byKind, vertexForms, vertexStored);
+        vertexStoredTotal += vertexStored;
         for (const auto& [kind, counts] : byKind) printf("  %s: code found for %u of %u pixel shader headers\n", kind.c_str(), counts.second, counts.first);
         int source = -1;
         for (size_t n = 0; n < sources.size(); n++) if (sources[n] == argv[i]) source = int(n);
@@ -496,6 +665,13 @@ int main(int argc, char** argv)
             if (!listed && source >= 0) extras.push_back({ source, shader });
         }
         printf("%s: %u file pairs with %u shader headers, %zu distinct pixel shaders (%zu of them recorded already)\n", argv[i], pairs, headersSeen, stored.size(), recorded);
+        const size_t formsHere = vertexForms.size();
+        for (auto& [hash, form] : vertexForms)
+        {
+            const bool fresh = vertexFormHashes.insert(hash).second;
+            if (fresh && !wanted.count({ false, hash }) && source >= 0) vertexExtras.push_back({ source, std::move(form) });
+        }
+        printf("%s: %u distinct stored vertex shaders, %zu forms made for them\n", argv[i], vertexStored, formsHere);
     }
 
     uint32_t exact[2] = {}, patched[2] = {}, missing[2] = {}, patchWords = 0;
@@ -536,6 +712,15 @@ int main(int argc, char** argv)
         else
             fprintf(out, "S ps %016llX %s %llX %u\n", (unsigned long long)shader.hash, sources[source].c_str(), (unsigned long long)shader.offset, shader.words);
     }
+    for (const auto& [source, shader] : vertexExtras)
+    {
+        if (shader.container >= 0)
+            fprintf(out, "Z vs %016llX %s %llX %llX %u", (unsigned long long)shader.hash, sources[source].c_str(), (unsigned long long)shader.container, (unsigned long long)shader.offset, shader.words);
+        else
+            fprintf(out, "S vs %016llX %s %llX %u", (unsigned long long)shader.hash, sources[source].c_str(), (unsigned long long)shader.offset, shader.words);
+        for (size_t i = 0; i < shader.patches.size(); i++) fprintf(out, "%c%u:%X", i ? ',' : ' ', shader.patches[i].first, shader.patches[i].second);
+        fprintf(out, "\n");
+    }
     uint32_t covered = 0;
     for (const std::string& line : pipelineLines)
     {
@@ -550,5 +735,11 @@ int main(int argc, char** argv)
     printf("pixel shaders:  %u stored as captured, %u stored with patched words, %u not found\n", exact[1], patched[1], missing[1]);
     printf("%u patched words in all; %u of %zu pipelines can be made ahead of time\n", patchWords, covered, pipelineLines.size());
     printf("%zu more pixel shaders listed that have not been drawn yet\n", extras.size());
+    // The check of the rule: a recorded vertex shader whose stored copy is in an archive must be one of the forms.
+    uint32_t recordedInArchives = 0, reproduced = 0;
+    for (const Shader* shader : found)
+        if (!shader->pixel && sources[shader->source] != "image") { recordedInArchives++; reproduced += vertexFormHashes.count(shader->hash) != 0; }
+    printf("%u distinct stored vertex shaders give %zu forms; %u of the %u recorded vertex shaders found in the archives are among them; %zu forms listed that have not been drawn yet\n",
+           vertexStoredTotal, vertexFormHashes.size(), reproduced, recordedInArchives, vertexExtras.size());
     return 0;
 }

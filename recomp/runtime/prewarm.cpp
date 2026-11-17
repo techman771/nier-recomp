@@ -14,8 +14,9 @@
 //     (a shader inside one of the archives' "lzo" containers, lzo1x.h: most model files are)
 //   P <vs hash> <ps hash> <blend> <write mask> <depth control> <stencil masks> <flags>
 //
-// Shader lines that no P line uses are pixel shaders the files hold but nobody has drawn yet
-// (tools/pipeline_list lists every one it finds). They are compiled once, the first time the game
+// Shader lines that no P line uses are shaders the files hold but nobody has drawn yet
+// (tools/pipeline_list lists every pixel shader it finds, and every vertex shader in each form the
+// console could give it: see VertexForms there). They are compiled once, the first time the game
 // starts, so that meeting one in play costs no compile: a note in the shader cache folder
 // (prepared_<hash of the list>.txt) says it has been done, and later starts leave them alone, since
 // the compiled shader is then read from the cache when it is first drawn. NIER_PREWARM_ALL=1 does

@@ -1087,6 +1087,30 @@ From the user's playthrough (open unless marked):
   seen: something drawn once into a surface that is kept (it would stay missing); a quad with
   more than 6 vertices that a later pass depends on. Not covered: the motion-vector form of a
   vertex shader (FSR 3 only) is still compiled and its pipeline built on the render thread.
+- Vertex shaders nobody has drawn yet are on the pipeline list too (awaiting the user's
+  playtest; nothing in play is expected to look different, only first-use builds get shorter).
+  The archives' model and effect files (X.MDV/X.MDP, X.EFV/X.EFP, X.2DV/X.2DP) hold 627
+  distinct vertex shaders with blank fetch instructions; play had recorded 199. What the
+  console's D3D writes into them, worked out from the recorded ones (tools/pipeline_list.cpp
+  VertexForms has the rule in full): the shader's header record has an input table (count at
+  record+28, entries at record+40: instruction index in bits 0-11, usage 12-15, usage index
+  16-19, a flag 20-23); the fetches are rewritten in the order of the mesh's vertex elements,
+  each keeping its input's register; format, sign bits, swizzle, stride and offset come from
+  the element's declaration type; fetches inside the 8 dwords a full fetch brought in are mini
+  fetches. The meshes' declarations are in the header files (12 bytes an element: offset,
+  type, usage/index/0x78; seven types in the whole game: FLOAT3 2A23B9, HEND3N 2A2190,
+  FLOAT16_4 1A2360, FLOAT16_2 2C235F, DEC3N 1A2187, UBYTE4N 1A2086, UBYTE4 1A2286), but they
+  are not needed: in every recorded case the layout is exactly the shader's own inputs in one
+  fixed order (position, weights, indices, normal, texture coordinates, tangents, colours), and
+  23 recorded shaders use layouts that are in no file. So the forms are made from the inputs
+  alone, with each texture coordinate tried as two and as four half floats and each tangent
+  tried present and absent: 2,396 forms, of which 2,216 are new on the list. Check: 180 of the
+  182 recorded vertex shaders whose stored copy is in an archive are among the forms, bit for
+  bit (the other two are stored outside the V/P file pairs). First start with the new list:
+  3,281 shaders, 0 different from the list, 0 untranslated, ready after 10.4 s (once; 0.3 s
+  after that); the shader cache grows to 3,284 files, 100 MB; the list from 123 KB to 624 KB.
+  Not measured: how many of the new forms the game ever draws, and so how much it saves.
+  Scratch tools used for the analysis are not kept in the repository.
 - Crash while preparing shaders at start-up (user's playtest, once; ten test starts after it did
   not crash): C0000005 at host address 0x18 in all seven pipeline workers at the same moment,
   in CreatePipeline where it copied a shader's ComPtr<ID3DBlob> out of its future (AddRef on a
