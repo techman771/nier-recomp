@@ -22,7 +22,11 @@
 #include "glyphs.h"
 #include "framecapture.h"
 #include "xenos_shader.h"
-#include <xxHash/xxhash.h>   // texture content hashes (xxhash.lib is linked already)
+// The hash is compiled here, inline, with this file's own flags (AVX2): the library that is linked
+// (xxhash.lib, used elsewhere) was built without them and hashes at about half the speed, and this
+// thread hashes tens of megabytes a frame (texture contents, vertex data). The values are the same.
+#define XXH_INLINE_ALL
+#include <xxHash/xxhash.h>
 
 namespace
 {
@@ -59,13 +63,39 @@ namespace
     // more than 1.5 vblanks, to see what makes 60 fps frames late.
     struct FrameTiming { uint64_t frames = 0, total = 0, wait = 0, idle = 0; };
     FrameTiming gOnTime, gLate;
+    std::atomic<float> gCommandWorkMs{ 0 };   // the command thread's working time a frame, smoothed (GpuCommandWorkMs)
     uint64_t gFrameWaitTicks = 0, gFrameIdleTicks = 0;
     // For the same trace: textures converted this frame (count, bytes, time) and time spent hashing textures in full.
     uint64_t gFrameDecodeTicks = 0, gFrameDecodeBytes = 0, gFrameDecodeCount = 0, gFrameHashTicks = 0, gFrameHashBytes = 0;
     // And the time in each kind of command packet (by opcode; packets inside an indirect buffer count for themselves).
     uint64_t gFrameOpTicks[256] = {};
     // Vertex bytes copied for this frame's draws (BuildDraw), and the longest any one packet of each kind took.
-    uint64_t gFrameVertexCopied = 0;
+    uint64_t gFrameVertexCopied = 0, gFrameVertexKept = 0, gFrameVertexHashed = 0;
+    // Vertex copies kept from earlier draws (BuildDraw): by where the bytes came from and their hash.
+    struct VertexKept { ByteBuffer data; uint64_t lastFrame = 0; };
+    std::unordered_map<uint64_t, VertexKept> gVertexCache;
+    uint64_t gVertexCacheBytes = 0;
+    // And per place (address, extent, byte order): how often in a row its bytes were new, and until which frame it is just copied.
+    struct VertexRange { uint32_t misses = 0; uint64_t copyUntil = 0; };
+    std::unordered_map<uint64_t, VertexRange> gVertexRanges;
+
+    // Once a frame: copies nobody drew from for two seconds go (sooner when a lot is held).
+    void VertexCacheTrim(uint64_t frame)
+    {
+        if (frame % 30) return;
+        const uint64_t age = gVertexCacheBytes > (768ull << 20) ? 15 : 120;
+        for (auto it = gVertexCache.begin(); it != gVertexCache.end();)
+        {
+            if (it->second.lastFrame + age < frame) { gVertexCacheBytes -= it->second.data.size(); it = gVertexCache.erase(it); }
+            else ++it;
+        }
+        if (frame % 1800 == 0)
+            for (auto it = gVertexRanges.begin(); it != gVertexRanges.end();)
+            {
+                if (it->second.copyUntil + 1800 < frame && !it->second.misses) it = gVertexRanges.erase(it);
+                else ++it;
+            }
+    }
     uint64_t gFrameOpLongest[256] = {};
     uint32_t gFrameOpCount[256] = {};
     const bool gLogPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
@@ -87,6 +117,8 @@ namespace
             bucket.total += total;
             bucket.wait += gFrameWaitTicks;
             bucket.idle += gFrameIdleTicks;
+            const float workMs = float(double(total - gFrameWaitTicks - gFrameIdleTicks) * 1000.0 / double(frequency.QuadPart));
+            gCommandWorkMs = gCommandWorkMs.load() * 0.95f + (std::min)(workMs, 16.7f) * 0.05f;
             // NIER_LOG_PACING=1: where the command thread's time went in a frame that took over 1.5
             // vblanks, and (for comparison) in every 100th frame that did not.
             static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
@@ -94,10 +126,11 @@ namespace
             if (logPacing && (vblanks > 1.5 || ++onTime % 100 == 0))
             {
                 const double k = 1000.0 / double(frequency.QuadPart);
-                Log("[pace] command thread, frame %llu (%s): %.1f ms = %.1f waiting (WAIT_REG_MEM) + %.1f idle (no commands from the game) + %.1f working (of that %.1f converting %llu textures, %llu KB, and %.1f hashing %llu KB in full; vertex data %llu KB copied)\n",
+                Log("[pace] command thread, frame %llu (%s): %.1f ms = %.1f waiting (WAIT_REG_MEM) + %.1f idle (no commands from the game) + %.1f working (of that %.1f converting %llu textures, %llu KB, and %.1f hashing %llu KB in full; vertex data %llu KB copied, %llu KB kept from before, %llu KB hashed; %llu MB kept in all)\n",
                     (unsigned long long)gFrames.load(), vblanks > 1.5 ? "late" : "on time", double(total) * k, double(gFrameWaitTicks) * k, double(gFrameIdleTicks) * k,
                     double(total - gFrameWaitTicks - gFrameIdleTicks) * k, double(gFrameDecodeTicks) * k, (unsigned long long)gFrameDecodeCount, (unsigned long long)(gFrameDecodeBytes >> 10),
-                    double(gFrameHashTicks) * k, (unsigned long long)(gFrameHashBytes >> 10), (unsigned long long)(gFrameVertexCopied >> 10));
+                    double(gFrameHashTicks) * k, (unsigned long long)(gFrameHashBytes >> 10), (unsigned long long)(gFrameVertexCopied >> 10), (unsigned long long)(gFrameVertexKept >> 10), (unsigned long long)(gFrameVertexHashed >> 10),
+                    (unsigned long long)(gVertexCacheBytes >> 20));
                 {
                     // The packet kinds that took the most time.
                     int order[256];
@@ -117,7 +150,7 @@ namespace
         gFrameWaitTicks = gFrameIdleTicks = 0;
         gFrameDecodeTicks = gFrameDecodeBytes = gFrameDecodeCount = gFrameHashTicks = gFrameHashBytes = 0;
         memset(gFrameOpTicks, 0, sizeof(gFrameOpTicks));
-        gFrameVertexCopied = 0;
+        gFrameVertexCopied = gFrameVertexKept = gFrameVertexHashed = 0;
         memset(gFrameOpLongest, 0, sizeof(gFrameOpLongest));
         memset(gFrameOpCount, 0, sizeof(gFrameOpCount));
     }
@@ -789,6 +822,15 @@ namespace
                 content = XXH3_64bits(source, size_t(bytes));
                 if (levels > 1) content = XXH3_64bits_withSeed(g_base + mipGuest, size_t(mipBytes), content);
                 QueryPerformanceCounter(&hashEnd);
+                if (gLogPacing && bytes + (levels > 1 ? mipBytes : 0) >= (512u << 10))
+                {
+                    // Which large textures get the full hash, and how often (the first 40 kinds, then every 600th time).
+                    static std::unordered_map<uint64_t, uint32_t> times;
+                    uint32_t& n = times[key];
+                    if ((n++ == 0 && times.size() <= 40) || n % 600 == 0)
+                        Log("[pace] full hash of texture %08X: format %u, %ux%u, %u levels, %u KB, block size %u, tiled %d (time %u, frame %llu)\n", t.base, t.format, t.width, t.height,
+                            levels, uint32_t((bytes + (levels > 1 ? mipBytes : 0)) >> 10), blockSize, t.tiled ? 1 : 0, n, (unsigned long long)frameNow);
+                }
                 gFrameHashTicks += uint64_t(hashEnd.QuadPart - hashBegin.QuadPart);
                 gFrameHashBytes += bytes + (levels > 1 ? mipBytes : 0);
                 if (memo) *memo = { frameNow, content, signature, frameNow };
@@ -1238,15 +1280,89 @@ namespace
             copies[copyCount++] = { slot, first, last - first, d1 & 3, g_base + PhysicalToGuest(d0 & ~3u) };
             totalBytes += last - first;
         }
-        draw.vertexData.resize(totalBytes);   // not zero-filled
-        gFrameVertexCopied += totalBytes;
+        // Most of what is drawn is geometry whose vertices are the same as in the frame before
+        // (levels, and characters too: they are posed on the GPU from bone textures), and copying
+        // and byte-swapping all of it again for every frame was the largest part of this thread's
+        // work: 32 MB a frame in a busy cutscene, which left too little of a 60 Hz frame spare
+        // there and held an uncapped one to about 105 a second. So the copy made for a draw is kept,
+        // by where it came from and a hash of the game's bytes there, and a later draw of the same
+        // bytes, in this frame or a later one, shares it (hashing is about three times as fast as
+        // the copy, and nothing is allocated). The whole range is hashed, so a buffer the game has
+        // changed in any way is copied afresh. Ranges that keep changing (particles, the 2D layer)
+        // are told by three misses in a row and then just copied for two seconds before being
+        // tried again; small ranges are not worth it. Copies not drawn from for two seconds are
+        // dropped (VertexCacheTrim, once a frame).
+        // NIER_NO_VERTEX_CACHE=1: copy for every draw, as before. NIER_VERIFY_VERTEX_CACHE=1: copy
+        // anyway and compare with the kept one (testing; differences are logged).
+        static const bool noVertexCache = GetEnvironmentVariableA("NIER_NO_VERTEX_CACHE", nullptr, 0) > 0;
+        static const bool verifyVertexCache = GetEnvironmentVariableA("NIER_VERIFY_VERTEX_CACHE", nullptr, 0) > 0;
+        const uint64_t frameNow = gFrames.load();
+        // NIER_VERTEX_CACHE_AB=1 (testing): on and off by turns of 300 frames, to compare within one run
+        // (from one run to the next this thread's time differs by more than the cache changes it).
+        static const bool alternate = GetEnvironmentVariableA("NIER_VERTEX_CACHE_AB", nullptr, 0) > 0;
+        bool kept = false;
+        uint64_t contentKey = 0;
+        VertexRange* range = nullptr;
+        if (!noVertexCache && !(alternate && ((frameNow / 300) & 1)) && totalBytes >= 4096)
+        {
+            uint64_t identity = 0x9E3779B97F4A7C15ull;
+            for (uint32_t i = 0; i < copyCount; i++)
+            {
+                const uint64_t where[4] = { uint64_t(uintptr_t(copies[i].source)), copies[i].first, copies[i].bytes, copies[i].endian };
+                identity = XXH3_64bits_withSeed(where, sizeof(where), identity);
+            }
+            range = &gVertexRanges[identity];
+            if (frameNow >= range->copyUntil)
+            {
+                contentKey = identity;
+                for (uint32_t i = 0; i < copyCount; i++)
+                    contentKey = XXH3_64bits_withSeed(copies[i].source + copies[i].first, copies[i].bytes, contentKey);
+                gFrameVertexHashed += totalBytes;
+                auto found = gVertexCache.find(contentKey);
+                if (found != gVertexCache.end() && found->second.data.size() == totalBytes)
+                {
+                    draw.vertexData = found->second.data;
+                    found->second.lastFrame = frameNow;
+                    range->misses = 0;
+                    kept = true;
+                    gFrameVertexKept += totalBytes;
+                }
+                else if (++range->misses >= 3)
+                {
+                    range->misses = 0;
+                    range->copyUntil = frameNow + 120;
+                }
+            }
+        }
+        if (!kept)
+        {
+            draw.vertexData.resize(totalBytes);   // not zero-filled
+            gFrameVertexCopied += totalBytes;
+        }
         uint32_t written = 0;
         for (uint32_t i = 0; i < copyCount; i++)
         {
             const VertexCopy& copy = copies[i];
-            CopySwapped(draw.vertexData.data() + written, copy.source + copy.first, copy.bytes, copy.endian);
+            if (!kept) CopySwapped(draw.vertexData.data() + written, copy.source + copy.first, copy.bytes, copy.endian);
+            else if (verifyVertexCache)
+            {
+                static thread_local std::vector<uint8_t> check;
+                check.resize(copy.bytes);
+                CopySwapped(check.data(), copy.source + copy.first, copy.bytes, copy.endian);
+                static int differences = 0;
+                if (memcmp(check.data(), draw.vertexData.data() + written, copy.bytes) && differences++ < 20)
+                    Log("[gpu] kept vertex data differs from the game's: frame %llu, %u bytes at %p+%u\n", (unsigned long long)frameNow, copy.bytes, copy.source, copy.first);
+            }
             draw.vertexBase[copy.slot] = written - copy.first;
             written += copy.bytes;
+        }
+        if (!kept && contentKey && frameNow >= range->copyUntil)
+        {
+            VertexKept& entry = gVertexCache[contentKey];
+            if (entry.data.size()) gVertexCacheBytes -= entry.data.size();
+            entry.data = draw.vertexData;
+            entry.lastFrame = frameNow;
+            gVertexCacheBytes += totalBytes;
         }
 
         memcpy(draw.constants.data(), &r[0x4000], draw.constants.size() * 4);
@@ -1606,6 +1722,7 @@ namespace
             uint64_t frame = gFrames.fetch_add(1) + 1;
             gFrameDrawsLogged = 0;
             NoteFrameTiming();
+            VertexCacheTrim(frame);
             if (frame == gCaptureFrame + 1)
             {
                 LogSetCaptureFile(nullptr);
@@ -1934,6 +2051,7 @@ namespace
 }
 
 uint64_t GpuFrameCount() { return gFrames.load(); }
+double GpuCommandWorkMs() { return gCommandWorkMs.load(); }
 
 void GpuResetFrameTiming()
 {

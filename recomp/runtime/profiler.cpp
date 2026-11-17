@@ -2,6 +2,8 @@
 // thread of the process is sampled about 1000 times a second for the given time, then the log gets each
 // busy thread's hot functions (own time and inclusive time) and what its idle samples were waiting in.
 // A third field "exit" (NIER_PROFILE=11000,20,exit) ends the process after the report.
+// NIER_PROFILE=work<ms>,<seconds> starts instead when the GPU command thread's work has averaged that
+// many milliseconds a frame (NIER_PROFILE=work7,30: a heavy scene, whenever it comes).
 #define NOMINMAX
 #include <windows.h>
 #include <tlhelp32.h>
@@ -187,9 +189,9 @@ namespace
         Log("=== end of profile ===\n");
     }
 
-    void ProfilerThread(uint64_t firstFrame, double seconds, bool exitAfter)
+    void ProfilerThread(uint64_t firstFrame, double workMs, double seconds, bool exitAfter)
     {
-        while (GpuFrameCount() < firstFrame) Sleep(50);
+        while (workMs > 0 ? GpuCommandWorkMs() < workMs : GpuFrameCount() < firstFrame) Sleep(50);
         Log("[profile] sampling from frame %llu for %.0f s\n", (unsigned long long)GpuFrameCount(), seconds);
         GpuResetFrameTiming();
 
@@ -417,10 +419,11 @@ void ProfilerInit()
     size_t length = 0;
     _dupenv_s(&setting, &length, "NIER_PROFILE");
     if (!setting) return;
+    const double workMs = !strncmp(setting, "work", 4) ? atof(setting + 4) : 0.0;
     uint64_t firstFrame = strtoull(setting, nullptr, 10);
     const char* comma = strchr(setting, ',');
     double seconds = comma ? atof(comma + 1) : 10.0;
     const bool exitAfter = strstr(setting, ",exit") != nullptr;
     free(setting);
-    std::thread(ProfilerThread, firstFrame, seconds, exitAfter).detach();
+    std::thread(ProfilerThread, firstFrame, workMs, seconds, exitAfter).detach();
 }

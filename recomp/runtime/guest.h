@@ -30,6 +30,7 @@ uint32_t PhysicalToGuest(uint32_t physical);
 void GpuDumpStats();
 void AudioDumpStats();
 uint64_t GpuFrameCount();
+double GpuCommandWorkMs();   // the command thread's working time a frame, averaged over the last second or so
 void GpuRequestCapture();   // F12: log every draw of the next frame and save its image
 void GpuRequestRecording(); // F9: record every frame for 10 seconds
 void ProfilerInit();        // NIER_PROFILE=<frame>,<seconds>: sampling profile into the log

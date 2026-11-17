@@ -64,15 +64,14 @@ struct RenderTargetKey
 
 // A draw's vertex bytes. Unlike a std::vector, sizing it doesn't zero-fill: the bytes are written
 // straight after (zero-filling cost as much as the copy), and resizing discards what was there.
+// Copies share the bytes: once filled they are never written again. A mesh whose vertices have not
+// changed since an earlier frame is drawn from the copy made then (gpu.cpp, BuildDraw), and the
+// renderer uploads a copy used by several draws of a frame once (it knows it by its address).
 struct ByteBuffer
 {
-    std::unique_ptr<uint8_t[]> bytes;
+    std::shared_ptr<uint8_t[]> bytes;
     size_t count = 0;
     ByteBuffer() = default;
-    ByteBuffer(ByteBuffer&&) = default;
-    ByteBuffer& operator=(ByteBuffer&&) = default;
-    ByteBuffer(const ByteBuffer& other) { assign(other.data(), other.count); }
-    ByteBuffer& operator=(const ByteBuffer& other) { if (this != &other) assign(other.data(), other.count); return *this; }
     ByteBuffer& operator=(const std::vector<uint8_t>& other) { assign(other.data(), other.size()); return *this; }
     void resize(size_t size) { bytes.reset(size ? new uint8_t[size] : nullptr); count = size; }
     void assign(const uint8_t* from, size_t size) { resize(size); if (size) memcpy(bytes.get(), from, size); }
@@ -178,6 +177,7 @@ RendererPerf RendererPerfTake();
 const char* RendererPerfStageName(int stage);
 // Whether this system has an FSR 4 upscaler (it comes with the AMD driver, for the GPUs it supports).
 bool RendererFsr4Available();
+bool RendererDisplayTicksOff();      // the display's refreshes don't come at its reported rate: not a clock for the game
 bool RendererWaitDisplayVblank();   // waits one 60 Hz period of the display's own refreshes; false if it can't
 bool RendererReady();
 // A picture of ours drawn over the game's, alpha-blended, in the largest 16:9 area of the window

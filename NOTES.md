@@ -1291,6 +1291,108 @@ From the user's playthrough (open unless marked):
   7 ms or all of them taking longer, and what an ordinary frame there looks like.
   OPEN. Still to try: finding what the 28.7 MB hashed every frame is (a fifth of the thread's
   work in gameplay), and the sampling profiler over the cutscene itself.
+  Sixth traced playtest (fresh shader cache: 3,845 shaders and pipelines ready after 12.6 s,
+  once): three late frames in the cutscene (8532, 9001, 9131) and one at its start. An ordinary
+  frame of that cutscene on the command thread: 831 draws in 7.7 ms, the longest single draw
+  0.63 ms (1.59 at most), 32.6 MB of vertex data copied, 1.1 ms hashing 32.5 MB. The late
+  ones: 909-962 draws in 14.9-16.7 ms, the longest draw 2.7-4.0 ms, 35-37 MB of vertex data.
+  So a late frame has a tenth more draws and data, one draw four to six times the usual
+  longest, and the rest slower as well; no single cause. The profiler can now start by
+  itself: `NIER_PROFILE=work<ms>,<seconds>` begins when the command thread's work has averaged
+  that many ms a frame (GpuCommandWorkMs, smoothed over about a second; work7.5 is the
+  cutscene, gameplay being 2-5).
+  The profile of the cutscene (30 s from frame 5408, NIER_PROFILE=work7.5,30): command thread
+  busy 59.4% of the time (9.9 ms a frame). Of the process's samples: CopySwapped 17.1% (14.6
+  from BuildDraw's vertex data, 2.5 from ReadIndices), BuildDraw itself 8.5%, XXH3 6.3% (the
+  full hash in DecodeTexture), ExecuteStream itself 5.8%, ReadIndices 7.4% with what it calls,
+  the heap about 8% (operator new 4.4, RtlSizeHeap 2.7, memset 1.4, the command list's
+  emplace_back 1.5), DecodeTexture 8.9% with what it calls, a std::set copied per draw 1.5%.
+  No one thing; the largest, vertex data, is 32 MB a frame at about 13 GB/s. The render
+  thread's 37% is mostly its own memcpy of the same bytes into the upload arena (9.4%) and
+  ExecuteDraw (4.4%).
+  What is hashed in full every frame (new `[pace] full hash of texture` lines): nine plain
+  RGBA8 textures (format 6), 29 MB in Game 3's gameplay, the largest 2048x2048 (16 MB) and
+  1024x1024 (4 MB). They cannot simply be sampled like the block compressed ones: plain
+  textures are where the game edits in place (its text sheets, a glyph at a time), a sample
+  would miss a small glyph, and Windows' write watch is not available because guest memory is
+  mapped views of a section (memory.cpp). Left as it is.
+  Uncapped (user's test, 240 Hz, VSync on): 240 fps in gameplay, 104-130 in the cutscene, and
+  there the command thread's frame is all work (9.7 ms = 0.0 waiting + 9.7 working): it is
+  the limit of the frame rate in that scene, render thread 7.4 ms (recording 5.3, GPU 1.8).
+  So: at 60 fps the cutscene's occasional late frame, and uncapped its ceiling of about 105
+  fps, are the same thing, the command thread's draw handling, which is already spread over
+  several medium costs. What would change it is structural (the vertex bytes copied once
+  instead of twice, straight into memory the renderer uploads from; or that copy done by
+  helper threads, which needs care with buffers the game rewrites between draws). Not started.
+  DONE instead, awaiting the user's pass through the cutscene: vertex copies are kept from
+  frame to frame (BuildDraw: gVertexCache, by where the bytes came from and an XXH3 hash of all
+  of them; RendererDraw's ByteBuffer now shares its bytes between copies). A draw whose
+  vertices are unchanged since an earlier draw, in this frame or a later one, takes the copy
+  made then: no copy, no allocation. Ranges whose bytes are new three times running are just
+  copied for 120 frames before being tried again; ranges under 4 KB are always copied; copies
+  not drawn from for 120 frames are dropped (15 when over 768 MB are held). The renderer
+  uploads a copy shared by several draws of a frame once. `NIER_NO_VERTEX_CACHE=1` off,
+  `NIER_VERIFY_VERTEX_CACHE=1` copies anyway and compares, `NIER_VERTEX_CACHE_AB=1` switches it
+  on and off every 300 frames. Loading Game 3 on the primary: 11.3 of 11.5 MB a frame are
+  taken from kept copies, 27 MB held, and the verify runs logged no difference. Measuring it
+  took care: from one run to the next the command thread's time differs by about half a
+  millisecond (3.8 to 4.8 for the same build and settings), more than the change, and the
+  first comparisons between runs pointed both ways. Within one run (the A/B switch, two
+  runs): 3.14 and 3.21 ms a frame with the cache, 3.93 and 3.78 without, i.e. 0.6-0.8 ms less
+  for 11 MB of vertex data; the render thread's recording 2.20 against 2.34. The cutscene has
+  32 MB a frame, so about 2 of its 9.9 ms should go; not measured there yet.
+  Measured there (user's traced playtest, 60 fps, VSync on; the cutscene at frames 9,600 to
+  12,000): the command thread works 6.9-8.0 ms a frame where it was 9.1-9.9 in the passes
+  before, 0.5 MB of vertex data copied and 33 MB taken from kept copies, 36-61 MB held; the
+  render thread's recording 4.3-4.5 ms where it was 5.2-5.5. Late frames in the scene: one at
+  its start (18 ms of work with 3.6 MB of new vertex data) and one where the thread worked
+  11.9 ms and sat idle for want of commands (the game's side); none from the command thread
+  running long mid-scene, where the six passes before had 3 to 12 each. One pass, so the
+  count may be luck; the 2 ms is not.
+  The user after that pass: "Still hitches". What the frame trace of the scene holds (2,551
+  frames, timer and Present at the next refresh on the G-SYNC display): 2,445 within 1 ms of
+  16.7 ms after the one before, 73 off by 1-2 ms, 15 by 2-4, 12 by 4-8, 6 by more than 8. The
+  large ones: the scene's first second and a half (31.8 ms at 9617, 22.2 at 9685, 42.7 at 9695,
+  29.2 at 9697: new vertex data and textures arriving); 75.9 ms at 11613, where the render
+  thread waited 58 ms for the swap chain to take a frame, straight after `[input] glyph
+  style: keyboard` (a key was pressed; three frames queued meanwhile and were then shown 11-13
+  ms apart); 31.5 ms at 11787, again the swap chain (15 ms). The small ones are frames
+  shown 2 ms late followed by one 2 ms early, about twice a second: with a variable refresh
+  rate a frame appears when it is finished, and the time to finish one varies. Which of
+  these the user means is not known; asked.
+  The user, after a long session switching between 60 and uncapped: "hitching is not a thing
+  with frame rates above 60fps, 60fps still has the hich" (distinct hitches; no F12 marks).
+  That names the difference. Above 60 the game is paced by a limiter (GuestRefreshHz() == 0:
+  the vblank comes when a flip is queued, no sooner than the cap allows, gpu.cpp's vblank
+  thread), so a frame that is a millisecond late is shown a millisecond late. At 60 the vblank
+  is fixed, and off the display's own refreshes it was a timer's: a frame that missed a tick
+  by a millisecond waited for the next, 33 ms. Everything found in that cutscene today (the
+  command thread a little over its 16.7 ms, a few times a minute) only shows because of that.
+  CHANGED, awaiting the user's playtest: at 60 with VSync off, or on a display whose
+  refreshes are no clock (gDisplayTicksOff), the game is paced by the limiter with a cap of 60
+  (pcsettings.cpp LimiterAt60: GuestRefreshHz() then returns 0 and FrameRateCap() 60;
+  `NIER_FIXED_60=1` keeps the timer). With VSync on and a display refreshing at a multiple of
+  60 nothing changes: the vblank is the display's and frames are held for whole refreshes.
+  gDisplayTicksOff is cleared when the display's reported rate changes. Loading Game 3 on the
+  primary, 60 fps, VSync on, 2,800 frames each: with the fixed tick four frames over 21 ms (the
+  two load frames, and 27.7 and 33.7 ms later on); with the limiter only the two load frames;
+  60.0 fps and 16.68 ms average either way.
+  The user's playtest after it: "hitching is gone at 60fps" (uncapped for 14,400 frames, then
+  60 with VSync on for 8,844, the cutscene included). But the trace says that stretch did NOT
+  run on the limiter: the display check never tripped, every frame was presented with interval
+  4 and the vblank followed the display throughout, with no late vblank. So this time the
+  G-SYNC display kept to 240 refreshes a second with frames held for four each, and the
+  display-locked path did the pacing: 8,417 of 8,844 frames within 1 ms of 16.7, 414 off by
+  1-4 ms, 11 by 4-12, 2 by more (40.4 ms at 20234, 33.5 at 21886), and two late frames from
+  the command thread in the whole stretch. Why the display behaved this time and fell to
+  85-156 refreshes a second in the sessions before is NOT known (those started at 60 from the
+  title; this one came to 60 from uncapped, in play; and the command thread is 2 ms faster
+  now, so there were fewer late frames to start the slide). The limiter at 60 therefore
+  stands verified only by the test run above; it is what the game falls back to if the
+  display's count goes off again.
+  xxhash is now compiled inline in gpu.cpp with the runtime's flags (XXH_INLINE_ALL; the
+  linked xxhash.lib is built without AVX2). The texture hash times did not change with it
+  (0.8-0.9 ms for 28.7 MB either way), so the library was not the slow part it looked like.
 - Vertex shaders nobody has drawn yet are on the pipeline list too (awaiting the user's
   playtest; nothing in play is expected to look different, only first-use builds get shorter).
   The archives' model and effect files (X.MDV/X.MDP, X.EFV/X.EFP, X.2DV/X.2DP) hold 627

@@ -26,6 +26,7 @@
 #include <vector>
 #include "guest.h"
 #include "settings.h"
+#include "renderer.h"
 #include "input.h"
 #include "glyphs.h"
 
@@ -454,18 +455,34 @@ void TitleQuitToDesktop(PPCRegister& r31)
     TerminateProcess(GetCurrentProcess(), 0);   // as closing the window does
 }
 
+// At 60 the game's frames follow a fixed vblank, 60 times a second, when that vblank is the
+// display's own (VSync on, a display that refreshes at a multiple of 60: every frame then gets its
+// whole refreshes). Otherwise (VSync off, or a display whose refreshes are no clock: a variable
+// refresh rate, a misreported rate) the vblank was a timer's, and a frame that missed a tick by a
+// millisecond waited for the next one: 33 ms instead of 17.7, a hitch the rates above 60 never
+// showed, because those are paced by a limiter (a vblank when the frame is ready, no sooner than
+// the limit allows). So there 60 is a limit like the others. NIER_FIXED_60=1: the timer, as before.
+static bool LimiterAt60()
+{
+    static const bool fixed = GetEnvironmentVariableA("NIER_FIXED_60", nullptr, 0) > 0;
+    return !fixed && (!gSettings.vsync.load() || RendererDisplayTicksOff());
+}
+
 int GuestRefreshHz()
 {
     static const int forced = [] { char v[16]; return GetEnvironmentVariableA("NIER_GUEST_HZ", v, sizeof(v)) ? atoi(v) : 0; }();
     if (forced >= 30) return forced;
     if (forced < 0) return 0;   // NIER_GUEST_HZ=-1: unlocked
-    return gSettings.frameRate60.load() >= 2 ? 0 : 60;   // above 60: no fixed vblank (a limiter, FrameRateCap)
+    const int rate = gSettings.frameRate60.load();
+    if (rate == 1 && LimiterAt60()) return 0;
+    return rate >= 2 ? 0 : 60;   // above 60: no fixed vblank (a limiter, FrameRateCap)
 }
 
 int FrameRateCap()
 {
     switch (gSettings.frameRate60.load())
     {
+    case 1: return LimiterAt60() ? 60 : 0;
     case 2: return 90;
     case 3: return 120;
     case 4: return 144;

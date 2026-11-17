@@ -1257,6 +1257,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     }
 
     std::set<const DepthResource*> gFlatDepthsCleared;   // per frame
+    std::unordered_map<const uint8_t*, ArenaBlock> gFrameVertexUploads;   // per frame: vertex bytes already in the arena, by their address
 
     void ExecuteDraw(const RendererDraw& draw)
     {
@@ -1320,9 +1321,20 @@ float PSMain(float4 position : SV_Position) : SV_Target
         memcpy(s->vertexBase, draw.vertexBase.data(), sizeof(s->vertexBase));
         memcpy(s->boolConstants, draw.boolConstants.data(), sizeof(s->boolConstants));
 
-        UINT64 vertexBytes = std::max<UINT64>(draw.vertexData.size(), 16);
-        ArenaBlock vertices = ArenaAlloc(vertexBytes, 16);
-        if (!draw.vertexData.empty()) memcpy(vertices.cpu, draw.vertexData.data(), draw.vertexData.size());
+        // Draws that share their vertex bytes (ByteBuffer) share the upload too.
+        ArenaBlock vertices;
+        const auto uploaded = draw.vertexData.empty() ? gFrameVertexUploads.end() : gFrameVertexUploads.find(draw.vertexData.data());
+        if (uploaded != gFrameVertexUploads.end()) vertices = uploaded->second;
+        else
+        {
+            UINT64 vertexBytes = std::max<UINT64>(draw.vertexData.size(), 16);
+            vertices = ArenaAlloc(vertexBytes, 16);
+            if (!draw.vertexData.empty())
+            {
+                memcpy(vertices.cpu, draw.vertexData.data(), draw.vertexData.size());
+                gFrameVertexUploads[draw.vertexData.data()] = vertices;
+            }
+        }
 
         const UINT firstDescriptor = gDrawSrvUsed;
         gDrawSrvUsed += kTextureSlots;
@@ -2832,6 +2844,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         uint32_t shownCopies = 0;
         gExecutingFrame = frame.frame;
         gArenaOffset = 0;
+        gFrameVertexUploads.clear();
         gDrawSrvUsed = 0;
         ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
         gList->SetDescriptorHeaps(2, heaps);
@@ -3639,6 +3652,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 if (now != multiple || checked == 1) Log("[present] display at %u Hz, game at %u Hz: each frame is held for %u refresh%s\n", hz, guestHz, now, now == 1 ? "" : "es");
                 multiple = now;
                 gVblankDivider = (guestHz && n >= 1 && n <= 4 && hz + 1 >= n * guestHz && hz <= n * guestHz + 1) ? n : 0;   // uncapped: the vblank doesn't follow the display
+                if (hz != gDisplayHz.load()) gDisplayTicksOff = false;   // another mode or display: to be found out again
                 gDisplayHz = hz;
             }
             bool waiting;
@@ -3943,6 +3957,8 @@ void RendererDumpStats()
 // step with the display itself (two free-running 60 Hz clocks drift apart, and each time they
 // cross a frame is shown too long or too briefly). False when that isn't possible (the rate isn't
 // a multiple of 60, vsync is off, the display is asleep): the caller then keeps its own time.
+bool RendererDisplayTicksOff() { return gDisplayTicksOff; }
+
 bool RendererWaitDisplayVblank()
 {
     static const bool off = GetEnvironmentVariableA("NIER_NO_VBLANK_LOCK", nullptr, 0) > 0;   // debugging
@@ -4002,7 +4018,7 @@ bool RendererWaitDisplayVblank()
                 refusedHz = hz;
                 refusedDivider = divider;
                 gDisplayTicksOff = true;
-                Log("[present] the display reported as %u Hz refreshes %.1f times a second: the game's vblank uses the timer instead\n", hz, rate);
+                Log("[present] the display reported as %u Hz refreshes %.1f times a second: the game is paced by a limiter instead\n", hz, rate);
                 return false;
             }
         }
