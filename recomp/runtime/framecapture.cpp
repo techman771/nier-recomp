@@ -777,6 +777,7 @@ void FrameReplayRunIfRequested()
     char path[MAX_PATH];
     if (!GetEnvironmentVariableA("NIER_REPLAY_FRAME", path, sizeof(path))) return;
     const ReplayOptions options;
+    RendererSetSynchronousPipelines(true);   // a recorded frame is drawn whole, never with a draw left out
     char value[64];
     const uint64_t limit = GetEnvironmentVariableA("NIER_REPLAY_FRAMES", value, sizeof(value)) ? strtoull(value, nullptr, 10) : ~0ull;
 

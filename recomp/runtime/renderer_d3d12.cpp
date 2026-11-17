@@ -406,7 +406,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     const std::vector<int>* VertexTextureSlots(const GuestShader& vs);
     struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
     std::unordered_map<uint64_t, DecodedResource> gDecoded;
-    std::unordered_map<uint64_t, ComPtr<ID3DBlob>> gShaderBlobs;
+    std::unordered_map<uint64_t, ID3DBlob*> gShaderBlobs;   // owned by gShaderJobs.results (see ShaderJobs)
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> gPipelines;
     std::atomic<uint64_t> gDrawsExecuted{ 0 }, gDrawsFailed{ 0 };
 
@@ -598,6 +598,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return blob;
     }
 
+    // A compiled shader's blob is held by its entry in `results` for the whole run, and everyone else
+    // uses the plain pointer. A d3dcompiler blob's reference count is NOT safe to change from two
+    // threads at once (measured: balanced AddRef/Release from 8 threads corrupts the heap), and the
+    // pipeline workers each took and dropped a reference to the shaders they shared: now and then a
+    // count came out one short, the blob was freed under them, and the game crashed while preparing
+    // shaders at start-up (seen once, in a playtest).
     struct ShaderJobs
     {
         std::mutex mutex;
@@ -636,8 +642,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
     // Starts compiling a shader unless it is already compiled or queued; returns its result. What the
     // game needs now (`urgent`) goes ahead of the pipeline list's ahead-of-time work, and pulls its
-    // own job forward if that work had queued it already.
-    std::shared_future<ComPtr<ID3DBlob>> QueueShader(const std::shared_ptr<const GuestShader>& shader, bool urgent = true)
+    // own job forward if that work had queued it already. A job somebody is about to wait for
+    // (`waiting`: a pipeline's worker, or for a pipeline the render thread) goes to the very front:
+    // urgent jobs are taken newest first, so during a burst (a level's first frames) the one a
+    // frame was held for could lie under dozens queued after it.
+    std::shared_future<ComPtr<ID3DBlob>> QueueShader(const std::shared_ptr<const GuestShader>& shader, bool urgent = true, bool waiting = false)
     {
         std::lock_guard lock(gShaderJobs.mutex);
         if (!gShaderJobs.started)
@@ -649,7 +658,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         auto found = gShaderJobs.results.find(shader->hash);
         if (found != gShaderJobs.results.end())
         {
-            if (urgent && gShaderJobs.backlog)
+            if (waiting || (urgent && gShaderJobs.backlog))
                 for (auto queued = gShaderJobs.queue.begin(); queued != gShaderJobs.queue.end(); ++queued)
                     if ((*queued)->hash == shader->hash)
                     {
@@ -678,11 +687,11 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ID3DBlob* ShaderBlob(const std::shared_ptr<GuestShader>& shader)
     {
         auto found = gShaderBlobs.find(shader->hash);
-        if (found != gShaderBlobs.end()) return found->second.Get();
+        if (found != gShaderBlobs.end()) return found->second;
         std::shared_future<ComPtr<ID3DBlob>> future = QueueShader(shader);
         LARGE_INTEGER before, after, frequency;
         QueryPerformanceCounter(&before);
-        ComPtr<ID3DBlob> blob = future.get();   // usually ready by now
+        ID3DBlob* blob = future.get().Get();   // usually ready by now
         QueryPerformanceCounter(&after);
         QueryPerformanceFrequency(&frequency);
         const double waited = double(after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
@@ -690,7 +699,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gShaderWaitWorstMs = std::max(gShaderWaitWorstMs.load(), waited);
         if (waited > 1.0) gShaderWaits++;
         gShaderBlobs[shader->hash] = blob;
-        return blob.Get();
+        return blob;
     }
 
     D3D12_BLEND BlendFactor(uint32_t value)
@@ -767,12 +776,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 promise = gPipelineJobs.promises[job.first];
                 gPipelineJobs.promises.erase(job.first);
             }
+            static const DWORD delay = [] { char value[16]; return GetEnvironmentVariableA("NIER_PIPELINE_DELAY", value, sizeof(value)) ? DWORD(atoi(value)) : 0; }();
+            if (delay) Sleep(delay);
             promise->set_value(CreatePipeline(job.second));
             gPipelineJobsDone++;
         }
     }
 
-    std::shared_future<ComPtr<ID3D12PipelineState>> QueuePipeline(const PipelineState& state, uint64_t key, bool urgent = true)
+    std::shared_future<ComPtr<ID3D12PipelineState>> QueuePipeline(const PipelineState& state, uint64_t key, bool urgent = true, bool waiting = false)
     {
         std::lock_guard lock(gPipelineJobs.mutex);
         if (!gPipelineJobs.started)
@@ -784,7 +795,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         auto found = gPipelineJobs.results.find(key);
         if (found != gPipelineJobs.results.end())
         {
-            if (urgent && gPipelineJobs.backlog)
+            if (waiting || (urgent && gPipelineJobs.backlog))
                 for (auto queued = gPipelineJobs.queue.begin(); queued != gPipelineJobs.queue.end(); ++queued)
                     if (queued->first == key)
                     {
@@ -806,21 +817,67 @@ float PSMain(float4 position : SV_Position) : SV_Target
         return future;
     }
 
-    ID3D12PipelineState* PipelineFor(const RendererDraw& draw)
+    // A pipeline that is not ready when the render thread reaches its draw (a combination met for
+    // the first time, that neither the pipeline list nor the GPU emulation's head start covered)
+    // used to hold the whole frame until the driver had built it. Now a draw of scene geometry is
+    // left out until its pipeline is there: the object appears a frame or a few late and the
+    // frames stay on time. Only draws that test against a depth buffer and have more vertices
+    // than a quad are left out. Full-screen passes, the resolves' sources the game reads back
+    // and the 2D layer still wait: without one of those the whole picture is wrong (black, or
+    // an exposure measured from nothing), not one object. NIER_SYNC_PIPELINES=1: wait for every
+    // pipeline, as before. Frame replays always wait (RendererSetSynchronousPipelines), so a
+    // recorded frame is drawn whole. NIER_PIPELINE_DELAY=<ms> (testing) makes every pipeline
+    // take that much longer on its worker.
+    bool gSynchronousPipelines = false;
+    struct DeferredPipeline { ULONGLONG since = 0; uint32_t draws = 0; };
+    std::unordered_map<uint64_t, DeferredPipeline> gDeferredPipelines;   // render thread only
+    std::atomic<uint64_t> gDrawsDeferred{ 0 }, gPipelinesDeferred{ 0 };
+
+    bool MayDeferDraw(const RendererDraw& draw)
+    {
+        static const bool always = GetEnvironmentVariableA("NIER_SYNC_PIPELINES", nullptr, 0) > 0;
+        if (always || gSynchronousPipelines) return false;
+        const size_t vertices = (std::max)(size_t(draw.vertexCount), draw.indices.size());
+        return !draw.rectList && draw.depthBound && ((draw.depthControl >> 1) & 1) && vertices > 6;
+    }
+
+    // `deferred` is set when the pipeline is still being built and the draw may be left out.
+    ID3D12PipelineState* PipelineFor(const RendererDraw& draw, bool* deferred)
     {
         const PipelineState state = PipelineStateOf(draw);
         const uint64_t key = PipelineKey(state);
         auto found = gPipelines.find(key);
         if (found != gPipelines.end()) return found->second.Get();
         std::shared_future<ComPtr<ID3D12PipelineState>> future = QueuePipeline(state, key);
+        if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready && MayDeferDraw(draw))
+        {
+            DeferredPipeline& d = gDeferredPipelines[key];
+            if (!d.draws) { d.since = GetTickCount64(); gPipelinesDeferred++; }
+            d.draws++;
+            gDrawsDeferred++;
+            *deferred = true;
+            return nullptr;
+        }
+        if (auto was = gDeferredPipelines.find(key); was != gDeferredPipelines.end())
+        {
+            Log("[pipeline] vs %016llX ps %016llX: ready after %llu ms, %u draws left out meanwhile\n", (unsigned long long)state.vs->hash, (unsigned long long)state.ps->hash,
+                GetTickCount64() - was->second.since, was->second.draws);
+            gDeferredPipelines.erase(was);
+        }
         LARGE_INTEGER before, after, frequency;
         QueryPerformanceCounter(&before);
+        if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) QueuePipeline(state, key, true, true);   // the frame waits for this one: ahead of all others
         ComPtr<ID3D12PipelineState> pipeline = future.get();   // usually created in the background already
         QueryPerformanceCounter(&after);
         QueryPerformanceFrequency(&frequency);
         const double waited = double(after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
         gPipelineWaitMs += waited;
         if (waited > 1.0) gPipelineWaits++;
+        // Which draws still hold a frame, and why they could not be left out.
+        if (waited > 5.0)
+            Log("[pipeline] vs %016llX ps %016llX: the frame waited %.0f ms (%s%s depth control %X, %zu vertices, target %ux%u)\n", (unsigned long long)state.vs->hash,
+                (unsigned long long)state.ps->hash, waited, draw.rectList ? "rectangles, " : "", draw.depthBound ? "depth bound," : "no depth,", draw.depthControl,
+                (std::max)(size_t(draw.vertexCount), draw.indices.size()), draw.hasColor ? draw.target.width : 0, draw.hasColor ? draw.target.height : 0);
         gPipelines[key] = pipeline;
         return pipeline.Get();
     }
@@ -828,9 +885,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // Creates a pipeline (on a worker thread): waits for its shaders' compiles, then lets the driver build it.
     ComPtr<ID3D12PipelineState> CreatePipeline(const PipelineState& draw)
     {
-        std::shared_future<ComPtr<ID3DBlob>> vsFuture = QueueShader(draw.vs), psFuture = QueueShader(draw.ps);   // both started before waiting
-        ComPtr<ID3DBlob> vsBlob = vsFuture.get(), psBlob = psFuture.get();
-        ID3DBlob* vs = vsBlob.Get(), * ps = psBlob.Get();
+        std::shared_future<ComPtr<ID3DBlob>> vsFuture = QueueShader(draw.vs, true, true), psFuture = QueueShader(draw.ps, true, true);   // both started before waiting
+        ID3DBlob* vs = vsFuture.get().Get(), * ps = psFuture.get().Get();   // no reference taken: see ShaderJobs
         ComPtr<ID3D12PipelineState> pipeline;
         if (vs && ps)
         {
@@ -1203,7 +1259,9 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
     void ExecuteDraw(const RendererDraw& draw)
     {
-        ID3D12PipelineState* pipeline = PipelineFor(draw);
+        bool deferred = false;
+        ID3D12PipelineState* pipeline = PipelineFor(draw, &deferred);
+        if (deferred) return;   // its pipeline is still being built: left out of this frame
         TargetResource* target = draw.hasColor ? GetTarget(draw.target) : nullptr;
         DepthResource* depth = draw.depthBound ? GetDepth(draw.depth) : nullptr;
         if (!pipeline || (draw.hasColor && !target) || (draw.depthBound && !depth) || !draw.vertexCount) { gDrawsFailed++; return; }
@@ -3331,8 +3389,15 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             (1280 * gDisplayTwelfths + 6) / 12, (720 * gDisplayTwelfths + 6) / 12, gShadowTwelfths / 12.0);
     }
 
+    // NIER_LOG_PACING=1: one line a frame with where the render thread's time went (ms): waiting for
+    // the swap chain to take another frame, recording, the read-backs, Present, the rest; how many
+    // frames were queued behind this one and the present interval used.
+    int gPaceQueued = -1, gPaceInterval = -1;
+
     void RenderFrame(const MailboxPlane planes[3], bool movie, uint64_t frame, const RendererFrame* guest)
     {
+        LARGE_INTEGER perfEntered;
+        QueryPerformanceCounter(&perfEntered);
         WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
         ApplyResolutionSetting();
         LARGE_INTEGER perfStart;
@@ -3548,9 +3613,11 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 gDisplayHz = hz;
             }
             bool waiting;
+            size_t queued;
             {
                 std::lock_guard lock(gMailboxMutex);
-                waiting = !gFrameQueue.empty();
+                queued = gFrameQueue.size();
+                waiting = queued != 0;
             }
             if (!waiting && Settings().frameRate60) interval = multiple;
             // With the game's rate the display's own (60 on 60 Hz), "one refresh" is all a frame ever
@@ -3559,8 +3626,21 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             // lagged and it set its exposure from a measurement that old (it overshot: a room fading in
             // flashed white). Such a frame is presented without waiting for the refresh, which drops
             // one from view and brings the game back level. NIER_KEEP_QUEUE=1 leaves them queued.
+            // NIER_QUEUE_CUSHION=<n> (testing): that many frames may stay queued (default 0). In play the game is
+            // a little late with a frame several times in ten seconds and catches up with the next;
+            // with nothing queued each of those shows as one picture repeated and one skipped.
             static const bool keepQueue = GetEnvironmentVariableA("NIER_KEEP_QUEUE", nullptr, 0) > 0;
-            if (waiting && interval == 1 && !keepQueue) interval = 0;
+            static const size_t cushion = [] { char v[8]; return GetEnvironmentVariableA("NIER_QUEUE_CUSHION", v, sizeof(v)) ? size_t(atoi(v)) : size_t(0); }();
+            static uint32_t skipped = 0, starved = 0, counted = 0;
+            if (queued > cushion && interval == 1 && !keepQueue) { interval = 0; skipped++; }
+            if (queued == 0) starved++;
+            gPaceQueued = int(queued);
+            gPaceInterval = int(interval);
+            if (++counted == 600)
+            {
+                Log("[present] last 600 frames: %u shown with none queued behind them, %u skipped from view to shorten the queue (cushion %zu)\n", starved, skipped, cushion);
+                skipped = starved = counted = 0;
+            }
         }
         HRESULT presented = gSwapChain->Present(interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(presented))
@@ -3573,6 +3653,18 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         if (movie) RecordImageTiming(planes[0]);
         LARGE_INTEGER perfPresented;
         QueryPerformanceCounter(&perfPresented);
+        static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
+        if (logPacing && guest)
+        {
+            static LARGE_INTEGER last{}, frequency{};
+            if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+            const double k = 1000.0 / double(frequency.QuadPart);
+            Log("[pace] %llu: %.1f since the last present; swap chain %.1f, recording %.1f, read-backs %.1f, present %.1f; %d queued, interval %d\n", (unsigned long long)frame,
+                last.QuadPart ? double(perfPresented.QuadPart - last.QuadPart) * k : 0.0, double(perfStart.QuadPart - perfEntered.QuadPart) * k,
+                double(perfRecorded.QuadPart - perfStart.QuadPart) * k, double(perfWrittenBack.QuadPart - perfRecorded.QuadPart) * k,
+                double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * k, gPaceQueued, gPaceInterval);
+            last = perfPresented;
+        }
         WaitForGpu();
         gRetired.clear();   // the frame's GPU work is complete
         if (lateWriteBack) deliverWriteBacks();
@@ -3783,6 +3875,7 @@ void RendererDumpStats()
     Log("[d3d12] waited for shader compiles: %.0f ms in total, %llu waits over 1 ms, worst %.1f ms\n", gShaderWaitMs.load(), gShaderWaits.load(), gShaderWaitWorstMs.load());
     Log("[d3d12] creating %zu pipelines took %.0f ms, %llu over 5 ms, worst %.1f ms\n", gPipelines.size(), gPipelineMs.load(), gPipelineSlow.load(), gPipelineWorstMs.load());
     Log("[d3d12] render thread waited for pipelines: %.0f ms in total, %llu waits over 1 ms\n", gPipelineWaitMs.load(), gPipelineWaits.load());
+    Log("[d3d12] pipelines not ready in time: %llu, with %llu draws left out until they were\n", gPipelinesDeferred.load(), gDrawsDeferred.load());
     if (gMovieImages.load())
     {
         Log("[present] %llu new images on screen: worst gap %.1fms, %llu gaps over 60ms\n", gMovieImages.load(), gWorstGap, gLateImages.load());
@@ -3846,6 +3939,7 @@ void RendererSaveFrame(uint64_t frame) { gRequestedSave = frame; }
 bool RendererReady() { return gReady; }
 void RendererWaitTotals(double totals[3]) { totals[0] = gShaderWaitMs.load(); totals[1] = gPipelineMs.load(); totals[2] = gPipelineWaitMs.load(); }
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader) { QueueShader(shader); }
+void RendererSetSynchronousPipelines(bool on) { gSynchronousPipelines = on; }
 
 // Starts creating the pipeline a draw needs, if this combination is new (GPU emulation thread).
 void RendererPreparePipeline(const RendererDraw& draw)

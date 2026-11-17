@@ -1063,6 +1063,82 @@ From the user's playthrough (open unless marked):
   that covers, and whether the cutscene stutter is gone, is not yet confirmed.
   `NIER_REPLAY_CONSTANTS=<ps hash>,<first>,<count>[,<target width>][;...]` lists those
   constants for every frame of a recording in replay.log.
+- Pipelines not ready in time no longer hold the frame for scene geometry (awaiting the user's
+  playtest). Pipelines were already built on workers, started by the GPU emulation a frame or
+  more ahead; the render thread waited when one was still not there (PipelineFor). Now a draw
+  that tests against a depth buffer, is not a rectangle list and has more than 6 vertices is
+  left out until its pipeline is ready (MayDeferDraw): the object appears late, the frame is on
+  time. Everything else still waits: full-screen and 2D quads (3-6 vertices), whose absence
+  would make the whole picture wrong. Frame replays wait for everything
+  (RendererSetSynchronousPipelines). NIER_SYNC_PIPELINES=1: as before. Log: `[pipeline] vs ..
+  ps ..: ready after N ms, M draws left out meanwhile`, and for every wait over 5 ms that
+  remains `[pipeline] ..: the frame waited N ms (state, vertices, target)`, so a playtest log
+  now says which slow frames were pipelines. Also: a job somebody waits for goes to the front
+  of its queue (urgent jobs are taken newest first, and in a burst the awaited one lay under
+  the rest: seen as a 2.3 s wait with NIER_PIPELINE_DELAY). Tests, loading Game 3 with
+  NIER_NO_PREWARM=1: with NIER_PIPELINE_DELAY=150 (every pipeline 150 ms slower) 13 pipelines
+  and 496 draws left out, picture whole once they were in (frames 1500/1800/2400 looked at);
+  the level's first frame still took 2.4 s there because its ten or so post-processing quads
+  each waited their 150 ms. With a cold shader cache and NIER_SHADER_SALT=1 (real compile
+  times): waiting as before 4 waits, 304 ms, slowest frame 226 ms; leaving out 7 waits (all
+  quads), 206 ms, slowest 187 ms, 10 pipelines and 125 draws left out for at most 172 ms. So
+  the gain without the pipeline list is modest; with the list, post-processing is built at
+  start-up and what is left to meet in play is scene geometry, which this covers. Risks, not
+  seen: something drawn once into a surface that is kept (it would stay missing); a quad with
+  more than 6 vertices that a later pass depends on. Not covered: the motion-vector form of a
+  vertex shader (FSR 3 only) is still compiled and its pipeline built on the render thread.
+- Crash while preparing shaders at start-up (user's playtest, once; ten test starts after it did
+  not crash): C0000005 at host address 0x18 in all seven pipeline workers at the same moment,
+  in CreatePipeline where it copied a shader's ComPtr<ID3DBlob> out of its future (AddRef on a
+  blob whose memory had been freed; found with llvm-symbolizer --inlines on the logged
+  PipelineWorker+0x547). Cause: a d3dcompiler blob's reference count is not safe to change from
+  several threads at once. Measured with a small program: D3DCreateBlob, then balanced
+  AddRef/Release from 8 threads, ends in heap corruption (exit C0000374) every time. The
+  workers each took and dropped a reference to the shaders their pipelines share, so now and
+  then the count came out short and the blob was freed. Not new with the pipeline skipping; it
+  has been possible since pipelines got several workers. Fixed: the blob is held only by its
+  entry in gShaderJobs.results, for the whole run, and CreatePipeline and ShaderBlob use plain
+  pointers (no reference counting outside the shader worker that made it). Not provable by
+  test, since it never reproduced: 16 starts and one loaded game since, none crashed.
+- "Noticing some hitching" (user, playtest with a fresh shader cache, 3 minutes). OPEN. The log:
+  gameplay windows at 59.1-59.4 fps with the slowest frame under 10 ms and no `[pipeline]`
+  lines at all, so neither pipelines nor slow frames: about 4-5 refreshes missed in 10 s. The
+  playtest before it (same queue code) logged 60.0 in gameplay. The display both times is
+  reported as 60 Hz, and Win32_VideoController shows why: the active display is a "Parsec
+  Virtual Display Adapter" at 1600x1200, 60 Hz (the RTX 4090's own output is listed at
+  3840x2160, 240 Hz), i.e. the user is on a streamed virtual display, whose vblank is not a
+  monitor's. Not yet asked whether both playtests were over Parsec. Measured in windowed test
+  runs on that display with the new `NIER_LOG_PACING=1` (one line a frame: time since the last
+  present, wait for the swap chain, recording, read-backs, Present, frames queued, interval):
+  a frame is 5 ms waiting for the swap chain + 3 recording + 7 waiting for the GPU; in 1200
+  gameplay frames 10-13 intervals of two refreshes, each one a frame where the swap chain's
+  wait was 22 ms instead of 5, i.e. the frame before it missed its refresh after being
+  presented on time. The count is the same with read-backs before or after Present
+  (NIER_LATE_WRITEBACK) and with `NIER_QUEUE_CUSHION` 0 or 1 (frames allowed to stay queued,
+  default 0); NIER_KEEP_QUEUE=1 gave 149 (33 ms frames for seconds after the load). So in
+  these tests the missed refreshes come from the display side, not from our frame times. With
+  the queue drained each one shows as a repeated picture and then a skipped one; whether the
+  old full queue hid them better in steady play is not measured. `[present] last 600 frames:
+  N shown with none queued behind them, M skipped from view` is logged every 600 frames.
+  The user confirmed both playtests were over Parsec, so the display did not change between
+  them. CAUSE FOUND (windowed tests): NIER_LOG_PACING=1 also logs `[pace] vblank N (frame M):
+  X ms after the one before, its handler took Y ms` for a late vblank or a slow handler. With
+  no frames queued every long interval is a late vblank: IDXGIOutput::WaitForVBlank on the
+  Parsec virtual display returns a refresh late (33 ms) 10 to 33 times in 1200 frames, the
+  handler in the game takes 0.0 ms, and the game runs exactly one frame a vblank, so it loses
+  that frame. Presents with interval 1 are held a refresh too at times (swap chain wait 22 ms
+  with a frame queued). With VSync off (NIER_VSYNC=0, or the setting: the vblank is then the
+  timer and frames are presented at once) 0 long intervals and 0 late vblanks in 1200 gameplay
+  frames, 60.0 fps in every gameplay window; the timer alone with VSync on
+  (NIER_NO_VBLANK_LOCK=1) still had 12. How many refreshes that display misses seems to vary
+  from session to session (60.0 in one playtest, 59.2 in the next, same code path). Not done:
+  choosing this by itself on such a display (late vblanks counted, or the adapter's name): the
+  user will set VSync off by hand over Parsec. Playtest after (12,000 frames): 60 fps in 18 of
+  20 windows, 1 frame skipped from view, no crash; the first pipeline left out in real play
+  (`vs E57CD156111D2B4C ps B12CB4FE50555DD0: ready after 47 ms, 15 draws left out`). User:
+  "The game was smooth overall, some of the hitching might just be latency due to Parsec" (they
+  stream from home to their workplace, 13 miles away), so what is left to see there cannot be
+  told apart from the stream; smoothness is best judged on the real monitor.
 - FIXED (confirmed by the user in play): the Aerie boss's red orbs
   showed their whole quad as a square. Not the resolution work (it shows at 1x with the 2D pass
   off): the renderer had no alpha test. The orbs are 19 quads drawn with the 2D shader (vs

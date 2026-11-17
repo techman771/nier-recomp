@@ -206,6 +206,8 @@ void RendererSaveFrame(uint64_t frame);   // save that frame's image to recomp/f
 void RendererPrepareShader(const std::shared_ptr<GuestShader>& shader);
 // Starts creating the pipeline a draw will need, ahead of the render thread (any thread).
 void RendererPreparePipeline(const RendererDraw& draw);
+// Frame replays: every draw waits for its pipeline, so a recorded frame is always drawn whole.
+void RendererSetSynchronousPipelines(bool on);
 // Ahead-of-time work from the pipeline list (prewarm.cpp): compiled and created behind whatever the
 // game itself asks for. `flags`: bit 0 rectangle list, 1 colour target, 2 depth bound, 3-4 cull,
 // 5 counter-clockwise front.

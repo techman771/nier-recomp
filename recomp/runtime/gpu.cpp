@@ -1774,7 +1774,21 @@ namespace
             }
             W32(MMIO_BASE + REG_VBLANK_STATUS * 4, 1);
             gVblanks++;
+            // NIER_LOG_PACING=1: a vblank that came late, or whose handler in the game took long.
+            static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
+            static LARGE_INTEGER lastVblank{};
+            LARGE_INTEGER before, after;
+            QueryPerformanceCounter(&before);
             DispatchInterrupt(ctx, pcr, 0, 2);
+            if (logPacing)
+            {
+                QueryPerformanceCounter(&after);
+                const double k = 1000.0 / double(frequency.QuadPart);
+                const double gap = lastVblank.QuadPart ? double(before.QuadPart - lastVblank.QuadPart) * k : 0.0, handler = double(after.QuadPart - before.QuadPart) * k;
+                if (gap > 1500.0 / rate || handler > 3.0)
+                    Log("[pace] vblank %llu (frame %llu): %.1f ms after the one before, its handler took %.1f ms\n", (unsigned long long)gVblanks.load(), (unsigned long long)gFrames.load(), gap, handler);
+                lastVblank = before;
+            }
         }
     }
 
