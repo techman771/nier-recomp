@@ -3,6 +3,9 @@
 #include <intrin.h>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
 #include "guest.h"
 
 GUEST_IMPORT(KeGetCurrentProcessType) { ctx.r3.u64 = 1; }  // title process
@@ -75,6 +78,15 @@ GUEST_IMPORT(RtlTimeFieldsToTime)
 
 GUEST_IMPORT(KeQuerySystemTime)
 {
+    static const bool logCallers = GetEnvironmentVariableA("NIER_LOG_CLOCK", nullptr, 0) > 0;
+    if (logCallers)
+    {
+        static std::mutex mutex;
+        static std::set<std::string> seen;
+        std::lock_guard lock(mutex);
+        const std::string chain = GuestCallChain(8);
+        if (seen.insert(chain).second) Log("[clock] KeQuerySystemTime from%s\n", chain.c_str());
+    }
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     W64(ctx.r3.u32, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
@@ -129,6 +141,15 @@ extern "C" PPC_FUNC(__imp__sub_825611A0);
 extern "C" PPC_FUNC(sub_825611A0)
 {
     static const bool fixed = GetEnvironmentVariableA("NIER_FIXED_TIME", nullptr, 0) > 0;
+    // NIER_LOG_CLOCK=1: logs each distinct caller of the game's QueryPerformanceCounter, once.
+    static const bool logCallers = GetEnvironmentVariableA("NIER_LOG_CLOCK", nullptr, 0) > 0;
+    if (logCallers)
+    {
+        static std::mutex mutex;
+        static std::set<uint32_t> seen;
+        std::lock_guard lock(mutex);
+        if (seen.insert(uint32_t(ctx.lr)).second) Log("[clock] QueryPerformanceCounter from %08X:%s\n", uint32_t(ctx.lr), GuestCallChain(8).c_str());
+    }
     if (!fixed)
     {
         __imp__sub_825611A0(ctx, base);

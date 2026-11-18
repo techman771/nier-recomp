@@ -13,9 +13,12 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <bitset>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <functional>
+#include <chrono>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -24,6 +27,7 @@
 #include <unordered_set>
 #include <variant>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include "guest.h"
@@ -81,6 +85,13 @@ float4 PSMain(Interpolated input) : SV_Target
     std::mutex gMailboxMutex;
     std::condition_variable gMailboxChanged, gQueueSpace;
     std::deque<RendererFrame> gFrameQueue;
+    bool gFrameInHand = false;   // the render thread has taken a frame whose read-backs the game has not been given yet (gMailboxMutex)
+    // The game may hand over its next frame (RendererSubmitFrame waits for this).
+    void FrameOutOfHand()
+    {
+        { std::lock_guard lock(gMailboxMutex); gFrameInHand = false; }
+        gQueueSpace.notify_one();
+    }
     std::mutex gCommandListMutex;
     std::vector<std::vector<RendererCommand>> gCommandLists;   // emptied lists, for RendererTakeCommandList
     MailboxPlane gPlanes[3];
@@ -388,6 +399,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // sub-pixel offset that changes each frame (the jitter), and the first such draw carrying a
     // perspective view-projection matrix in vertex constants c5-c8 gives the frame's camera.
     bool gTemporalOn = false, gInShadowPass = false, gInFlatPass = false;
+    uint64_t gExecutingFrame = 0;
     float gJitterPixels[2] = {}, gJitterNdc[2] = {};
     double gCameraNow[16] = {}, gCameraBefore[16] = {};
     bool gCameraNowValid = false, gCameraBeforeValid = false;
@@ -404,6 +416,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
         D3D12_RECT scissor{};
     };
     std::vector<SkinnedDraw> gSkinnedDraws;
+    struct DepthResource;
+    void ReactiveDraw(const RendererDraw& draw, DepthResource& depth, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT indexCount);
     const std::vector<int>* VertexTextureSlots(const GuestShader& vs);
     struct DecodedResource { ComPtr<ID3D12Resource> texture; uint64_t contentHash = 0; };
     std::unordered_map<uint64_t, DecodedResource> gDecoded;
@@ -884,6 +898,59 @@ float PSMain(float4 position : SV_Position) : SV_Target
     }
 
     // Creates a pipeline (on a worker thread): waits for its shaders' compiles, then lets the driver build it.
+    // A draw's pipeline, described: its shaders and fixed-function state.
+    void DescribePipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const PipelineState& draw, ID3DBlob* vs, ID3DBlob* ps)
+    {
+        desc.pRootSignature = gDrawRoot.Get();
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        if (draw.rectList) desc.GS = { gRectBlob->GetBufferPointer(), gRectBlob->GetBufferSize() };
+        auto& target = desc.BlendState.RenderTarget[0];
+        const uint32_t b = draw.blendControl;
+        target.SrcBlend = BlendFactor(b & 0x1F);
+        target.BlendOp = BlendOp((b >> 5) & 7);
+        target.DestBlend = BlendFactor((b >> 8) & 0x1F);
+        target.SrcBlendAlpha = BlendFactor((b >> 16) & 0x1F);
+        target.BlendOpAlpha = BlendOp((b >> 21) & 7);
+        target.DestBlendAlpha = BlendFactor((b >> 24) & 0x1F);
+        target.BlendEnable = !(target.SrcBlend == D3D12_BLEND_ONE && target.DestBlend == D3D12_BLEND_ZERO && target.BlendOp == D3D12_BLEND_OP_ADD &&
+            target.SrcBlendAlpha == D3D12_BLEND_ONE && target.DestBlendAlpha == D3D12_BLEND_ZERO && target.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+        target.RenderTargetWriteMask = UINT8(draw.writeMask);
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = draw.rectList || draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;   // strips are drawn as strips (RendererDraw::strip)
+        desc.NumRenderTargets = draw.hasColor ? 1 : 0;
+        desc.RTVFormats[0] = draw.hasColor ? kTargetFormat : DXGI_FORMAT_UNKNOWN;
+        if (draw.depthBound)
+        {
+            // RB_DEPTHCONTROL: stencil 0, z 1, z write 2, z func 4-6, back-face stencil 7,
+            // front stencil func/fail/pass/zfail 8-19, back-face 20-31. Xenos enums are D3D12's minus one.
+            const uint32_t d = draw.depthControl;
+            auto& ds = desc.DepthStencilState;
+            desc.DSVFormat = kDepthFormat;
+            ds.DepthEnable = (d >> 1) & 1;
+            ds.DepthWriteMask = (((d >> 1) & 1) && ((d >> 2) & 1)) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+            ds.DepthFunc = D3D12_COMPARISON_FUNC(((d >> 4) & 7) + 1);
+            ds.StencilEnable = d & 1;
+            ds.StencilReadMask = UINT8(draw.stencilRefMask >> 8);
+            ds.StencilWriteMask = UINT8(draw.stencilRefMask >> 16);
+            auto face = [](uint32_t func, uint32_t fail, uint32_t pass, uint32_t depthFail) {
+                D3D12_DEPTH_STENCILOP_DESC op;
+                op.StencilFunc = D3D12_COMPARISON_FUNC(func + 1);
+                op.StencilFailOp = D3D12_STENCIL_OP(fail + 1);
+                op.StencilPassOp = D3D12_STENCIL_OP(pass + 1);
+                op.StencilDepthFailOp = D3D12_STENCIL_OP(depthFail + 1);
+                return op;
+            };
+            ds.FrontFace = face((d >> 8) & 7, (d >> 11) & 7, (d >> 14) & 7, (d >> 17) & 7);
+            ds.BackFace = ((d >> 7) & 1) ? face((d >> 20) & 7, (d >> 23) & 7, (d >> 26) & 7, (d >> 29) & 7) : ds.FrontFace;
+        }
+        desc.SampleDesc.Count = 1;
+    }
+
     ComPtr<ID3D12PipelineState> CreatePipeline(const PipelineState& draw)
     {
         std::shared_future<ComPtr<ID3DBlob>> vsFuture = QueueShader(draw.vs, true, true), psFuture = QueueShader(draw.ps, true, true);   // both started before waiting
@@ -892,54 +959,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (vs && ps)
         {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-            desc.pRootSignature = gDrawRoot.Get();
-            desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-            desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-            if (draw.rectList) desc.GS = { gRectBlob->GetBufferPointer(), gRectBlob->GetBufferSize() };
-            auto& target = desc.BlendState.RenderTarget[0];
-            const uint32_t b = draw.blendControl;
-            target.SrcBlend = BlendFactor(b & 0x1F);
-            target.BlendOp = BlendOp((b >> 5) & 7);
-            target.DestBlend = BlendFactor((b >> 8) & 0x1F);
-            target.SrcBlendAlpha = BlendFactor((b >> 16) & 0x1F);
-            target.BlendOpAlpha = BlendOp((b >> 21) & 7);
-            target.DestBlendAlpha = BlendFactor((b >> 24) & 0x1F);
-            target.BlendEnable = !(target.SrcBlend == D3D12_BLEND_ONE && target.DestBlend == D3D12_BLEND_ZERO && target.BlendOp == D3D12_BLEND_OP_ADD &&
-                target.SrcBlendAlpha == D3D12_BLEND_ONE && target.DestBlendAlpha == D3D12_BLEND_ZERO && target.BlendOpAlpha == D3D12_BLEND_OP_ADD);
-            target.RenderTargetWriteMask = UINT8(draw.writeMask);
-            desc.SampleMask = UINT_MAX;
-            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-            desc.RasterizerState.CullMode = draw.rectList || draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
-            desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
-            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-            desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;   // strips are drawn as strips (RendererDraw::strip)
-            desc.NumRenderTargets = draw.hasColor ? 1 : 0;
-            desc.RTVFormats[0] = draw.hasColor ? kTargetFormat : DXGI_FORMAT_UNKNOWN;
-            if (draw.depthBound)
-            {
-                // RB_DEPTHCONTROL: stencil 0, z 1, z write 2, z func 4-6, back-face stencil 7,
-                // front stencil func/fail/pass/zfail 8-19, back-face 20-31. Xenos enums are D3D12's minus one.
-                const uint32_t d = draw.depthControl;
-                auto& ds = desc.DepthStencilState;
-                desc.DSVFormat = kDepthFormat;
-                ds.DepthEnable = (d >> 1) & 1;
-                ds.DepthWriteMask = (((d >> 1) & 1) && ((d >> 2) & 1)) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-                ds.DepthFunc = D3D12_COMPARISON_FUNC(((d >> 4) & 7) + 1);
-                ds.StencilEnable = d & 1;
-                ds.StencilReadMask = UINT8(draw.stencilRefMask >> 8);
-                ds.StencilWriteMask = UINT8(draw.stencilRefMask >> 16);
-                auto face = [](uint32_t func, uint32_t fail, uint32_t pass, uint32_t depthFail) {
-                    D3D12_DEPTH_STENCILOP_DESC op;
-                    op.StencilFunc = D3D12_COMPARISON_FUNC(func + 1);
-                    op.StencilFailOp = D3D12_STENCIL_OP(fail + 1);
-                    op.StencilPassOp = D3D12_STENCIL_OP(pass + 1);
-                    op.StencilDepthFailOp = D3D12_STENCIL_OP(depthFail + 1);
-                    return op;
-                };
-                ds.FrontFace = face((d >> 8) & 7, (d >> 11) & 7, (d >> 14) & 7, (d >> 17) & 7);
-                ds.BackFace = ((d >> 7) & 1) ? face((d >> 20) & 7, (d >> 23) & 7, (d >> 26) & 7, (d >> 29) & 7) : ds.FrontFace;
-            }
-            desc.SampleDesc.Count = 1;
+            DescribePipeline(desc, draw, vs, ps);
             LARGE_INTEGER before, after, frequency;
             QueryPerformanceCounter(&before);
             Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "guest pipeline");
@@ -1395,11 +1415,15 @@ float PSMain(float4 position : SV_Position) : SV_Target
             lastIndexView = view;
         }
         gDrawsExecuted++;
-        // For the per-object motion vectors: opaque scene geometry drawn with a skinning shader.
+        // For the temporal upscaler's reactive mask: blended effects (see ReactiveDraw).
+        if (gTemporalOn && !gInShadowPass && !gInFlatPass && target && depth && !draw.rectList && (draw.depthControl & 6) == 2 && (draw.writeMask & 7) &&
+            draw.viewport[2] >= 1280.0f && !((draw.blendControl & 0x1F) == 1 && ((draw.blendControl >> 8) & 0x1F) == 0))
+            ReactiveDraw(draw, *depth, dsv, UINT(draw.indices.size()));
+        // For the per-object motion vectors (ObjectMotion): every piece of opaque scene geometry.
         if (gTemporalOn && !gInShadowPass && !gInFlatPass && draw.depthBound && (draw.depthControl & 2) && (draw.depthControl & 4) && draw.hasColor && !draw.rectList && !draw.indices.empty())
         {
             const std::vector<int>* slots = VertexTextureSlots(*draw.vs);
-            if (slots && !slots->empty())
+            if (slots)
             {
                 SkinnedDraw record;
                 record.draw = &draw;
@@ -1651,7 +1675,6 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // in turn (not per frame: the window is on screen), so save frames 60 apart to capture each one.
     constexpr uint32_t kSnapshotBase = 0xFFFFF000;
     struct ShownSurface { uint32_t base = 0, occurrence = 0; };
-    uint64_t gExecutingFrame = 0;
     ShownSurface Shown()
     {
         static const std::vector<ShownSurface> list = [] {
@@ -2056,9 +2079,10 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
     // its way into the 2D pass. The game gives it none of what such an upscaler needs, so:
     //  - jitter: see gTemporalOn above (applied at the end of the translated vertex shaders);
     //  - depth: the game's own full-size depth copy of the frame (gSceneDepthBase);
-    //  - motion vectors: computed here from that depth and the camera of this frame and the last,
-    //    so they describe the camera's movement only. Things that move by themselves (characters,
-    //    particles) have no vectors of their own yet and can leave trails.
+    //  - motion vectors: computed here from that depth and the camera of this frame and the last
+    //    (the camera's movement), then drawn over for everything that moves by itself: skinned and
+    //    rigid geometry (ObjectMotion);
+    //  - reactive mask: blended effects, which have neither depth nor vectors (ReactiveDraw).
     // The colour it gets is the tone-mapped picture after the game's post-processing (declared as
     // non-linear), not the scene before it as the SDK would prefer.
     // Per-object motion vectors for skinned geometry (characters, enemies, cloth). The camera-only
@@ -2072,22 +2096,390 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
     // the camera pass, kept only where they are the visible surface (compared with the frame's
     // depth copy, in slot 31). A draw is paired with last frame's by its shaders and sizes and
     // its order among equals. NIER_NO_OBJECT_MOTION=1 turns this off.
+    // The reactive mask. Particles, smoke, lightning and magic are blended over the scene without
+    // writing depth, so the upscaler's depth and motion vectors at their pixels describe what is
+    // behind them; it then takes the effect for a change of that surface it can't explain and
+    // either smears it or holds on to stale history. The mask tells it how much of each pixel is
+    // such an effect, so that it trusts the new frame there. Every blended effect draw of the
+    // scene (depth-tested, no depth write, full size) is drawn a second time straight after
+    // itself, with the same shaders, state and depth buffer, into a one-channel target that starts
+    // the frame at 1 and is multiplied by (1 - alpha): what is left of the background. All of the
+    // game's effect blends weigh the source by its alpha (over INV_SRC_ALPHA or over ONE), so alpha
+    // is the coverage in both. Before the upscaler runs the target is turned into the mask
+    // (1 - what is left, at most 0.9 as AMD advise). The second pipeline of an effect is made on
+    // the motion worker; until it is there the effect goes unmasked. NIER_NO_REACTIVE=1: off.
+    struct ReactiveState
+    {
+        ComPtr<ID3D12Resource> left, mask;   // background left behind the effects (the depth buffer's size); the mask (render size)
+        ComPtr<ID3D12DescriptorHeap> rtvHeap;   // 0 left, 1 mask
+        ComPtr<ID3D12PipelineState> convert;
+        uint32_t width = 0, height = 0, maskWidth = 0, maskHeight = 0;
+        bool used = false;          // drawn into this frame
+        uint32_t draws = 0;
+        std::mutex mutex;           // guards the two below
+        std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
+        std::unordered_set<uint64_t> asked;
+    } gReactive;
+    void MotionQueue(std::function<void()> job);
+
+    ID3D12PipelineState* ReactivePipeline(const RendererDraw& draw)
+    {
+        const PipelineState state = PipelineStateOf(draw);
+        const uint64_t key = PipelineKey(state);
+        {
+            std::lock_guard lock(gReactive.mutex);
+            auto found = gReactive.pipelines.find(key);
+            if (found != gReactive.pipelines.end()) return found->second.Get();
+            if (!gReactive.asked.insert(key).second) return nullptr;
+        }
+        // The draw has just been made with these shaders: their blobs exist and are never freed.
+        ID3DBlob* vs = ShaderBlob(draw.vs);
+        ID3DBlob* ps = ShaderBlob(draw.ps);
+        if (!vs || !ps) return nullptr;
+        MotionQueue([state, key, vs, ps] {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+            DescribePipeline(desc, state, vs, ps);
+            auto& target = desc.BlendState.RenderTarget[0];
+            target.BlendEnable = TRUE;
+            target.SrcBlend = target.SrcBlendAlpha = D3D12_BLEND_ZERO;
+            target.DestBlend = target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOp = target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+            desc.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+            // The stencil test stays; what the first draw did to the stencil is not done twice.
+            auto& ds = desc.DepthStencilState;
+            ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            ds.StencilWriteMask = 0;
+            for (D3D12_DEPTH_STENCILOP_DESC* face : { &ds.FrontFace, &ds.BackFace })
+                face->StencilFailOp = face->StencilPassOp = face->StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+            ComPtr<ID3D12PipelineState> pipeline;
+            if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "reactive mask pipeline")) return;
+            std::lock_guard lock(gReactive.mutex);
+            gReactive.pipelines[key] = pipeline;
+        });
+        return nullptr;
+    }
+
+    void ReactiveDraw(const RendererDraw& draw, DepthResource& depth, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT indexCount)
+    {
+        static const bool off = GetEnvironmentVariableA("NIER_NO_REACTIVE", nullptr, 0) > 0;
+        if (off) return;
+        ID3D12PipelineState* pipeline = ReactivePipeline(draw);
+        if (!pipeline) return;
+        ReactiveState& r = gReactive;
+        const D3D12_RESOURCE_DESC size = depth.texture->GetDesc();
+        if (!r.left || r.width != uint32_t(size.Width) || r.height != size.Height)
+        {
+            if (r.used) return;   // a second depth buffer size in one frame: not expected
+            if (r.left) gRetired.push_back(std::move(r.left));
+            if (!r.rtvHeap)
+            {
+                D3D12_DESCRIPTOR_HEAP_DESC heap{};
+                heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                heap.NumDescriptors = 2;
+                if (!Check(gDevice->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&r.rtvHeap)), "reactive mask RTV heap")) return;
+            }
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = size.Width;
+            desc.Height = size.Height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE clear{};
+            clear.Format = DXGI_FORMAT_R8_UNORM;
+            clear.Color[0] = 1.0f;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&r.left)), "reactive mask target")) { r.left.Reset(); return; }
+            gDevice->CreateRenderTargetView(r.left.Get(), nullptr, r.rtvHeap->GetCPUDescriptorHandleForHeapStart());
+            r.width = uint32_t(size.Width);
+            r.height = size.Height;
+        }
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        if (!r.used)
+        {
+            const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            gList->ClearRenderTargetView(rtv, one, 0, nullptr);
+            r.used = true;
+        }
+        // Everything else is as the draw just made left it.
+        gList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        gList->SetPipelineState(pipeline);
+        if (indexCount) gList->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+        else gList->DrawInstanced(draw.vertexCount, 1, 0, 0);
+        r.draws++;
+    }
+
+    bool ReactiveConvertPipeline()
+    {
+        const char kShader[] = R"(
+Texture2D<float4> leftTexture : register(t0, space1);
+float4 VSMain(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+float PSMain(float4 position : SV_Position) : SV_Target
+{
+    return min(1.0 - leftTexture.Load(int3(position.xy, 0)).r, 0.9);
+}
+)";
+        ComPtr<ID3DBlob> vs, ps, errors;
+        if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "reactive", nullptr, nullptr, "VSMain", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &errors)) ||
+            FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "reactive", nullptr, nullptr, "PSMain", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &errors)))
+        {
+            Log("[fsr3] reactive mask shader failed to compile: %s\n", errors ? (const char*)errors->GetBufferPointer() : "unknown");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = gDrawRoot.Get();
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        return Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&gReactive.convert)), "reactive mask conversion pipeline");
+    }
+
+    // Before the upscaler: the frame's mask, or null if no effect was drawn (or it can't be made).
+    ID3D12Resource* ReactiveMask(uint32_t renderWidth, uint32_t renderHeight)
+    {
+        ReactiveState& r = gReactive;
+        if (!r.used || !r.convert || !r.left || gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return nullptr;
+        if (!r.mask || r.maskWidth != renderWidth || r.maskHeight != renderHeight)
+        {
+            if (r.mask) gRetired.push_back(std::move(r.mask));
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = renderWidth;
+            desc.Height = renderHeight;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (!Check(gDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, kShaderRead, nullptr, IID_PPV_ARGS(&r.mask)), "reactive mask")) { r.mask.Reset(); return nullptr; }
+            D3D12_CPU_DESCRIPTOR_HANDLE view = r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            view.ptr += gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            gDevice->CreateRenderTargetView(r.mask.Get(), nullptr, view);
+            r.maskWidth = renderWidth;
+            r.maskHeight = renderHeight;
+        }
+        D3D12_RESOURCE_BARRIER before[2] = { Transition(r.left.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), Transition(r.mask.Get(), kShaderRead, D3D12_RESOURCE_STATE_RENDER_TARGET) };
+        gList->ResourceBarrier(2, before);
+        const UINT slot = gDrawSrvUsed;
+        gDrawSrvUsed += kTextureSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(slot) * gSrvStep;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(slot) * gSrvStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(r.left.Get(), &view, cpu);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(renderWidth), float(renderHeight), 0.0f, 1.0f };
+        D3D12_RECT scissor{ 0, 0, LONG(renderWidth), LONG(renderHeight) };
+        gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        gList->RSSetViewports(1, &viewport);
+        gList->RSSetScissorRects(1, &scissor);
+        BindDrawRoot();
+        gList->SetPipelineState(r.convert.Get());
+        gList->SetGraphicsRootDescriptorTable(3, gpu);
+        gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gList->DrawInstanced(3, 1, 0, 0);
+        D3D12_RESOURCE_BARRIER after[2] = { Transition(r.left.Get(), kShaderRead, D3D12_RESOURCE_STATE_RENDER_TARGET), Transition(r.mask.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead) };
+        gList->ResourceBarrier(2, after);
+        return r.mask.Get();
+    }
+
+    // The second form of a vertex shader and its pipelines are made on a thread of their own
+    // (MotionWorker): compiling one on the render thread held a frame for most of a second the first
+    // time a shader was met. Until one is ready its draws keep the camera-only vectors.
     struct MotionVariant
     {
         std::vector<int> slots;        // texture slots the vertex shader reads
-        bool usable = false, tried = false;
-        ComPtr<ID3DBlob> blob;
+        std::bitset<256> position;     // vertex constants its output position depends on (PositionConstants)
+        bool tried = false;
+        std::atomic<int> state{ 0 };   // 0 not asked for, 1 being compiled, 2 ready, 3 can't be made
+        ComPtr<ID3DBlob> blob;         // touched by the worker only
+        std::mutex mutex;              // guards the two below
         std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> pipelines;   // by cull state
+        std::unordered_set<uint32_t> asked;
     };
-    std::unordered_map<uint64_t, MotionVariant> gMotionVariants;
-    ComPtr<ID3DBlob> gObjectMotionPixel;
+    std::unordered_map<uint64_t, MotionVariant> gMotionVariants;   // entries are never removed (the worker keeps pointers)
+    ComPtr<ID3DBlob> gObjectMotionPixel;                           // worker only
     struct PreviousDraw
     {
-        std::array<float, 2048> constants;
+        std::array<float, 1024> constants;   // the vertex shader's half
         std::vector<std::pair<int, std::shared_ptr<DecodedTexture>>> textures;
     };
-    std::unordered_map<uint64_t, PreviousDraw> gPreviousDraws;   // by key and order among equals
+    std::vector<PreviousDraw> gPreviousDraws;                      // last frame's noted draws (the storage is reused)
+    std::unordered_map<uint64_t, uint32_t> gPreviousIndex;         // by key and order among equals
     std::unordered_map<uint64_t, DecodedResource> gDecodedBefore;   // host textures holding last frame's contents
+    struct MotionJobs
+    {
+        std::mutex mutex;
+        std::condition_variable work;
+        std::deque<std::function<void()>> queue;
+        bool started = false;
+    } gMotionJobs;
+    bool Invert4x4(const double m[16], double out[16]);
+
+    void MotionWorker()
+    {
+        for (;;)
+        {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(gMotionJobs.mutex);
+                gMotionJobs.work.wait(lock, [] { return !gMotionJobs.queue.empty(); });
+                job = std::move(gMotionJobs.queue.front());
+                gMotionJobs.queue.pop_front();
+            }
+            job();
+        }
+    }
+
+    void MotionQueue(std::function<void()> job)
+    {
+        std::lock_guard lock(gMotionJobs.mutex);
+        if (!gMotionJobs.started)
+        {
+            gMotionJobs.started = true;
+            std::thread(MotionWorker).detach();
+        }
+        gMotionJobs.queue.push_back(std::move(job));
+        gMotionJobs.work.notify_one();
+    }
+
+    // The vertex constants a translated vertex shader's output position depends on. The translated
+    // body is a run of plain assignments, so one pass over them is enough: each register component
+    // carries the set of constants its value came from (replaced when it is assigned, added to
+    // when the assignment is conditional or into an array). Everything, if main can't be found;
+    // `c[N + a0]` (a matrix palette indexed by a vertex attribute) counts as every register from N.
+    std::bitset<256> PositionConstants(const std::string& hlsl)
+    {
+        std::bitset<256> all;
+        all.set();
+        const size_t mainAt = hlsl.find("Interpolated main(");
+        if (mainAt == std::string::npos) return all;
+        std::unordered_map<std::string, std::array<std::bitset<256>, 4>> deps;
+        auto isWord = [](char ch) { return isalnum(static_cast<unsigned char>(ch)) || ch == '_'; };
+        auto component = [](char ch) { return ch == 'x' || ch == 'r' ? 0 : ch == 'y' || ch == 'g' ? 1 : ch == 'z' || ch == 'b' ? 2 : ch == 'w' || ch == 'a' ? 3 : -1; };
+        // What a stretch of source reads: constants, and registers (by the swizzle that follows).
+        auto reads = [&](std::string_view text, const std::string* skip) {
+            std::bitset<256> value;
+            for (size_t i = 0; i < text.size();)
+            {
+                if (!(isalpha(static_cast<unsigned char>(text[i])) || text[i] == '_')) { i++; continue; }
+                size_t j = i;
+                while (j < text.size() && isWord(text[j])) j++;
+                const std::string name(text.substr(i, j - i));
+                const bool member = i > 0 && text[i - 1] == '.';
+                i = j;
+                if (member || (skip && name == *skip)) continue;
+                if (name == "c" && j < text.size() && text[j] == '[')
+                {
+                    char* stop = nullptr;
+                    const long index = strtol(text.data() + j + 1, &stop, 10);   // inside the shader's string: terminated
+                    if (stop == text.data() + j + 1) value.set();
+                    else if (*stop != ']') { for (long r = std::max(index, 0l); r < 256; r++) value.set(size_t(r)); }   // c[N + a0]: a matrix palette from N up
+                    else if (index >= 0 && index < 256) value.set(size_t(index));
+                    continue;
+                }
+                auto found = deps.find(name);
+                if (found == deps.end()) continue;
+                std::bitset<256> part;
+                bool picked = false;
+                if (j < text.size() && text[j] == '.')
+                {
+                    size_t k = j + 1;
+                    picked = k < text.size();
+                    for (; k < text.size() && isWord(text[k]); k++)
+                    {
+                        const int comp = component(text[k]);
+                        if (comp < 0) picked = false; else part |= found->second[comp];
+                    }
+                    picked = picked && k > j + 1;
+                }
+                if (picked) value |= part;
+                else for (const auto& one : found->second) value |= one;
+            }
+            return value;
+        };
+        for (size_t at = hlsl.find('{', mainAt); at < hlsl.size();)
+        {
+            const size_t end = hlsl.find(';', at);
+            if (end == std::string::npos) break;
+            const std::string_view statement(hlsl.data() + at, end - at);
+            at = end + 1;
+            size_t equals = std::string::npos;
+            for (size_t i = 0; i < statement.size(); i++)
+            {
+                if (statement[i] != '=') continue;
+                if (i + 1 < statement.size() && statement[i + 1] == '=') { i++; continue; }
+                if (i > 0 && (statement[i - 1] == '<' || statement[i - 1] == '>' || statement[i - 1] == '!')) continue;
+                equals = i;
+                break;
+            }
+            if (equals == std::string::npos || equals == 0) continue;
+            const std::string_view left = statement.substr(0, equals);
+            // The target: the last name on the left that isn't a member (r0 in "r0.xy", oT in "oT[3].x").
+            size_t targetAt = std::string::npos, targetEnd = 0;
+            bool conditional = false;
+            for (size_t i = 0; i < left.size();)
+            {
+                if (!(isalpha(static_cast<unsigned char>(left[i])) || left[i] == '_')) { i++; continue; }
+                size_t j = i;
+                while (j < left.size() && isWord(left[j])) j++;
+                const std::string_view name = left.substr(i, j - i);
+                if (name == "if" || name == "else" || name == "for" || name == "while") conditional = true;
+                else if (i == 0 || left[i - 1] != '.') { targetAt = i; targetEnd = j; }
+                i = j;
+            }
+            if (targetAt == std::string::npos) continue;
+            const std::string target(left.substr(targetAt, targetEnd - targetAt));
+            const char last = left.find_last_not_of(" \t\r\n") == std::string::npos ? ' ' : left[left.find_last_not_of(" \t\r\n")];
+            bool replace = !conditional && last != '+' && last != '-' && last != '*' && last != '/';
+            bool comps[4] = { true, true, true, true };
+            if (targetEnd < left.size() && left[targetEnd] == '[') replace = false;
+            else if (targetEnd < left.size() && left[targetEnd] == '.')
+            {
+                bool any = false, picked[4] = {};
+                bool valid = true;
+                for (size_t k = targetEnd + 1; k < left.size() && isWord(left[k]); k++)
+                {
+                    const int comp = component(left[k]);
+                    if (comp < 0) valid = false; else { picked[comp] = true; any = true; }
+                }
+                if (valid && any) for (int i = 0; i < 4; i++) comps[i] = picked[i];
+                else replace = false;
+            }
+            const std::bitset<256> value = reads(statement.substr(equals + 1), nullptr) | reads(left, &target);
+            auto& entry = deps[target];
+            for (int i = 0; i < 4; i++)
+                if (comps[i]) { if (replace) entry[i] = value; else entry[i] |= value; }
+        }
+        std::bitset<256> position;
+        auto found = deps.find("oPos");
+        if (found == deps.end()) return all;
+        for (const auto& one : found->second) position |= one;
+        return position;
+    }
 
     MotionVariant& VariantFor(const GuestShader& vs)
     {
@@ -2095,7 +2487,8 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
         if (variant.tried) return variant;
         variant.tried = true;
         const std::string& hlsl = vs.hlsl;
-        if (hlsl.find("TextureCube") != std::string::npos) return variant;
+        variant.position = PositionConstants(hlsl);
+        if (hlsl.find("TextureCube") != std::string::npos) { variant.state = 3; return variant; }
         for (size_t at = 0; (at = hlsl.find("Texture2D<float4> t", at)) != std::string::npos; at++)
         {
             const int slot = atoi(hlsl.c_str() + at + 19);
@@ -2106,20 +2499,17 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
 
     const std::vector<int>* VertexTextureSlots(const GuestShader& vs) { return &VariantFor(vs).slots; }
 
-    // Compiles the two-bodied form of a skinning vertex shader (once; false if it can't be made).
-    bool PrepareVariant(const GuestShader& vs, MotionVariant& variant)
+    // The two-bodied form of a vertex shader, as source (empty if it can't be made).
+    std::string VariantSource(const GuestShader& vs, const MotionVariant& variant)
     {
-        if (variant.blob) return true;
-        if (variant.usable || variant.slots.empty()) return false;   // usable is set only on the first attempt
-        variant.usable = true;
         const std::string& hlsl = vs.hlsl;
         const std::string mainStart = "Interpolated main(uint vertexId : SV_VertexID)";
         const std::string constants = "cbuffer Constants : register(b0) { float4 c[512]; };";
         const size_t mainAt = hlsl.find(mainStart), constantsAt = hlsl.find(constants);
-        if (mainAt == std::string::npos || constantsAt == std::string::npos) return false;
+        if (mainAt == std::string::npos || constantsAt == std::string::npos) return {};
         for (int slot : variant.slots)
             for (int other : variant.slots)
-                if ((slot + 16) % 32 == other || slot == 31 || (slot + 16) % 32 == 31) return false;   // no free slot for last frame's copy
+                if ((slot + 16) % 32 == other || slot == 31 || (slot + 16) % 32 == 31) return {};   // no free slot for last frame's copy
         std::string head = hlsl.substr(0, mainAt);
         head.replace(constantsAt, constants.size(), "cbuffer Constants : register(b0) { float4 c[512]; float4 cP[512]; };");
         for (int slot : variant.slots)
@@ -2138,7 +2528,7 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
         };
         replaceAll(before, "c[", "cP[");
         for (int slot : variant.slots) replaceAll(before, "t" + std::to_string(slot) + ".", "tP" + std::to_string(slot) + ".");
-        const std::string source = head + now + before + R"(
+        return head + now + before + R"(
 struct MotionOut { float4 position : SV_Position; float4 now : TEXCOORD0; float4 before : TEXCOORD1; };
 MotionOut main(uint vertexId : SV_VertexID)
 {
@@ -2150,21 +2540,11 @@ MotionOut main(uint vertexId : SV_VertexID)
     return output;
 }
 )";
-        ComPtr<ID3DBlob> errors;
-        if (FAILED(D3DCompile(source.data(), source.size(), "motion variant", nullptr, nullptr, "main", "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION, 0, &variant.blob, &errors)))
-        {
-            Log("[fsr3] motion form of vertex shader %016llX failed to compile: %s\n", vs.hash, errors ? (const char*)errors->GetBufferPointer() : "unknown");
-            variant.blob.Reset();
-            return false;
-        }
-        return true;
     }
 
-    ID3D12PipelineState* VariantPipeline(MotionVariant& variant, const RendererDraw& draw)
+    // On the worker: one pipeline of a compiled variant.
+    void BuildVariantPipeline(MotionVariant& variant, uint32_t state)
     {
-        const uint32_t state = uint32_t(draw.cull) | (draw.frontCounterClockwise ? 4u : 0u);
-        auto found = variant.pipelines.find(state);
-        if (found != variant.pipelines.end()) return found->second.Get();
         if (!gObjectMotionPixel)
         {
             const char kPixel[] = R"(
@@ -2184,9 +2564,10 @@ float2 main(MotionOut input) : SV_Target
             if (FAILED(D3DCompile(kPixel, sizeof(kPixel) - 1, "object motion", nullptr, nullptr, "main", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &gObjectMotionPixel, &errors)))
             {
                 Log("[fsr3] object motion pixel shader failed to compile: %s\n", errors ? (const char*)errors->GetBufferPointer() : "unknown");
-                return nullptr;
+                return;
             }
         }
+        const uint32_t cull = state & 3;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = gDrawRoot.Get();
         desc.VS = { variant.blob->GetBufferPointer(), variant.blob->GetBufferSize() };
@@ -2194,36 +2575,143 @@ float2 main(MotionOut input) : SV_Target
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        desc.RasterizerState.CullMode = draw.cull == 0 ? D3D12_CULL_MODE_NONE : draw.cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
-        desc.RasterizerState.FrontCounterClockwise = draw.frontCounterClockwise;
+        desc.RasterizerState.CullMode = cull == 0 ? D3D12_CULL_MODE_NONE : cull == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        desc.RasterizerState.FrontCounterClockwise = (state & 4) != 0;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
         desc.SampleDesc.Count = 1;
         ComPtr<ID3D12PipelineState> pipeline;
-        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "object motion pipeline")) return nullptr;
-        return (variant.pipelines[state] = pipeline).Get();
+        if (!Check(gDevice->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "object motion pipeline")) return;
+        std::lock_guard lock(variant.mutex);
+        variant.pipelines[state] = pipeline;
     }
 
-    // The frame's skinned draws again, into the motion vector texture (bound as the render target
-    // by the caller, with `rtv`), each with last frame's inputs beside this frame's.
+    // The pipeline that draws `draw` into the motion vector texture, or null while it is being made
+    // (asked for here the first time) or if it can't be.
+    ID3D12PipelineState* VariantPipeline(const GuestShader& vs, MotionVariant& variant, const RendererDraw& draw)
+    {
+        const uint32_t state = uint32_t(draw.cull) | (draw.frontCounterClockwise ? 4u : 0u);
+        MotionVariant* target = &variant;
+        if (variant.state == 0)
+        {
+            std::string source = VariantSource(vs, variant);
+            if (source.empty()) { variant.state = 3; return nullptr; }
+            variant.state = 1;
+            const uint64_t hash = vs.hash;
+            MotionQueue([target, hash, source = std::move(source)] {
+                ComPtr<ID3DBlob> errors;
+                const auto started = std::chrono::steady_clock::now();
+                if (FAILED(D3DCompile(source.data(), source.size(), "motion variant", nullptr, nullptr, "main", "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION, 0, &target->blob, &errors)))
+                {
+                    Log("[fsr3] motion form of vertex shader %016llX failed to compile: %s\n", hash, errors ? (const char*)errors->GetBufferPointer() : "unknown");
+                    target->blob.Reset();
+                    target->state = 3;
+                    return;
+                }
+                Log("[fsr3] motion form of vertex shader %016llX compiled in %.0f ms (off the render thread)\n", hash,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                target->state = 2;
+            });
+        }
+        if (variant.state == 3) return nullptr;
+        std::lock_guard lock(variant.mutex);
+        auto found = variant.pipelines.find(state);
+        if (found != variant.pipelines.end()) return found->second.Get();
+        if (variant.asked.insert(state).second)
+            MotionQueue([target, state] { if (target->state == 2) BuildVariantPipeline(*target, state); });   // after the compile: one worker, in order
+        return nullptr;
+    }
+
+    // The frame's moving draws again, into the motion vector texture (bound as the render target
+    // by the caller, with `rtv`), each with last frame's inputs beside this frame's. Moving means:
+    // skinned (the bones are a texture), or rigid with a transform that changed. Which registers
+    // hold a rigid object's transform varies by shader (the shared camera in c5-c8 with a world
+    // matrix elsewhere, or one combined matrix, in c5-c8 or c36-c39), so the test goes by the
+    // constants the shader's position depends on (PositionConstants): if one of them changed since
+    // the last frame the object moved, unless the change is only the camera's: four registers in
+    // a row that hold a combined matrix whose world part (the matrix with the camera taken out,
+    // now and a frame ago) is the same. Taking a still object for a moving one costs a draw and
+    // gives the same vectors as the camera pass.
     void ObjectMotion(D3D12_CPU_DESCRIPTOR_HANDLE rtv, ID3D12Resource* depthCopy)
     {
         static const bool off = GetEnvironmentVariableA("NIER_NO_OBJECT_MOTION", nullptr, 0) > 0;
+        static const bool noRigid = GetEnvironmentVariableA("NIER_NO_RIGID_MOTION", nullptr, 0) > 0;
         if (off || gSkinnedDraws.empty()) return;
+
+        struct Candidate { const SkinnedDraw* record; const PreviousDraw* before; bool skinned; };
+        std::vector<Candidate> candidates;
+        candidates.reserve(gSkinnedDraws.size());
         std::unordered_map<uint64_t, uint32_t> order;
-        uint32_t drawn = 0;
         for (const SkinnedDraw& record : gSkinnedDraws)
         {
             const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
-            auto before = gPreviousDraws.find(key);
-            if (before == gPreviousDraws.end()) continue;
+            auto before = gPreviousIndex.find(key);
+            if (before == gPreviousIndex.end()) continue;
+            candidates.push_back({ &record, &gPreviousDraws[before->second], !VertexTextureSlots(*record.draw->vs)->empty() });
+        }
+        double inverseNow[16], inverseBefore[16];
+        const bool cameras = gCameraNowValid && gCameraBeforeValid && Invert4x4(gCameraNow, inverseNow) && Invert4x4(gCameraBefore, inverseBefore);
+        // A combined matrix (four registers, by rows) whose world part is unchanged: only the camera moved.
+        auto cameraOnly = [&](const float* now, const float* before) {
+            if (!cameras) return false;
+            // It has to look like one (as the camera does: the z row is the w row but for its last
+            // term); rows of a matrix palette are tried here too and must not pass.
+            const float* z = now + 8;
+            const float* w = now + 12;
+            const float length = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            if (length < 1e-6f || std::fabs(z[0] - w[0]) + std::fabs(z[1] - w[1]) + std::fabs(z[2] - w[2]) > 0.02f * length) return false;
+            // Element by element: against the largest element (a translation of hundreds) a slow
+            // rotation would pass for none.
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                {
+                    double a = 0, b = 0;
+                    for (int k = 0; k < 4; k++) { a += inverseNow[r * 4 + k] * now[k * 4 + c]; b += inverseBefore[r * 4 + k] * before[k * 4 + c]; }
+                    if (std::fabs(a - b) > 5e-5 * std::max(1.0, std::fabs(a))) return false;
+                }
+            return true;
+        };
+        auto rigidMoved = [&](const RendererDraw& draw, const PreviousDraw& old) {
+            const float* now = draw.constants.data();
+            const float* before = old.constants.data();
+            if (memcmp(now, before, 4096) == 0) return false;
+            const std::bitset<256>& position = VariantFor(*draw.vs).position;
+            for (int r = 0; r < 256;)
+            {
+                if (!position[r]) { r++; continue; }
+                int end = r;
+                bool changed[256];
+                bool any = false;
+                for (; end < 256 && position[end]; end++) any |= changed[end] = memcmp(now + end * 4, before + end * 4, 16) != 0;
+                if (any)
+                {
+                    for (int q = r; q + 4 <= end; q++)
+                        if ((changed[q] || changed[q + 1] || changed[q + 2] || changed[q + 3]) && cameraOnly(now + q * 4, before + q * 4))
+                            changed[q] = changed[q + 1] = changed[q + 2] = changed[q + 3] = false;
+                    for (int q = r; q < end; q++) if (changed[q]) return true;
+                }
+                r = end;
+            }
+            return false;
+        };
+
+        uint32_t drawn = 0, skinnedCount = 0, rigidCount = 0, waiting = 0;
+        const auto started = std::chrono::steady_clock::now();
+        D3D12_GPU_DESCRIPTOR_HANDLE plainTable{};   // for draws whose vertex shader reads no textures: the depth copy only, made once
+        for (const Candidate& candidate : candidates)
+        {
+            const SkinnedDraw& record = *candidate.record;
+            const PreviousDraw& old = *candidate.before;
             const RendererDraw& draw = *record.draw;
+            if (!candidate.skinned && (noRigid || !rigidMoved(draw, old))) continue;
+            (candidate.skinned ? skinnedCount : rigidCount)++;
             MotionVariant& variant = VariantFor(*draw.vs);
-            if (!PrepareVariant(*draw.vs, variant)) continue;
-            ID3D12PipelineState* pipeline = VariantPipeline(variant, draw);
-            if (!pipeline || gDrawSrvUsed + kTextureSlots > kDrawDescriptors) continue;
+            ID3D12PipelineState* pipeline = VariantPipeline(*draw.vs, variant, draw);
+            if (!pipeline) { waiting += variant.state != 3; continue; }
+            const bool plain = variant.slots.empty();
+            if ((!plain || !plainTable.ptr) && gDrawSrvUsed + kTextureSlots > kDrawDescriptors) continue;
 
             // Textures first (uploads change the command list's state): this frame's contents in the
             // usual host texture, last frame's in its twin.
@@ -2233,22 +2721,26 @@ float2 main(MotionOut input) : SV_Target
             for (int slot : variant.slots)
             {
                 const TextureBinding& binding = draw.textures[slot];
-                std::shared_ptr<DecodedTexture> old;
-                for (const auto& [oldSlot, texture] : before->second.textures) if (oldSlot == slot) old = texture;
-                if (!binding.valid || !binding.decoded || !old || old->width != binding.decoded->width || old->height != binding.decoded->height || old->format != binding.decoded->format) { complete = false; break; }
+                std::shared_ptr<DecodedTexture> before;
+                for (const auto& [oldSlot, texture] : old.textures) if (oldSlot == slot) before = texture;
+                if (!binding.valid || !binding.decoded || !before || before->width != binding.decoded->width || before->height != binding.decoded->height || before->format != binding.decoded->format) { complete = false; break; }
                 textures[slot] = GetDecoded(*binding.decoded);
-                textures[(slot + 16) % 32] = GetDecoded(*old, gDecodedBefore);
+                textures[(slot + 16) % 32] = GetDecoded(*before, gDecodedBefore);
                 formats[slot] = formats[(slot + 16) % 32] = DecodedFormat(binding.decoded->format);
                 if (!textures[slot] || !textures[(slot + 16) % 32]) { complete = false; break; }
             }
             if (!complete) continue;
 
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu = plainTable;
+            if (!plain || !plainTable.ptr)
+            {
             const UINT first = gDrawSrvUsed;
             gDrawSrvUsed += kTextureSlots;
             D3D12_CPU_DESCRIPTOR_HANDLE cpu = gDrawSrvHeap->GetCPUDescriptorHandleForHeapStart();
             cpu.ptr += SIZE_T(first) * gSrvStep;
-            D3D12_GPU_DESCRIPTOR_HANDLE gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
+            gpu = gDrawSrvHeap->GetGPUDescriptorHandleForHeapStart();
             gpu.ptr += UINT64(first) * gSrvStep;
+            if (plain) plainTable = gpu;
             for (UINT slot = 0; slot < kTextureSlots; slot++)
             {
                 D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -2267,9 +2759,11 @@ float2 main(MotionOut input) : SV_Target
                 gDevice->CreateShaderResourceView(resource, &view, cpu);
                 cpu.ptr += gSrvStep;
             }
+            }
+            // A vertex shader reads the first 256 registers only (the rest are the pixel shader's).
             ArenaBlock constants = ArenaAlloc(2 * 8192, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-            memcpy(constants.cpu, draw.constants.data(), 8192);
-            memcpy(constants.cpu + 8192, before->second.constants.data(), 8192);
+            memcpy(constants.cpu, draw.constants.data(), 4096);
+            memcpy(constants.cpu + 8192, old.constants.data(), 4096);
             gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
             gList->RSSetViewports(1, &record.viewport);
             gList->RSSetScissorRects(1, &record.scissor);
@@ -2284,20 +2778,27 @@ float2 main(MotionOut input) : SV_Target
             gList->DrawIndexedInstanced(record.indices.SizeInBytes / 4, 1, 0, 0, 0);
             drawn++;
         }
+        static const int every = [] { char v[16]; return GetEnvironmentVariableA("NIER_MOTION_LOG", v, sizeof(v)) ? std::max(1, atoi(v)) : 600; }();
         static uint32_t frames = 0;
-        if (frames++ % 600 == 0) Log("[fsr3] object motion: %u of %zu skinned draws paired with last frame's\n", drawn, gSkinnedDraws.size());
+        if (frames++ % every == 0)
+            Log("[fsr3] object motion: of %zu scene draws (%zu paired with last frame's) %u skinned and %u rigid ones moved; %u drawn, %u waiting for their shader; %.2f ms; %u effect draws in the reactive mask\n",
+                gSkinnedDraws.size(), candidates.size(), skinnedCount, rigidCount, drawn, waiting, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), gReactive.draws);
     }
 
     // End of a frame's commands: what the next frame's object motion needs of this one.
     void RememberSkinnedDraws()
     {
-        gPreviousDraws.clear();
+        gPreviousIndex.clear();
+        gPreviousDraws.resize(gSkinnedDraws.size());
         std::unordered_map<uint64_t, uint32_t> order;
+        uint32_t index = 0;
         for (const SkinnedDraw& record : gSkinnedDraws)
         {
             const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
-            PreviousDraw& kept = gPreviousDraws[key];
-            kept.constants = record.draw->constants;
+            PreviousDraw& kept = gPreviousDraws[index];
+            gPreviousIndex[key] = index++;
+            memcpy(kept.constants.data(), record.draw->constants.data(), sizeof(kept.constants));
+            kept.textures.clear();
             for (int slot : *VertexTextureSlots(*record.draw->vs))
                 if (record.draw->textures[slot].valid && record.draw->textures[slot].decoded) kept.textures.emplace_back(slot, record.draw->textures[slot].decoded);
         }
@@ -2358,6 +2859,7 @@ float2 main(MotionOut input) : SV_Target
             Log("[fsr3] the FSR loader DLL lacks the expected functions\n");
             return false;
         }
+        if (!ReactiveConvertPipeline()) return false;
         const char kMotionShader[] = R"(
 cbuffer Motion : register(b1) { row_major float4x4 reproject; float4 texelAndJitter; };
 Texture2D<float4> depthTexture : register(t0, space1);
@@ -2649,6 +3151,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                     for (int k = 0; k < 4; k++) sum += gCameraBefore[r * 4 + k] * inverse[k * 4 + c];
                     reproject[r * 4 + c] = sum;
                 }
+        ID3D12Resource* reactive = nullptr;
         float constants[20];
         for (int i = 0; i < 16; i++) constants[i] = float(reproject[i]);
         constants[16] = 1.0f / float(renderWidth);
@@ -2684,7 +3187,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             gList->SetGraphicsRootDescriptorTable(3, gpu);
             gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             gList->DrawInstanced(3, 1, 0, 0);
-            ObjectMotion(rtv, depthFound->second.texture.Get());   // skinned geometry: its own movement on top
+            ObjectMotion(rtv, depthFound->second.texture.Get());   // moving geometry: its own movement on top
+            reactive = ReactiveMask(renderWidth, renderHeight);    // blended effects
             D3D12_RESOURCE_BARRIER barriers[2] = { Transition(t.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), {} };
             UINT count = 1;
             if (t.outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) barriers[count++] = Transition(t.output.Get(), t.outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2703,6 +3207,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         dispatch.color = ffxApiGetResourceDX12(surface.texture.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         dispatch.depth = ffxApiGetResourceDX12(depthFound->second.texture.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         dispatch.motionVectors = ffxApiGetResourceDX12(t.motion.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+        if (reactive) dispatch.reactive = ffxApiGetResourceDX12(reactive, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         dispatch.output = ffxApiGetResourceDX12(t.output.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         dispatch.jitterOffset = { gJitterPixels[0], gJitterPixels[1] };
         dispatch.motionVectorScale = { float(renderWidth), float(renderHeight) };
@@ -2849,6 +3354,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
         gList->SetDescriptorHeaps(2, heaps);
         gFlatDepthsCleared.clear();
+        gReactive.used = false;
+        gReactive.draws = 0;
         RenderTargetKey flatTarget;
         const size_t flatStart = FindFlatPhase(frame, flatTarget);
         const bool hasFlat = flatStart < frame.commands.size();
@@ -3623,7 +4130,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             }
             gWriteBackUsed = 0;
         };
-        if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); }
+        if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); FrameOutOfHand(); }
         const bool vsync = Settings().vsync != 0;
         const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
         // Even frame pacing: on a display refreshing at a multiple of 60 Hz (120, 180, 240) a 60 fps
@@ -3816,6 +4323,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 {
                     guest = std::move(gFrameQueue.front());
                     gFrameQueue.pop_front();
+                    gFrameInHand = true;
                     frame = guest->frame;
                     hasWork = true;
                     gQueueSpace.notify_one();
@@ -3831,6 +4339,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             }
             if (resize) Resize(resizeWidth, resizeHeight);
             if (hasWork) RenderFrame(planes, movie, frame, guest ? &*guest : nullptr);
+            FrameOutOfHand();
             if (guest)
             {
                 // The frame's commands are done with: empty the list and keep it for a later frame.
@@ -3922,7 +4431,16 @@ void RendererSubmitFrame(RendererFrame&& frame)
         std::unique_lock lock(gMailboxMutex);
         const size_t queuedOnEntry = gFrameQueue.size();
         if (logPacing) QueryPerformanceCounter(&locked);
-        gQueueSpace.wait(lock, [] { return gFrameQueue.size() < 3 || !gReady; });
+        // One frame waits at most, and not while the frame before it is still being drawn: the game
+        // reads each frame's luminance back to set the exposure of the frames after, correcting it a
+        // step every frame. With three frames allowed to wait (as it was) and the renderer the slower
+        // side, as it is at 144-240 fps, the measurement reached the game five frames late; it
+        // corrected against a picture that old, overshot, and the exposure swung between dark and
+        // white about once a second (Northern Plains at 240 fps). Now it is two frames late there
+        // (one at 60 fps, as before). The game still builds its next frame while this one is drawn.
+        // NIER_QUEUE_LIMIT=<n>: n frames may wait whatever the renderer is doing (3: as it was).
+        static const size_t limit = [] { char v[8]; return GetEnvironmentVariableA("NIER_QUEUE_LIMIT", v, sizeof(v)) ? size_t(std::clamp(atoi(v), 1, 8)) : size_t(0); }();
+        gQueueSpace.wait(lock, [] { return (limit ? gFrameQueue.size() < limit : gFrameQueue.empty() && !gFrameInHand) || !gReady; });
         if (!gReady) return;
         if (logPacing)
         {

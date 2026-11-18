@@ -152,6 +152,7 @@ uint32_t LoadGame(const std::string& gameDir)
                 if (variable.ordinal != ordinal) continue;
                 uint32_t block = GuestAlloc(variable.size, 0x10, Region::Heap);
                 W32(slot, block);
+                if (ordinal == 0x00AD) Log("[loader] KeTimeStampBundle: slot %08X, block %08X\n", slot, block);
                 InitVariable(ordinal, block, file);
                 Log("data import %s -> 0x%08X\n", variable.name, block);
                 filled++;

@@ -1722,6 +1722,24 @@ namespace
             uint64_t frame = gFrames.fetch_add(1) + 1;
             gFrameDrawsLogged = 0;
             NoteFrameTiming();
+            {
+                // NIER_POKE_F32=<guest address hex>:<value>[,...]: writes those floats into the game's
+                // memory every frame (testing what a value is for).
+                static const std::vector<std::pair<uint32_t, float>> pokes = [] {
+                    std::vector<std::pair<uint32_t, float>> list;
+                    char value[1024];
+                    if (GetEnvironmentVariableA("NIER_POKE_F32", value, sizeof(value)))
+                        for (char* item = strtok(value, ","); item; item = strtok(nullptr, ","))
+                            if (const char* colon = strchr(item, ':')) list.push_back({ uint32_t(strtoul(item, nullptr, 16)), strtof(colon + 1, nullptr) });
+                    return list;
+                }();
+                for (const auto& [address, number] : pokes)
+                {
+                    uint32_t bits;
+                    memcpy(&bits, &number, 4);
+                    W32(address, bits);
+                }
+            }
             VertexCacheTrim(frame);
             if (frame == gCaptureFrame + 1)
             {
@@ -1765,6 +1783,15 @@ namespace
                     return at;
                 }();
                 if (auto change = resolutionAt.find(frame); change != resolutionAt.end()) Settings().resolutionScale = change->second;
+                CoverTick(frame);   // NIER_COVER (cover.cpp)
+                // NIER_FPS_AT=<frame>,<index>: sets the Frame Rate setting at that frame (test runs: the
+                // scripted route to a save is timed for 60 fps).
+                static const std::pair<uint64_t, int> rateAt = [] {
+                    char value[64];
+                    if (!GetEnvironmentVariableA("NIER_FPS_AT", value, sizeof(value)) || !strchr(value, ',')) return std::pair<uint64_t, int>{ ~0ull, 0 };
+                    return std::pair<uint64_t, int>{ strtoull(value, nullptr, 10), atoi(strchr(value, ',') + 1) };
+                }();
+                if (frame == rateAt.first) Settings().frameRate60 = rateAt.second;
             }
             if (gCaptureRequested.exchange(false))
             {
@@ -2041,7 +2068,9 @@ namespace
         W32(mode + 0x00, 1280);
         W32(mode + 0x04, 720);
         W32(mode + 0x08, 0);        // progressive
-        W32(mode + 0x0C, 1);        // widescreen
+        // NIER_VIDEO_WIDE=0 reports a 4:3 display (testing what the game does with the picture's shape).
+        static const uint32_t wide = [] { char v[8]; return GetEnvironmentVariableA("NIER_VIDEO_WIDE", v, sizeof(v)) ? uint32_t(atoi(v)) : 1u; }();
+        W32(mode + 0x0C, wide);     // widescreen
         W32(mode + 0x10, 1);        // high definition
         W32(mode + 0x14, refreshBits);
         W32(mode + 0x18, 1);        // NTSC

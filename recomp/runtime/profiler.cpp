@@ -357,14 +357,14 @@ namespace
             const float tolerance = comma ? strtof(comma + 1, nullptr) : 0.001f;
             MEMORY_BASIC_INFORMATION info{};
             int found = 0;
-            for (uint64_t address = 0; address < 0x100000000ull && found < 200;)
+            for (uint64_t address = 0; address < 0x100000000ull && found < 20000;)
             {
                 if (!VirtualQuery(g_base + address, &info, sizeof(info)) || !info.RegionSize) break;
                 const uint64_t start = uint64_t(static_cast<uint8_t*>(info.BaseAddress) - g_base);
                 address = start + info.RegionSize;
                 const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
                 if (info.State != MEM_COMMIT || !(info.Protect & readable) || (info.Protect & PAGE_GUARD)) continue;
-                for (uint64_t at = start; at + 4 <= start + info.RegionSize && found < 200; at += 4)
+                for (uint64_t at = start; at + 4 <= start + info.RegionSize && found < 20000; at += 4)
                 {
                     const uint32_t bits = R32(uint32_t(at));
                     float value;

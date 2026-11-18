@@ -1,0 +1,20 @@
+# replay_input_test.ps1 <seconds> <label> [<exe>] [-Recording <file>]: a muted test run on the second
+# monitor that replays recorded controller input (run_boot.ps1 -Record) with a copy of all the saves
+# and the player's settings, so the menus and the frame rate are what they were when it was recorded.
+# Other NIER_ switches come from the caller. Log: recomp\replay_<label>.log.
+param([int]$Seconds = 90, [string]$Label = 'replay', [string]$Exe = 'nier.exe', [string]$Recording = 'kaine_desert.input')
+$root = Split-Path $PSScriptRoot -Parent
+$settings = "$root\recomp\replay_settings.ini"
+Copy-Item "$root\recomp\build\settings.ini" $settings -Force
+$testSave = "$root\recomp\test_save"
+if (Test-Path $testSave) { Remove-Item -Recurse -Force $testSave }
+Copy-Item -Recurse "$root\save" $testSave
+Remove-Item Env:NIER_FULLSCREEN, Env:NIER_60FPS, Env:NIER_30FPS, Env:NIER_RECORD_INPUT, Env:NIER_REPLAY_FRAME, Env:NIER_AUTO_PRESS -ErrorAction SilentlyContinue
+$env:NIER_SETTINGS_FILE = $settings; $env:NIER_MONITOR = 'primary'; $env:NIER_MUTE = '1'; $env:NIER_SAVE_DIR = $testSave   # 'primary' is the second monitor here
+$env:NIER_IGNORE_PADS = '1'; $env:NIER_SHOW_FPS = '1'; $env:NIER_REPLAY_INPUT = "$root\recomp\recordings\$Recording"
+$log = "$root\recomp\replay_$Label.log"
+$p = Start-Process -FilePath "$root\recomp\build\$Exe" -WorkingDirectory "$root\recomp\build" -RedirectStandardOutput $log -RedirectStandardError "$log.err" -NoNewWindow -PassThru
+$null = $p.Handle
+if (-not $p.WaitForExit($Seconds * 1000)) { $p.Kill() }
+Remove-Item Env:NIER_SETTINGS_FILE, Env:NIER_MONITOR, Env:NIER_MUTE, Env:NIER_SAVE_DIR, Env:NIER_IGNORE_PADS, Env:NIER_SHOW_FPS, Env:NIER_REPLAY_INPUT -ErrorAction SilentlyContinue
+(Select-String -Path $log -Pattern '^\[perf\] frame (\d+): ([\d.]+) fps' | Select-Object -Last 3 | ForEach-Object { $_.Matches[0].Value })

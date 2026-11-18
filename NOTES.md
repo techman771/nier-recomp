@@ -561,11 +561,48 @@ NIER_UPSCALING=<0|1> overrides): what happens when the render resolution is belo
     2% of 1 - depth allowed). Last frame's texture contents live in their own host textures
     (`gDecodedBefore`). Game 3: 7 of 7 skinned draws paired; at 360p -> 720p the running
     character keeps its shape where the camera-only vectors left it speckled and dissolving.
-    Limits: the second shader form compiles on the render thread the first time a skinning
-    shader is seen (a hitch); two identical enemies that swap draw order get each other's
-    history for a frame; rigid moving objects (their own matrix in constants) and particles
-    still have camera-only vectors.
-  - Not done: motion vectors for rigid moving objects and particles; upscaling before the game's
+    Limit: two identical enemies that swap draw order get each other's history for a frame.
+  - Rigid moving objects, 17 November 2026 (same pass; NIER_NO_RIGID_MOTION=1 turns it off). Every
+    opaque scene draw is now noted and paired with last frame's; a draw is repeated with the
+    two-bodied shader if its transform changed. Where the transform lives varies by shader: the
+    shared camera in c5-c8 with a world matrix elsewhere; one combined matrix in c36-c39 (most
+    static scenery) or c4-c7; a palette of 3-row world matrices indexed by a vertex attribute
+    (`c[43 + a0]`: Junk Heap robots and rolling cylinders, props). So the test goes by the
+    constants the shader's position depends on, found from the translated HLSL
+    (`PositionConstants`: one pass over its assignments, each register component carrying the
+    set of constants its value came from). One of them changed = moved, except four registers in
+    a row that look like a combined perspective matrix (z row = w row but for the last term)
+    whose world part, inverse(camera) x matrix, is the same now and a frame ago: only the
+    camera moved. Two things that went wrong on the way: comparing that world part against its
+    largest element hid slow rotations (now element by element, 5e-5), and letting palette rows
+    through the camera-only test hid the rolling cylinders (hence the shape test). Counts: Junk
+    Heap room 14-111 of 150 draws, the field 30-155 of 120-430 (grass and trees sway with a time
+    constant in c0; props turn), the village 213 of 414; a palette shader counts as moved when
+    any register from 43 up changes, including stale ones left by other objects (costs draws,
+    gives the same vectors as the camera pass). 0.05-0.35 ms a frame on the render thread.
+    Seen in seq_f142863 (640x360 -> 1280x720): the rolling cylinder keeps its edges and surface
+    where it used to dissolve.
+  - The two-bodied shader and its pipelines are now made on a thread of their own
+    (`MotionWorker`; log line `motion form of vertex shader ... compiled in N ms (off the render
+    thread)`, 15-200 ms each); until one is ready its draws keep the camera-only vectors. This
+    was the likely cause of the 950 ms frame in the playtest of 16 November.
+  - Reactive mask for blended effects, 17 November 2026 (NIER_NO_REACTIVE=1 turns it off).
+    Particles, smoke, lightning and magic are blended without writing depth, so depth and
+    motion vectors at their pixels describe the surface behind them. Every such draw of the
+    scene (depth test on, depth write off, blended, full-size viewport, not a rect list; all
+    of them use SRC_ALPHA over INV_SRC_ALPHA or over ONE) is drawn a second time straight after
+    itself, same shaders, state and depth buffer, into an R8 target that starts the frame at 1
+    and is multiplied by (1 - alpha); before the dispatch a full-screen pass writes
+    min(1 - that, 0.9) into the mask given to FSR as `reactive`. The second pipeline is made on
+    the motion worker. Not masked: blended draws that do write depth (they get vectors), the
+    half-size particle pass itself (640x360; whatever puts it into the scene is), the shadow
+    mask (a rect list). Seen in seq_f142863: smoke keeps its shape where it was grainy and
+    smeared, the sword arc is cleaner. `NIER_MOTION_LOG=<n>` logs the counts every n frames
+    (default 600): `[fsr3] object motion: of N scene draws ... K effect draws in the reactive mask`.
+  - Not verified in play by the user yet. Not looked at: vertices animated on the processor
+    (same constants, new vertex data: camera-only vectors); alpha-blended geometry that writes
+    depth and moves by its texture only.
+  - Not done: upscaling before the game's
     post-processing; use at native resolution (anti-aliasing only); the half-size and particle
     passes are jittered by the same rule but weren't checked separately. The vertex shader
     change gives every vertex shader new HLSL, so the DXBC cache refills once.
@@ -854,6 +891,139 @@ village). At 2x the single-pixel highlights on characters go from 46 to 3 in the
 capture f7338. Not measured: frame rate at any size. Not done: sizes that aren't 16:9 (16:10
 for the Steam Deck is wanted later), choosing the size from the display, modern upscalers.
 
+### Material for the motion vector work (recorded by the user, 16 November 2026)
+
+A 47 minute playtest of main, further into the game, with FSR 3.1.6 active for most of it
+(Resolution 3200x1800 and then 2560x1440 on the 3840x2160 display; `[fsr3] object motion: 7 of
+7 skinned draws paired with last frame's`). The user pressed F9 "for motion vectors" at:
+seq_f49124 (1187 MB, 2206 frames), seq_f67567 (1058 MB), seq_f75137 (1517 MB), seq_f99506
+(1174 MB), seq_f103289 (1499 MB), seq_f136112 (427 MB), seq_f142863 (353 MB), seq_f144408
+(352 MB), all in recomp\captures (never committed), and F12 at frame 14596 (frame_f14596.nfrm).
+What they show (replayed 17 November): 49124 a field fight, a shade dissolving into dark
+particles; 67567 the village gate and guards; 75137 a ruin with red magic projectiles and
+Grimoire Weiss; 99506 a menu over the scene; 103289 the tavern (Devola, candle flames); 136112
+the Junk Heap, close on robots with lightning; 142863 and 144408 a Junk Heap room from above
+with robots, rolling cylinders, smoke and sword arcs. Seen in that session's log, with FSR 3 on:
+- 950 ms for one frame in the window ending at frame 63600, with 19 new shaders logged in it:
+  most likely the motion form of new vertex shaders compiled, and their pipelines built, on the
+  render thread (the part of the motion vector work already on the list); not confirmed.
+- 987 ms in the window ending at 78000, at a loading screen (31 new shaders, 34 files opened).
+- 412 ms at 35400: the Resolution setting was changed there (every scaled surface is rebuilt).
+- Two frames held by a pipeline that may not be left out: 39 ms (vs C241C2AA31B867C4 ps
+  96DE927CDF9CD541) and 184 ms (same vertex shader, ps C0AC7283D1789EA8), both 6-vertex quads.
+- One pipeline was `ready after 1000 ms`, two draws left out for that second (vs
+  051A81E76BFCC43D ps ABA8D0F7C6750FEF); fourteen others were ready in 0-63 ms.
+- 53 new pipelines met (564 to 617 in pipelines_seen.txt); no crash; 5 frames skipped from
+  view; 60 fps in the 60 fps stretches, 195-240 in most of the uncapped ones.
+
+### Exposure swinging between dark and white at high frame rates (17 November 2026)
+
+Reported by the user after a playtest at 240 fps (Frame Rate 240, VSync off, FSR 3.1 at 2560x1440):
+"extreme lighting issues" in the Northern Plains. Captures: frame_f355632.nfrm (the whole screen
+white: every material drawn far too bright, i.e. the game's own exposure constant), frame_f355853,
+seq_f351692, seq_f364477, seq_f381408 (seq_f29592, seq_f41436 and seq_f148055 from the same session
+are spare material for motion vectors). Mean brightness of the replayed recordings goes up and down
+in a wave, about 300 frames from peak to peak and at times 80, between 25 and 250 of 255; replayed
+without FSR 3 it is the same, so it is in the recorded constants and not the upscaler.
+- Cause: the game reads each frame's luminance reduction back (072DC000, 32x2) and corrects its
+  exposure a step every frame. NIER_LOG_WRITEBACK=1 in the village: at 30 and 60 fps the
+  measurement of frame N arrives while frame N+1 is built; at 240 fps and uncapped while frame
+  N+5 is built, because the renderer is then the slower side and three frames wait in the queue.
+  Corrections made against a picture five frames old overshoot.
+- Change (RendererSubmitFrame): the game hands over its next frame only when none waits and the
+  frame before has given its read-backs back (`gFrameInHand`, cleared straight after the
+  read-backs, before Present). Measured: N+2 at 240 fps and uncapped (5,940 of 5,940 frames), the
+  same 180 fps as before in that test; at 60 fps with VSync still N+1, 60.0 fps, none skipped.
+  NIER_QUEUE_LIMIT=3 is the old behaviour, NIER_QUEUE_LIMIT=1 gives N+3.
+- NOT shown yet: that two frames is short enough to stop the swing. Standing in the village the
+  exposure is steady at any delay; the swing needs the Northern Plains in motion, which no test
+  route reaches. For the user to confirm at 240 fps.
+- `NIER_FPS_AT=<frame>,<index>` (test runs) sets the Frame Rate setting at a frame: the scripted
+  route to a save is timed for 60 fps and does not arrive at 240.
+
+### High frame rate game logic problems (reported 17 November 2026, nothing fixed yet)
+
+User's playtest at 240 fps (exposure fix confirmed: "lighting is fixed"). New reports, with the
+recordings that show them (recomp\captures, never committed):
+- Kaine teleports to the player very often when following at 240 fps; not at 120 and below
+  (seq_f617153 at 240 with the warp flash around recorded frame 700; seq_f619982 at 120, fine).
+- Kaine's hair physics wrong: strands stand straight out in cutscenes (seq_f563734, frame_f571955).
+- Fishing: the camera turns extremely fast and ends up at the sky (seq_f184466).
+- Lighthouse hitching (seq_f165656: three frames of 148-178 ms with no shader or pipeline waits
+  and the render thread idle, so the game thread itself stalls; cause not found).
+- Kaine doesn't appear in the village (user's remark; may be the game's own behaviour, not checked).
+
+What is known about the game's time step:
+- The main loop is sub_82496D00. Each frame it calls a virtual function of the object at
+  [0x827C..] (r14, vtable slot 3) that returns the frame's time in seconds as a double, caps it at
+  the float at 0x820007E0 unless sub_82336F88 says otherwise, and hands it (f31) to every
+  subsystem: sub_82497018, sub_82336958, sub_8211EAA8, sub_82103C50, sub_821843C8, sub_82102C48.
+- sub_82102C48 stores it as a float at 0x827B8B34 (the game-wide time step; copies at 85F0845C
+  and 85F50638). Measured 0.016662 / 0.011127 / 0.008314 at 60 / 90 / 120 fps, so it is real
+  time and fine-grained. There is a maximum but no minimum.
+- The game's code never calls QueryPerformanceCounter (sub_825611A0), KeQuerySystemTime or
+  GetTickCount (sub_82561038) during play; those are only used by the libraries.
+- So the three logic problems are per-system reactions to a small step (4 ms), not a bad clock.
+  Not found yet: the companion's warp test, the hair solver, the fishing camera.
+- Test tools: NIER_LOG_CLOCK=1 (callers of the clock functions), NIER_SCAN_F32 now reports up to
+  20,000 addresses, NIER_FPS_AT=<frame>,<index>, NIER_AUTO_MOVE takes stick values up to 32767.
+  The user's newest save is GAME_DATA1 (Northern Plains mailbox); a copy loads with the usual
+  loadsave_args.txt when it is the only slot in the test save folder. Kaine was not seen within
+  10 s of running from there at 240 fps, so the teleport is not reproduced in a test run yet.
+
+Kaine's warp reproduced in a test run (17 November 2026, late):
+- The user recorded their input (`run_boot.ps1 14400 -Playtest -Record recompecordings\kaine_desert.input`,
+  never committed): load slot 3 (GAME_DATA2, saved in Facade), out the door, run in the desert
+  with Kaine following, 15,000 frames at 240 fps. `toolseplay_input_test.ps1 <seconds> <label>
+  [<exe>]` replays it muted on the second monitor with a copy of all the saves and the user's
+  settings (log: recomp\replay_<label>.log). The route holds
+  (desert by frame 9000) and Kaine warps with the white flash several times between frames 9600
+  and 11800; the exact frames move by a couple of hundred between runs.
+- Function coverage: `recompuntime\cover.cpp` + `cover_prologue.h`. A coverage build is the
+  normal build.ninja copied to recompuild_cover with `/FI../runtime/cover_prologue.h` added to
+  the cxx rule (ninja -C recompuild_cover, under a minute), its nier.exe copied to
+  recompuild
+ier_cover.exe. `NIER_COVER=<first frame>,<last frame>` then logs every guest
+  function that ran in that window with the first and last frame it ran in and in how many
+  frames. Normal builds never call it.
+- First pass (frames 9600-11800, 3,125 functions): the ones that ran in only 1-7 frames include a
+  family at 0x82153A08-0x82155EC0 and 0x82164360 / 0x82164CF8 (the latter called from 0x82170744
+  with r4 = 0x3E on three different objects, so probably enemies, not Kaine), and
+  0x821D9xxx-0x821DAxxx / 0x8225Cxxx. Not yet tied to the warp. Next: record and cover the same
+  run, take the exact frame the flash starts from the recording, and look only at functions whose
+  first frame is within a few frames before it; then NIER_BREAK on those for the call chain.
+
+### Other aspect ratios (16:10, ultrawide): findings so far, nothing built
+
+SET ASIDE by the user for later (16 November 2026, after these findings): "let's have this for
+later". The test switches (NIER_VIDEO_WIDE, NIER_POKE_F32) are in the working copy, uncommitted.
+
+
+Wanted by the user (16 November 2026): 16:10 and ultrawide; "menus, cutscenes can stay 16:9
+with black bars", so it is gameplay that should fill the screen.
+- The video mode's widescreen flag changes nothing: with `NIER_VIDEO_WIDE=0` (a 4:3 display
+  reported by VdQueryVideoMode / XGetVideoMode) the title and gameplay pictures are the same.
+- The game holds 16/9 (1.777778) as a float in four places of its image (820007E4, 826B4204,
+  827B89D8, 827CE7B8) and in eighteen of its data (8487CA68 ... 84880528, 0x380 apart from the
+  second on: one per some object). Found with `NIER_PROFILE=2400,1` and
+  `NIER_SCAN_F32=1.777778,0.0004`; each was then overwritten every frame with 2.37
+  (`NIER_POKE_F32=<address>:<value>[,...]`, new, in the swap handler) and frame 2400 of Game 3
+  compared. Only 827CE7B8 changes the picture: the 3D scene is drawn with the wider horizontal
+  field of view, squeezed into the same 1280x720 (so right once the surface is 2.37 wide),
+  and nothing is missing at the sides, so the game's culling follows it. The health bars and
+  the marks on the minimap move towards the middle by the same 0.75 (they are placed through
+  that aspect); the minimap's frame and the rest of the 2D stay where they were.
+- So the plan: write the window's aspect into 827CE7B8; make the screen-shaped surfaces
+  (guest 16:9: 1280x720 and its reductions) wider on the host, with viewports, scissors and
+  resolve rectangles scaled in x to match (about two dozen uses of Scaled / ScaledInt in
+  renderer_d3d12.cpp); keep the 2D that does not follow the aspect inside the middle 16:9
+  (full-width flat overlays such as fades stretched instead); show menus and cutscenes at 16:9
+  with black at the sides, telling gameplay by the HUD being drawn. 16:10 is the mirror case
+  (taller, not wider) and needs the field of view looked at too; not worked out yet.
+- Not known yet: how to tell the 2D draws that follow the aspect from those that do not (the
+  capture log does not list vertex constants; the frame capture does), and whether anything
+  else reads that constant.
+
 ### 2D at the display's resolution
 
 The Resolution setting sizes the 3D scene; the HUD, menus, text and the title screen are drawn at
@@ -1085,8 +1255,9 @@ From the user's playthrough (open unless marked):
   the gain without the pipeline list is modest; with the list, post-processing is built at
   start-up and what is left to meet in play is scene geometry, which this covers. Risks, not
   seen: something drawn once into a surface that is kept (it would stay missing); a quad with
-  more than 6 vertices that a later pass depends on. Not covered: the motion-vector form of a
-  vertex shader (FSR 3 only) is still compiled and its pipeline built on the render thread.
+  more than 6 vertices that a later pass depends on. The motion-vector form of a vertex shader
+  (FSR 3 only) was still compiled on the render thread then; since 17 November 2026 it has a
+  worker of its own (see the FSR 3.1 notes).
 - The stutter in the cutscene after leaving the library, looked at again with the recordings
   (seq_f63744, seq_f64736; seq_f57737 from the same morning is as heavy). CAUSE FOUND, not
   fixed. All thirteen recordings side by side: the ones made at home on 14-15 November have 0-2
@@ -1390,6 +1561,14 @@ From the user's playthrough (open unless marked):
   now, so there were fewer late frames to start the slide). The limiter at 60 therefore
   stands verified only by the test run above; it is what the game falls back to if the
   display's count goes off again.
+  SHELVED by the user (16 November 2026): the hitches at a scene's start and at a save load
+  (frames of 22-43 ms as a scene's vertex data and textures arrive, over 100 ms at a load:
+  texture conversion at 1.4 GB/s, the frame queue full while the renderer uploads). "can be
+  shelved since the major scene has been fixed". Not to be picked up unless asked.
+  Also shelved "for now" by the user the same day: the uncapped ceiling in heavy scenes (the
+  command thread at 105-130 fps in that cutscene). Order given for what is next: aspect ratios
+  other than 16:9 first, then the motion vector work (rigid moving objects, particles, and
+  the FSR 3 motion form of vertex shaders still compiled on the render thread).
   xxhash is now compiled inline in gpu.cpp with the runtime's flags (XXH_INLINE_ALL; the
   linked xxhash.lib is built without AVX2). The texture hash times did not change with it
   (0.8-0.9 ms for 28.7 MB either way), so the library was not the slow part it looked like.

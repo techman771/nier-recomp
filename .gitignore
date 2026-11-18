@@ -17,6 +17,7 @@
 
 # Build output and logs
 /recomp/build/
+/recomp/build_cover/
 /tools/build/
 *.log
 *.log.err
@@ -33,6 +34,7 @@
 /save_backups/
 /recomp/test_save/
 /recomp/test_settings.ini
+/recomp/replay_settings.ini
 /recomp/build/settings.ini
 /dlc/
 /tools/SDL3/

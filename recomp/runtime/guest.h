@@ -52,6 +52,7 @@ void PresenterDumpStats();
 
 uint32_t LoadGame(const std::string& gameDir);     // returns the entry point
 void UpdateTimeBundle();
+void CoverTick(uint64_t frame);   // NIER_COVER=<first>,<last>: function coverage (cover.cpp)
 uint32_t XexHeaderGuest();
 
 void ThreadsInit();
