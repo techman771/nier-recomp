@@ -238,6 +238,7 @@ namespace
                 DWORD64 establisher = 0;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
             }
+            if (const std::string whole = GuestCallChain(12); whole.size() > chain.size()) chain = whole;   // the unwinder stops where there is no unwind data
             if (gWatchSeen[chain + " @" + std::to_string((offset - start) / 64)]++ < 3)   // per writer and 64-byte block
             {
                 Log("[watch] %s %08X (+%u) by%s (frame %llu)\n", isWrite ? "write to" : "read of", guest, offset - start, chain.c_str(), GpuFrameCount());
@@ -425,6 +426,7 @@ namespace
         const PPCContext* ctx = reinterpret_cast<const PPCContext*>(info->ContextRecord->Rcx);
         Log("[break] sub_%08X frame %llu: r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X f1=%g f2=%g lr=%08llX\n", gBreakGuest, GpuFrameCount(),
             ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->f1.f64, ctx->f2.f64, ctx->lr);
+        Log("[break]   called through%s\n", GuestCallChain(14).c_str());
         char spec[128];
         if (GetEnvironmentVariableA("NIER_BREAK_DUMP", spec, sizeof(spec)))
             for (char* item = strtok(spec, ","); item; item = strtok(nullptr, ","))

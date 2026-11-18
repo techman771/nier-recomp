@@ -115,3 +115,22 @@ registers = ["r31"]
 name = "TitleQuitToDesktop"
 address = 0x82199B20
 registers = ["r31"]
+
+# High frame rates: the trail of the player's positions a partner (Kaine, Emil) follows gets a
+# point when the frame counter is a multiple of 8 (lwz r11,16(r10) / clrlwi r9,r11,29 in
+# sub_821F02C0): every 0.267 s at 30 fps, eight times as often at 240, where the 64-point trail
+# became too short and the partner kept being warped to the player. The hook replaces the counter
+# with one that passes the test every 8/30 s of game time (runtime: highfps.cpp).
+[[midasm_hook]]
+name = "PartnerTrailCadence"
+address = 0x821F06FC
+registers = ["r11", "r31"]
+
+# High frame rates: Kaine's "am I stuck" test (sub_82213DC0) samples her position every 4 frames
+# (lwz r11,16(r27) / clrlwi r11,r11,30) into a ring and warps her to the player when the ring's
+# ends are too close. At 240 fps the ring spanned under a second and she was warped constantly.
+# The hook makes the sampling go by game time: every 4/30 s (runtime: highfps.cpp).
+[[midasm_hook]]
+name = "PartnerStuckCadence"
+address = 0x82214118
+registers = ["r11", "r31"]

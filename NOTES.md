@@ -993,6 +993,32 @@ ier_cover.exe. `NIER_COVER=<first frame>,<last frame>` then logs every guest
   run, take the exact frame the flash starts from the recording, and look only at functions whose
   first frame is within a few frames before it; then NIER_BREAK on those for the call chain.
 
+Kaine's warp at high frame rates: cause found and fixed (18 November 2026, awaiting the user's check):
+- Kaine is a static object at 0x84883BA0 (vtable 0x8201D088; Emil's is at 0x848C50E0), found
+  through the script commands that control her (`_SetKaineEnableJump` writes +9368 of it; the
+  script table at 0x82740B80 pairs names with thunks). Position at +144. Her update is vtable
+  +424, sub_82213DC0; the follow logic sub_821F02C0; "warp to the player" is vtable +944,
+  sub_821E7C70, which calls sub_82212028.
+- The cause: while she follows (state 13 or 18 at +6556), sub_82213DC0 puts her own position into
+  a ring at +6912 when the game's frame counter (0x85F08468) is a multiple of 4. Once the ring is
+  full, if its oldest and newest points are closer than a threshold she counts as stuck and is
+  warped. At 30 fps the ring spans about six seconds; at 240 under one, and ordinary running
+  doesn't cover the distance. Mid-asm hook PartnerStuckCadence at 0x82214118 (highfps.cpp) makes
+  the test pass every 4/30 s of game time instead.
+- A second frame count in the same family: the trail of the player's positions she follows (ring
+  of 64 at +7712, sub_822559F0) gets a point every 8 frames. Hook PartnerTrailCadence at
+  0x821F06FC: every 8/30 s. On its own it did NOT stop the warps (the user checked); it is kept
+  because it restores the 30 fps spacing. NIER_FRAME_COUNTS=1 turns both hooks off.
+- Measured with the recorded desert run at 240 fps (scratchpad warp_count.ps1: NIER_BREAK on
+  sub_82212028 with the call chain): 4 warps in 20 seconds with the game's own tests, all through
+  sub_821E7C70 from sub_82213DC0; 0 with the hooks.
+- Wrong turns, so they aren't repeated: sub_82154BA8 is NOT the warp (it is some particle's set-up
+  and runs about as often with the fix); the list at 0x847B4990 is rebuilt every frame.
+- The game's frame counter is used the same way elsewhere (`& 7`, `& 3`, ... on the word at
+  0x85F08458+16): every such test is a 30 fps assumption and a candidate for the other high
+  frame rate problems (hair, fishing camera). Tools: NIER_BREAK now logs the guest call chain,
+  NIER_WATCH_WRITE logs the full chain too.
+
 ### Other aspect ratios (16:10, ultrawide): findings so far, nothing built
 
 SET ASIDE by the user for later (16 November 2026, after these findings): "let's have this for
