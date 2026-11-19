@@ -2098,6 +2098,44 @@ the place"):
 - Next: a profile of a heavy scene on the Deck (NIER_PROFILE=work12,30 as a launch option) to see which
   functions of the command thread the time is in.
 
+- Debugging the Deck from the PC: Tailscale on both with Tailscale SSH (`ssh deck@steamdeck`), so
+  logs are read and builds copied (`scp`) while the game runs. A process started from the SSH
+  session dies with it; long-lived helpers go through `systemd-run --user`.
+- A profile on demand: creating `recomp/profile_now` (holding a number of seconds, or empty for
+  30) starts the sampling profiler within half a second, no launch option needed (profiler.cpp
+  `AskThread`). Under Proton dbghelp names nothing in Wine's DLLs, so waiting threads counted as
+  busy; the profiler now falls back to the DLLs' export tables (`ExportName`), and a thread in
+  NtSuspendThread counts as idle. The game's own recompiled functions still come out as 4 KB
+  regions (`nier+0x11A9000`) there: Wine's dbghelp does not resolve most of the PDB.
+- What the profile of a heavy area (40-49 fps at 720p) showed, against the first reading of the
+  log: the command thread is busy 20% and the render thread 11%, both mostly waiting; vkd3d's
+  queue thread waits on the GPU 76% of the time; GPU busy 100%, the APU on its 15 W cap. The
+  Deck is GPU and power bound there. The command thread's "working" time in the `[gpu] on-time
+  / late frames` lines includes time blocked behind the render thread and is not CPU work.
+- The one thread at 100% of a core was the game's main thread in the D3D library's spin wait for
+  a fence (sub_82573758 calling sub_82579D50, which pauses 4 x db16cyc and checks again). Hook
+  `GpuSpinWait` at 0x82579D68 now sleeps (WaitOnAddress, at most 1 ms) until the command thread
+  has written a fence or moved the ring's read pointer (gpu.cpp `Progress`). On the PC the
+  thread no longer shows as busy and the lighthouse replay at 240 fps reads the same with and
+  without it (`NIER_SPIN_WAIT=1` restores the spin, for comparing). On the Deck the next run
+  held 58-60 fps at 720p in the heavy area with the APU at 7-10 W and the CPU at 65-69 C (before:
+  40-49 fps, on the 15 W cap, 83-87 C). Not a controlled comparison (another session, and the
+  shadow setting one step higher).
+- Upscaling Quality (PC Settings, `upscaling_quality` in settings.ini): with Upscaling on, the
+  render resolution is the display's divided by FSR's factor: Native 1.0, Ultra Quality 1.3,
+  Quality 1.5, Balanced 1.7, Performance 2.0, Ultra Performance 3.0; Custom (0, the default)
+  keeps the Resolution setting. Rounded to twelfths of 720p and never below 360p, so on the Deck
+  (720p picture) the modes are 720p, 540p, 480p, 420p, 360p, 360p. `NIER_UPSCALING_QUALITY=<0-6>`
+  overrides. 420p (7 twelfths, a scale no setting used before) drew correctly in the lighthouse,
+  and the Deck's log showed the modes switching. Seen on the Deck with the row's first form (no
+  Native, values one lower).
+- Native with FSR 3.1 or 4 is their anti-aliasing alone (Native AA): `UpscalingMode` returns 2 at
+  the display's own resolution, the 2D pass is still found (`FindFlatPhase`) so its draws take
+  the upscaler's output and no jitter, and `BeginFlatPhase` does nothing when the render-sized
+  and display-sized targets are the same one. With FSR 1 Native is plain native rendering.
+  Checked on the PC: lighthouse replay, `[fsr3] upscaler ready: 3.1.6, 1493x840 -> 1493x840`,
+  picture correct, upscaling 0.37 ms of GPU time there.
+
 ## Debugging tools worth taking to another Xbox 360 recompilation
 
 Written 18 November 2026 at the user's request. Most of the tools made here depend on the

@@ -2,6 +2,9 @@
 // thread of the process is sampled about 1000 times a second for the given time, then the log gets each
 // busy thread's hot functions (own time and inclusive time) and what its idle samples were waiting in.
 // A third field "exit" (NIER_PROFILE=11000,20,exit) ends the process after the report.
+// Without NIER_PROFILE a profile can still be asked for while the game runs: create the file
+// recomp\profile_now (holding a number of seconds, or empty for 30) and sampling starts within half a
+// second. Made for the Steam Deck, where the heavy moment is picked by eye and the file is made over SSH.
 // NIER_PROFILE=work<ms>,<seconds> starts instead when the GPU command thread's work has averaged that
 // many milliseconds a frame (NIER_PROFILE=work7,30: a heavy scene, whenever it comes).
 #define NOMINMAX
@@ -12,6 +15,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,6 +45,69 @@ namespace
     std::unordered_map<uintptr_t, Symbol> gSymbols;   // by function start
     std::unordered_map<uintptr_t, uintptr_t> gStarts;  // address -> function start
 
+    // The module holding an address and its nearest named export at or below it. Under Proton dbghelp
+    // names nothing in Wine's own DLLs, so a waiting thread (stopped at the system call inside
+    // ntdll's NtWaitForSingleObject) counted as busy; the export tables are always there. A module
+    // with few exports, or an address far past the nearest one, is named by module and 4 KB page.
+    bool gExportsOnly = false;   // NIER_PROFILE_EXPORTS=1: this path for every module but the game's (testing)
+
+    bool ExportName(uintptr_t address, std::string& module, std::string& name, uintptr_t& start)
+    {
+        HMODULE handle = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &handle) || !handle)
+            return false;
+        struct Exports { std::string module; std::vector<std::pair<uint32_t, std::string>> list; };
+        static std::unordered_map<HMODULE, Exports> known;
+        auto found = known.find(handle);
+        if (found == known.end())
+        {
+            Exports exports;
+            char path[MAX_PATH] = {};
+            GetModuleFileNameA(handle, path, sizeof(path));
+            const char* file = strrchr(path, '\\');
+            exports.module = file ? file + 1 : path;
+            if (const size_t dot = exports.module.rfind('.'); dot != std::string::npos) exports.module.resize(dot);
+            for (char& c : exports.module) c = char(tolower(c));
+            const auto* base = reinterpret_cast<const uint8_t*>(handle);
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            const auto& entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (entry.Size >= sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                const auto* directory = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + entry.VirtualAddress);
+                const auto* names = reinterpret_cast<const uint32_t*>(base + directory->AddressOfNames);
+                const auto* ordinals = reinterpret_cast<const uint16_t*>(base + directory->AddressOfNameOrdinals);
+                const auto* functions = reinterpret_cast<const uint32_t*>(base + directory->AddressOfFunctions);
+                for (uint32_t i = 0; i < directory->NumberOfNames; i++)
+                {
+                    if (ordinals[i] >= directory->NumberOfFunctions) continue;
+                    const uint32_t rva = functions[ordinals[i]];
+                    if (rva >= entry.VirtualAddress && rva < entry.VirtualAddress + entry.Size) continue;   // forwarded
+                    exports.list.emplace_back(rva, reinterpret_cast<const char*>(base + names[i]));
+                }
+                std::sort(exports.list.begin(), exports.list.end());
+            }
+            found = known.emplace(handle, std::move(exports)).first;
+        }
+        const Exports& exports = found->second;
+        module = exports.module;
+        const uint32_t rva = uint32_t(address - reinterpret_cast<uintptr_t>(handle));
+        auto after = std::upper_bound(exports.list.begin(), exports.list.end(), std::make_pair(rva, std::string("\x7f")));
+        if (exports.list.size() >= 100 && after != exports.list.begin() && rva - (after - 1)->first < 0x800)
+        {
+            name = (after - 1)->second;
+            start = reinterpret_cast<uintptr_t>(handle) + (after - 1)->first;
+        }
+        else
+        {
+            char text[32];
+            snprintf(text, sizeof(text), "+0x%X", rva & ~0xFFFu);
+            name = text;
+            start = address & ~uintptr_t(0xFFF);
+        }
+        return true;
+    }
+
     const Symbol& Describe(uintptr_t address, uintptr_t& start)
     {
         auto known = gStarts.find(address);
@@ -55,10 +122,22 @@ namespace
         info->MaxNameLen = 255;
         DWORD64 displacement = 0;
         Symbol symbol;
-        if (SymFromAddr(GetCurrentProcess(), address, &displacement, info))
+        std::string name, bare;
+        HMODULE holder = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &holder);
+        const bool ours = holder == GetModuleHandleA(nullptr);
+        if (!(gExportsOnly && !ours) && SymFromAddr(GetCurrentProcess(), address, &displacement, info))
         {
             start = uintptr_t(info->Address);
             symbol.name = info->Name;
+            IMAGEHLP_MODULE64 module{};
+            module.SizeOfStruct = sizeof(module);
+            if (SymGetModuleInfo64(GetCurrentProcess(), address, &module)) name = module.ModuleName;
+            for (char& c : name) c = char(tolower(c));
+        }
+        else if (ExportName(address, name, bare, start))
+        {
+            symbol.name = bare[0] == '+' ? name + bare : name + "!" + bare;
         }
         else
         {
@@ -67,16 +146,12 @@ namespace
             snprintf(text, sizeof(text), "%p", (void*)address);
             symbol.name = text;
         }
-        IMAGEHLP_MODULE64 module{};
-        module.SizeOfStruct = sizeof(module);
-        if (SymGetModuleInfo64(GetCurrentProcess(), address, &module))
+        if (!name.empty())
         {
-            std::string name = module.ModuleName;
-            for (char& c : name) c = char(tolower(c));
             symbol.system = name == "ntdll" || name == "kernelbase" || name == "win32u" || name == "kernel32";
-            const std::string& n = symbol.name;
+            const std::string& n = bare.empty() ? symbol.name : bare;
             symbol.wait = (name == "ntdll" || name == "win32u") && (n.rfind("Nt", 0) == 0 || n.rfind("Zw", 0) == 0);
-            if (symbol.wait && n.find("Wait") == std::string::npos && n.find("Delay") == std::string::npos && n.find("Remove") == std::string::npos && n.find("Signal") == std::string::npos && n.find("Yield") == std::string::npos && n.rfind("NtUser", 0) != 0)
+            if (symbol.wait && n.find("Wait") == std::string::npos && n.find("Delay") == std::string::npos && n.find("Remove") == std::string::npos && n.find("Signal") == std::string::npos && n.find("Suspend") == std::string::npos && n.find("Yield") == std::string::npos && n.rfind("NtUser", 0) != 0)
                 symbol.wait = false;
         }
         gStarts[address] = start;
@@ -221,10 +296,11 @@ namespace
         // (left on: the profiler thread does nothing else that should reach the crash handler)
     }
 
-    void ProfilerThread(uint64_t firstFrame, double workMs, double seconds, bool exitAfter)
+    std::mutex gProfiling;   // one profile at a time
+
+    void RunProfile(double seconds)
     {
-        // By work: not in the first minute, when starting up and loading count as heavy frames.
-        while (workMs > 0 ? (GpuFrameCount() < 1800 || GpuCommandWorkMs() < workMs) : GpuFrameCount() < firstFrame) Sleep(50);
+        std::lock_guard lock(gProfiling);
         Log("[profile] sampling from frame %llu for %.0f s\n", (unsigned long long)GpuFrameCount(), seconds);
         GpuResetFrameTiming();
 
@@ -273,6 +349,29 @@ namespace
         const double elapsed = double(now.QuadPart - begin.QuadPart) / frequency.QuadPart;
         Report(samples, elapsed, GpuFrameCount() - startFrame);
         for (auto& [id, handle] : handles) CloseHandle(handle);
+        fflush(stdout);
+    }
+
+    // Profiles asked for while the game runs (see the top of the file).
+    void AskThread()
+    {
+        for (;; Sleep(500))
+        {
+            FILE* file = fopen("..\\profile_now", "r");
+            if (!file) continue;
+            double seconds = 0;
+            if (fscanf(file, "%lf", &seconds) != 1 || seconds < 1 || seconds > 600) seconds = 30;
+            fclose(file);
+            DeleteFileA("..\\profile_now");
+            RunProfile(seconds);
+        }
+    }
+
+    void ProfilerThread(uint64_t firstFrame, double workMs, double seconds, bool exitAfter)
+    {
+        // By work: not in the first minute, when starting up and loading count as heavy frames.
+        while (workMs > 0 ? (GpuFrameCount() < 1800 || GpuCommandWorkMs() < workMs) : GpuFrameCount() < firstFrame) Sleep(50);
+        RunProfile(seconds);
         // NIER_SCAN=<f1>,<f2>,<f3>: logs guest addresses holding those three big-endian floats in a row
         // (within 0.01), e.g. to find every copy of a matrix (debugging).
         char scan[128];
@@ -437,6 +536,8 @@ void ProfilerInit()
 {
     char* setting = nullptr;
     size_t length = 0;
+    gExportsOnly = GetEnvironmentVariableA("NIER_PROFILE_EXPORTS", nullptr, 0) > 0;
+    std::thread(AskThread).detach();
     _dupenv_s(&setting, &length, "NIER_PROFILE");
     if (!setting) return;
     const double workMs = !strncmp(setting, "work", 4) ? atof(setting + 4) : 0.0;

@@ -61,6 +61,7 @@ namespace
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
             { "upscaling", &gSettings.upscaling, 0, 3 },
+            { "upscaling_quality", &gSettings.upscalingQuality, 0, 6 },
             { "save_page", &gSettings.savePage, 1, 10 },
             { "show_fps", &gSettings.showFps, 0, 1 },
             { "master_volume", &gSettings.masterVolume, 0, 10 },
@@ -88,6 +89,7 @@ namespace
         T_Upscaling, T_UpscalingHelp, T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4, T_UpscalingHelp4,
         T_Uncapped, T_90fps, T_120fps, T_144fps, T_240fps,
         T_FpsCounter, T_FpsCounterHelp,
+        T_UpQuality, T_UpQualityHelp, T_UpCustom, T_UpUltraQuality, T_UpQualityMode, T_UpBalanced, T_UpPerformance, T_UpUltraPerformance, T_UpNative,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
@@ -118,6 +120,8 @@ namespace
         "Choose how a resolution below the screen's is enlarged.\nFSR 4 looks best and costs the most.",
         "Uncapped", "90 fps", "120 fps", "144 fps", "240 fps",
         "Frame Rate Counter", "Show the current frame rate in the top left corner.",
+        "Upscaling Quality", "With Upscaling on, draw the game at a share of the\nscreen's resolution. Native: FSR 3 anti-aliasing only.",
+        "Custom", "Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance", "Native",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -164,6 +168,7 @@ namespace
         { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
         { 69, 4, &gSettings.upscaling, 3, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4 } },
+        { 75, 4, &gSettings.upscalingQuality, 6, T_UpQuality, T_UpQualityHelp, { T_UpCustom, T_UpNative, T_UpUltraQuality, T_UpQualityMode, T_UpBalanced, T_UpPerformance, T_UpUltraPerformance } },
         { 68, 4, &gSettings.shadowQuality, 3, T_Shadows, T_ShadowsHelp, { T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
         { 64, 2, &gSettings.muteInBackground, 1, T_MuteInBackground, T_MuteInBackgroundHelp, { T_Off, T_On } },

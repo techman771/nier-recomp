@@ -151,3 +151,11 @@ registers = ["f29", "f30"]
 name = "GameStepHook"
 address = 0x82496E60
 registers = ["f31"]
+
+# Power: the D3D library's wait for the GPU (sub_82573758) spins in sub_82579D50, 100% of a core
+# for most of every frame. The hook, at the top of the spin, sleeps until the GPU command thread
+# has got further (runtime: gpu.cpp GpuSpinWait).
+[[midasm_hook]]
+name = "GpuSpinWait"
+address = 0x82579D68
+registers = []

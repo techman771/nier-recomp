@@ -12,6 +12,11 @@ struct PcSettings
     // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
     std::atomic<int> resolutionScale{ 3 };
     std::atomic<int> upscaling{ 0 };           // how a lower render resolution is enlarged: 0 plain filtering, 1 FSR 1, 2 FSR 3.1, 3 FSR 4 (temporal)
+    // Upscaling Quality: with Upscaling on, the render resolution as a share of the display's instead of
+    // the Resolution setting: 0 custom (Resolution), 1 Native (the display's own; with FSR 3.1 or 4 that
+    // is their anti-aliasing alone, "Native AA"), 2 Ultra Quality (display / 1.3), 3 Quality (1.5),
+    // 4 Balanced (1.7), 5 Performance (2.0), 6 Ultra Performance (3.0). FSR's own factors.
+    std::atomic<int> upscalingQuality{ 0 };
     std::atomic<int> showFps{ 0 };             // frame rate counter in the top left corner
     std::atomic<int> savePage{ 1 };            // which page of three game saves the save list shows (1-10)
     std::atomic<int> shadowQuality{ 0 };       // shadow map size: 0 the original 1024, 1 2048, 2 3072, 3 4096

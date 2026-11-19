@@ -2,6 +2,7 @@
 // CPU side can observe (read pointer, fences, scratch writeback, interrupts, vblank), but draws
 // nothing. Replacing the draw handling with a real backend is the later renderer work.
 #define NOMINMAX
+#pragma comment(lib, "synchronization.lib")
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -52,6 +53,19 @@ namespace
     uint32_t gGpuPcr = 0;
 
     std::atomic<uint64_t> gFrames{ 0 }, gDraws{ 0 }, gIndirect{ 0 }, gFences{ 0 }, gCpInterrupts{ 0 }, gVblanks{ 0 };
+
+    // The game's D3D library waits for the GPU to pass a fence by spinning (sub_82573758 calling
+    // sub_82579D50 in a loop), which kept its main thread at 100% of a core for most of every frame.
+    // Harmless on a desktop; on the Steam Deck the CPU and GPU share 15 W. The command thread counts
+    // its progress here (a fence written, the ring's read pointer moved) and the wait loop sleeps
+    // until the count changes (GpuSpinWait, mid-asm hook in nier_hooks.toml).
+    std::atomic<uint32_t> gProgress{ 0 };
+    std::atomic<int> gProgressWaiters{ 0 };
+    inline void Progress()
+    {
+        gProgress.fetch_add(1);
+        if (gProgressWaiters.load()) WakeByAddressAll(&gProgress);
+    }
     std::mutex gStatsMutex;
     std::map<uint32_t, uint64_t> gUnknownOpcodes;
     int gWaitTimeoutsLogged = 0, gCorruptLogged = 0;
@@ -1657,6 +1671,7 @@ namespace
             uint32_t initiator = s.Next(), address = s.Next(), value = s.Next();
             GpuStore(address, (initiator >> 31) ? uint32_t(gFrames.load()) : value);
             gFences++;
+            Progress();
             break;
         }
         case PM4_COND_WRITE:
@@ -1667,6 +1682,7 @@ namespace
                 if (waitInfo & 0x100) GpuStore(target, data);
                 else WriteRegister(target, data);
                 gFences++;
+                Progress();
             }
             break;
         }
@@ -1973,6 +1989,7 @@ namespace
             gReadIndex = write;
             W32(MMIO_BASE + REG_CP_RB_RPTR * 4, gReadIndex);
             if (gWritebackAddress) W32(gWritebackAddress, gReadIndex);
+            Progress();
             QueryPerformanceCounter(&lastWork);
         }
     }
@@ -2172,6 +2189,20 @@ GUEST_IMPORT(VdInitializeRingBuffer)
         std::thread(VblankThread).detach();
     }
     ctx.r3.u64 = 0;
+}
+
+// Mid-asm hook at the top of the D3D library's spin (sub_82579D50), reached only when what it waits
+// for has not happened yet: sleeps until the command thread gets further, at most a millisecond
+// (the loop has other ways out, and its own time-out). NIER_SPIN_WAIT=1 leaves the spin as it was.
+void GpuSpinWait()
+{
+    static const bool spin = GetEnvironmentVariableA("NIER_SPIN_WAIT", nullptr, 0) > 0;
+    if (spin) return;
+    thread_local uint32_t seen = 0;
+    gProgressWaiters++;
+    WaitOnAddress(&gProgress, &seen, sizeof(seen), 1);
+    gProgressWaiters--;
+    seen = gProgress.load();
 }
 
 GUEST_IMPORT(VdEnableRingBufferRPtrWriteBack)

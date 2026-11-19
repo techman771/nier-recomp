@@ -1775,6 +1775,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // scales the scene texture to the display as it draws, and everything after lands on display
     // pixels. Returns the index of the first command of the pass (commands.size() if there is none)
     // and the target it draws to. NIER_NATIVE_2D=0 turns it off.
+    int UpscalingMode();
+
     size_t FindFlatPhase(const RendererFrame& frame, RenderTargetKey& target, bool always = false)
     {
         const size_t none = frame.commands.size();
@@ -1782,7 +1784,9 @@ float PSMain(float4 position : SV_Position) : SV_Target
             char value[8];
             return !(GetEnvironmentVariableA("NIER_NATIVE_2D", value, sizeof(value)) && value[0] == '0');
         }();
-        if (!frame.scanoutBase || (!always && (!enabled || gDisplayTwelfths == gResTwelfths))) return none;
+        // At the display's own resolution there is nothing to split, except under Native AA: the 2D
+        // pass must still be told apart, since its draws take the anti-aliased scene and no jitter.
+        if (!frame.scanoutBase || (!always && (!enabled || (gDisplayTwelfths == gResTwelfths && UpscalingMode() != 2)))) return none;
         size_t end = none;
         for (size_t i = frame.commands.size(); i-- > 0;)
             if (const RendererResolve* resolve = std::get_if<RendererResolve>(&frame.commands[i]))
@@ -1811,6 +1815,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gActiveTwelfths = gDisplayTwelfths;
         TargetResource* to = GetTarget(key);
         if (!from || !to || !drawnThisFrame) return;   // nothing new at render size: the display-sized picture carries on
+        if (from == to) return;                         // Native AA: one target at both sizes
         const UINT slot = gDrawSrvUsed;
         if (slot + kTextureSlots > kDrawDescriptors) return;
         gDrawSrvUsed += kTextureSlots;
@@ -2916,10 +2921,20 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         return forced >= 0 ? forced : Settings().upscaling.load();
     }
 
+    // The Upscaling Quality setting (settings.h); NIER_UPSCALING_QUALITY=<0-6> overrides it.
+    int UpscalingQuality()
+    {
+        static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING_QUALITY", v, sizeof(v)) ? atoi(v) : -1; }();
+        return std::clamp(forced >= 0 ? forced : Settings().upscalingQuality.load(), 0, 6);
+    }
+
     // 0 plain filtering, 1 FSR 1, 2 temporal (the FSR 3.1 and FSR 4 settings: TemporalWantsNewest).
+    // At the display's own resolution only the Native quality mode with a temporal upscaler does
+    // anything: the upscaler runs with equal sizes in and out, as anti-aliasing ("Native AA").
     int UpscalingMode()
     {
-        if (gResTwelfths >= gDisplayTwelfths) return 0;
+        if (gResTwelfths > gDisplayTwelfths) return 0;
+        if (gResTwelfths == gDisplayTwelfths) return UpscalingQuality() == 1 && UpscalingSetting() >= 2 && TemporalLoaded() ? 2 : 0;
         const int mode = std::min(UpscalingSetting(), 2);
         if (mode == 2 && !TemporalLoaded()) return 1;
         return mode;
@@ -3338,7 +3353,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             if (found->second.width < 1024 || found->second.height < 576) continue;   // the scene, not a small effect buffer
             StageMark(kStageUpscale);
             ID3D12Resource* upscaled = mode == 2 ? TemporalUpscaled(binding.resolvedBase, found->second) : nullptr;
-            if (!upscaled) upscaled = Upscaled(binding.resolvedBase, found->second);
+            if (!upscaled && gResTwelfths < gDisplayTwelfths) upscaled = Upscaled(binding.resolvedBase, found->second);
             if (upscaled) gUpscaledNow[binding.resolvedBase] = upscaled;
         }
         StageMark(kStageFlat);
@@ -3469,7 +3484,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                     ExecuteResolve(snapshot);
                 }
                 ExecuteResolve(resolve);
-                if (flat && (resolve.clearColor || resolve.clearDepth))
+                if (flat && (resolve.clearColor || resolve.clearDepth) && gResTwelfths != gDisplayTwelfths)
                 {
                     // The clear that ends the frame is meant for the next frame's scene too.
                     gActiveTwelfths = gResTwelfths;
@@ -3880,14 +3895,23 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     }
 
     // The resolution asked for, in twelfths: the setting is an index into this list of scales;
-    // NIER_RES_SCALE=<scale> (0.5 to 4) overrides it.
-    uint32_t ResolutionWanted()
+    // NIER_RES_SCALE=<scale> (0.5 to 4) overrides it. With Upscaling on, the Upscaling Quality setting
+    // (other than Custom) replaces it with the display's resolution divided by FSR's factor for that
+    // mode, to the nearest twelfth of 720p and no lower than 360p (so on a 720p display Ultra
+    // Performance is the same 360p as Performance); Native is the display's own resolution.
+    uint32_t ResolutionWanted(uint32_t displayTwelfths)
     {
         static const double forced = [] {
             char value[16];
             return GetEnvironmentVariableA("NIER_RES_SCALE", value, sizeof(value)) ? atof(value) : 0.0;
         }();
         static const uint32_t kSettingTwelfths[] = { 6, 8, 9, 12, 15, 18, 24, 30, 36, 48 };   // 360p 480p 540p 720p 900p 1080p 1440p 1800p 2160p 2880p
+        const int quality = UpscalingQuality();
+        if (forced <= 0.0 && quality > 0 && UpscalingSetting() != 0)
+        {
+            static const double kFactors[] = { 1.0, 1.0, 1.3, 1.5, 1.7, 2.0, 3.0 };
+            return uint32_t(std::clamp(int(displayTwelfths / kFactors[quality] + 0.5), 6, 48));
+        }
         const double asked = forced > 0.0 ? forced : kSettingTwelfths[std::clamp(Settings().resolutionScale.load(), 0, 9)] / 12.0;
         return uint32_t(std::clamp(int(asked * 12.0 + 0.5), 6, 48));
     }
@@ -3912,10 +3936,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
     void ApplyResolutionSetting()
     {
-        const uint32_t wanted = ResolutionWanted(), shadow = ShadowWanted();
         // The display's scale: the largest 16:9 picture that fits the window, against 1280x720.
         const double fit = (std::min)(gWidth / 1280.0, gHeight / 720.0);
         const uint32_t display = uint32_t(std::clamp(int(fit * 12.0 + 0.5), 6, 48));
+        const uint32_t wanted = ResolutionWanted(display), shadow = ShadowWanted();
         if (wanted == gResTwelfths && display == gDisplayTwelfths && shadow == gShadowTwelfths && gResolutionLogged) return;
         if (wanted != gResTwelfths || display != gDisplayTwelfths || shadow != gShadowTwelfths)
         {
