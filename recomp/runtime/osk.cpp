@@ -22,6 +22,8 @@
 
 using namespace Gdiplus;
 
+const wchar_t* AvailableFont(const wchar_t* wanted, const wchar_t* second, const wchar_t* third);   // keyglyphs.cpp
+
 namespace
 {
     constexpr int kCanvasWidth = 1920, kCanvasHeight = 1080;
@@ -226,7 +228,7 @@ bool DrawSmallLabel(const std::string& text, std::vector<uint8_t>& rgba, uint32_
         g.Clear(Color(0, 0, 0, 0));
         SolidBrush plate(Color(150, 0, 0, 0)), ink(Color(255, 240, 240, 235));
         g.FillRectangle(&plate, 0, 0, INT(width), INT(height));
-        FontFamily family(L"Consolas");
+        FontFamily family(AvailableFont(L"Consolas", L"Courier New", L"Arial"));
         Font font(&family, 44, FontStyleBold, UnitPixel);
         StringFormat centred;
         centred.SetAlignment(StringAlignmentCenter);
@@ -260,7 +262,7 @@ bool DrawProgressScreen(uint32_t done, uint32_t total, std::vector<uint8_t>& rgb
         g.SetTextRenderingHint(TextRenderingHintAntiAlias);
         g.Clear(Color(255, 0, 0, 0));
         SolidBrush ink(Color(255, 236, 232, 222)), dim(Color(255, 150, 146, 138)), trough(Color(255, 40, 39, 36));
-        FontFamily family(L"Segoe UI");
+        FontFamily family(AvailableFont(L"Segoe UI", L"Arial", L"Tahoma"));
         Font title(&family, 54, FontStyleRegular, UnitPixel), note(&family, 30, FontStyleRegular, UnitPixel);
         StringFormat centred;
         centred.SetAlignment(StringAlignmentCenter);

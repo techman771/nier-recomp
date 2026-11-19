@@ -43,6 +43,7 @@ void NoteGuestSwap();      // the game submitted a frame (for NIER_FIXED_TIME)
 uint64_t FixedElapsed100ns();   // NIER_FIXED_TIME's elapsed time
 std::string GuestCallChain(int depth);   // current thread's guest call chain (debugging)
 void DumpGuestThreads();  // logs every guest thread's stack and last imports
+void ExpectFaults(bool on);   // the calling thread handles its own faults (__try): the crash handler stands aside
 void WatchInit();
 uint64_t GameTick();      // turns of the game's main loop so far (gametick.cpp)
 void GameTickMarker();    // a recorded route begins now: its time steps are recorded or replayed from here

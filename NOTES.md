@@ -2071,6 +2071,33 @@ muted its music. It now writes 0 to both (the title controls playback, as Xenia 
 - System load beside the frame rate counter (`NIER_SHOW_LOAD=1`, SampleLoad in renderer_d3d12.cpp): the
   system's CPU and GPU use and the game's RAM and VRAM, sampled twice a second.
 
+## Steam Deck (LCD, AMD Van Gogh) through Proton, first run 2026-11-18
+
+What it took to run (Proton Experimental):
+- Microsoft's d3dcompiler_47.dll beside nier.exe and WINEDLLOVERRIDES="d3dcompiler_47=n,b" %command% as
+  the Steam launch options. With Proton's own compiler only the videos showed (their one simple shader
+  compiled; the game's translated shaders did not). With it: 1483 of 1483 shaders and pipelines ready in
+  9.1 s, 0 draws failed.
+- Fonts: Proton has no Segoe UI or Consolas, and GDI+ text in a missing font is not drawn (the frame rate
+  counter, the "Preparing shaders" screen). AvailableFont (keyglyphs.cpp) falls back to Arial / Courier New /
+  Tahoma. Not yet confirmed on the Deck.
+- nier.exe writes recomp/last_run.log itself (main.cpp): output of a program started from Steam is not kept.
+
+The user's first play log (12 minutes, 60 fps cap, 720p shown at 1280x800; "performance is a bit all over
+the place"):
+- Menus 58 fps. Gameplay at 720p without upscaling: 47-57 fps, down to 35-41 in the heaviest stretch.
+- The GPU is not the limit at 720p: its stages add up to 8-10 ms (scene 4-7.5, exposure 1-1.5, post 1,
+  shadows 0.5-1), over 15 only in the heaviest stretch (scene 10.8, shadows 2.3).
+- The GPU command thread is: its own work averages 13.4-14.5 ms on the frames that made 60 fps and 25 ms
+  on the late ones (a quarter to a third of all frames), at about 290 draws a frame. The render thread's
+  recording is 3-10 ms on top. So the Deck is CPU-bound in the translation of the game's draws.
+- FSR 3.1.6 from 540p costs 3.5-5.5 ms of GPU there, more than rendering at 720p saves: 37-46 fps with it.
+- 8 stalls of the main loop of 115-373 ms. In every one the main thread waits in NtWaitForSingleObjectEx
+  under sub_82596EA0 <- sub_82496D00 (what it waits for: not traced). One is the upscaler being switched on.
+- Creating 163 pipelines took 35 s of background time (552 over 5 ms, worst 340 ms); nothing waited on them.
+- Next: a profile of a heavy scene on the Deck (NIER_PROFILE=work12,30 as a launch option) to see which
+  functions of the command thread the time is in.
+
 ## Debugging tools worth taking to another Xbox 360 recompilation
 
 Written 18 November 2026 at the user's request. Most of the tools made here depend on the

@@ -14,6 +14,17 @@
 #include "input.h"
 #include "glyphs.h"
 
+// The first of these fonts the system has (GDI+ must be started). Windows has Segoe UI and Consolas;
+// Proton (the Steam Deck) has neither, and text asked for in a missing font is simply not drawn (the
+// frame rate counter and the "Preparing shaders" screen were blank there), but it has stand-ins for
+// Arial, Courier New, Times New Roman and Tahoma.
+const wchar_t* AvailableFont(const wchar_t* wanted, const wchar_t* second, const wchar_t* third)
+{
+    for (const wchar_t* name : { wanted, second, third })
+        if (Gdiplus::FontFamily(name).IsAvailable()) return name;
+    return wanted;
+}
+
 namespace
 {
     using namespace Gdiplus;
@@ -64,7 +75,7 @@ namespace
 
     void Label(Graphics& g, const std::wstring& text, float cx, float cy, float size)
     {
-        FontFamily family(L"Segoe UI");
+        FontFamily family(AvailableFont(L"Segoe UI", L"Arial", L"Tahoma"));
         Font font(&family, size, FontStyleBold, UnitPixel);
         StringFormat format;
         format.SetAlignment(StringAlignmentCenter);

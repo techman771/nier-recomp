@@ -189,9 +189,42 @@ namespace
         Log("=== end of profile ===\n");
     }
 
+    // One frame up a sampled thread's stack; false where the walk ends. Under Proton (the Steam Deck)
+    // a thread is often stopped inside Wine's own code, whose unwind data led RtlVirtualUnwind through
+    // a null pointer and took the game down with it (the first profile there crashed at once), so a
+    // fault here only ends this sample's walk.
+    bool StepOut(CONTEXT& context, bool innermost)
+    {
+        ExpectFaults(true);   // the crash handler leaves this thread's faults to the __except below
+        __try
+        {
+            DWORD64 imageBase = 0;
+            auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+            if (!function)
+            {
+                // Leaf function without unwind data (innermost frame only): return address is at the
+                // stack pointer.
+                if (!innermost) return false;
+                context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+                context.Rsp += 8;
+                return true;
+            }
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        // (left on: the profiler thread does nothing else that should reach the crash handler)
+    }
+
     void ProfilerThread(uint64_t firstFrame, double workMs, double seconds, bool exitAfter)
     {
-        while (workMs > 0 ? GpuCommandWorkMs() < workMs : GpuFrameCount() < firstFrame) Sleep(50);
+        // By work: not in the first minute, when starting up and loading count as heavy frames.
+        while (workMs > 0 ? (GpuFrameCount() < 1800 || GpuCommandWorkMs() < workMs) : GpuFrameCount() < firstFrame) Sleep(50);
         Log("[profile] sampling from frame %llu for %.0f s\n", (unsigned long long)GpuFrameCount(), seconds);
         GpuResetFrameTiming();
 
@@ -228,20 +261,7 @@ namespace
                     while (sample.count < kMaxFrames && context.Rip)
                     {
                         sample.frames[sample.count++] = context.Rip;
-                        DWORD64 imageBase = 0;
-                        auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
-                        if (!function)
-                        {
-                            // Leaf function without unwind data (innermost frame only): return address
-                            // is at the stack pointer.
-                            if (sample.count > 1) break;
-                            context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
-                            context.Rsp += 8;
-                            continue;
-                        }
-                        void* handlerData = nullptr;
-                        DWORD64 establisher = 0;
-                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+                        if (!StepOut(context, sample.count == 1)) break;
                     }
                 }
                 ResumeThread(handle);

@@ -99,11 +99,14 @@ namespace
         }
     }
 
+    thread_local bool tFaultsExpected = false;
+
     LONG WINAPI CrashHandler(EXCEPTION_POINTERS* info)
     {
         DWORD code = info->ExceptionRecord->ExceptionCode;
         if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_BREAKPOINT)
             return EXCEPTION_CONTINUE_SEARCH;
+        if (tFaultsExpected) return EXCEPTION_CONTINUE_SEARCH;   // the code has its own __except (the profiler's stack walk)
 
         uintptr_t faultAddress = info->ExceptionRecord->NumberParameters > 1 ? info->ExceptionRecord->ExceptionInformation[1] : 0;
         bool isGuest = faultAddress >= uintptr_t(g_base) && faultAddress < uintptr_t(g_base) + 0x100000000ull;
@@ -119,6 +122,9 @@ namespace
 }
 
 namespace { FILE* gCaptureLog = nullptr; }
+// The log of this run beside the program (recomp/last_run.log), whatever started it and wherever its
+// output went: under Proton the output of a program started from Steam is not kept anywhere useful.
+namespace { FILE* gRunLog = nullptr; }
 
 void LogSetCaptureFile(FILE* file)
 {
@@ -138,6 +144,14 @@ void Log(const char* format, ...)
         va_copy(copy, arguments);
         vfprintf(gCaptureLog, format, copy);
         va_end(copy);
+    }
+    if (gRunLog)
+    {
+        va_list copy;
+        va_copy(copy, arguments);
+        vfprintf(gRunLog, format, copy);
+        va_end(copy);
+        fflush(gRunLog);
     }
     vprintf(format, arguments);
     va_end(arguments);
@@ -171,6 +185,7 @@ void FatalGuest(const char* reason, PPCContext& ctx)
     __builtin_unreachable();
 }
 
+void ExpectFaults(bool on) { tFaultsExpected = on; }   // this thread handles its own faults for now
 void InstallCrashHandler() { AddVectoredExceptionHandler(1, CrashHandler); }
 
 // NIER_WATCH_WRITE=<guest address>,<bytes>: logs which guest functions write that range (debugging).
@@ -558,6 +573,25 @@ int main(int argc, char** argv)
     // 100% (a 1080p handheld at 150%) the game is told the screen is smaller (1280x720), draws at
     // that size, and Windows stretches the picture to the panel.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // Started by itself (double-clicked, or added to Steam as a non-Steam game: a .bat file did not
+    // start under Proton on the Steam Deck) rather than by a script that gives the game's folder and
+    // takes the output: work from the executable's own folder, wherever it was started from, and
+    // write the log files a script would have, ..\playtest.log and ..\playtest.log.err.
+    char self[MAX_PATH] = "";
+    if (GetModuleFileNameA(nullptr, self, sizeof(self)))
+        if (char* slash = strrchr(self, '\\'))
+        {
+            *slash = 0;
+            // Not for test runs (NIER_SETTINGS_FILE): several follow each other and keep their own logs.
+            if (GetEnvironmentVariableA("NIER_SETTINGS_FILE", nullptr, 0) == 0) gRunLog = fopen((std::string(self) + "\\..\\last_run.log").c_str(), "w");
+        }
+    if (argc == 1 && GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_DISK)
+    {
+        if (self[0]) SetCurrentDirectoryA(self);
+        freopen("..\\playtest.log", "w", stdout);
+        freopen("..\\playtest.log.err", "w", stderr);
+        if (GetEnvironmentVariableA("NIER_LOG_STALLS", nullptr, 0) == 0) SetEnvironmentVariableA("NIER_LOG_STALLS", "1");
+    }
     std::string gameDir = argc > 1 ? argv[1] : "..\\..\\Nier";
     char* trace = nullptr;
     size_t length = 0;
