@@ -4289,6 +4289,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             }
             slowest = std::max<int64_t>(slowest, perfDone.QuadPart - perfStart.QuadPart);
             if (since == 0) since = perfStart.QuadPart;
+            // How evenly the frames went to the display: the time from each present to the next. The
+            // average rate hides this (60 fps of frames 12 and 21 ms apart judders).
+            static double intervals[600];
+            static int64_t lastPresent = 0;
+            intervals[logged.frames - 1] = lastPresent ? double(perfPresented.QuadPart - lastPresent) * ms : 0.0;
+            lastPresent = perfPresented.QuadPart;
             if (logged.frames == 600)
             {
                 char gpu[256] = "";
@@ -4298,6 +4304,21 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                     frame, 600.0 * double(frequency.QuadPart) / double(perfDone.QuadPart - since), (logged.recordMs + logged.presentMs + logged.gpuWaitMs) / 600.0,
                     logged.recordMs / 600.0, logged.presentMs / 600.0, logged.gpuWaitMs / 600.0, double(slowest) * ms, gpu,
                     Scaled(1280), Scaled(720), gWidth, gHeight, gPerfTotals.upscaler);
+                {
+                    double sorted[600];
+                    memcpy(sorted, intervals, sizeof(sorted));
+                    std::sort(sorted, sorted + 600);
+                    const double median = sorted[300];
+                    int even = 0, longer = 0, shorter = 0;
+                    for (double value : intervals)
+                    {
+                        if (fabs(value - median) <= 1.0) even++;
+                        else if (value > median) longer++;
+                        else shorter++;
+                    }
+                    Log("[perf] present to present: median %.2f ms; %d of 600 within 1 ms of it, %d shorter, %d longer; 1%% each end %.1f and %.1f, longest %.1f; vsync %d, interval %d\n",
+                        median, even, shorter, longer, sorted[6], sorted[593], sorted[599], int(vsync), gPaceInterval);
+                }
                 since = perfDone.QuadPart;
                 slowest = 0;
                 logged = RendererPerf{};
@@ -4507,8 +4528,17 @@ bool RendererDisplayTicksOff() { return gDisplayTicksOff; }
 bool RendererWaitDisplayVblank()
 {
     static const bool off = GetEnvironmentVariableA("NIER_NO_VBLANK_LOCK", nullptr, 0) > 0;   // debugging
+    // Under Wine (Proton, the Steam Deck) IDXGIOutput::WaitForVBlank is no display clock: it is a
+    // timer at the mode's rate that polls the performance counter and yields until its moment, which
+    // kept a core at 97% for a clock no better than the caller's own. The caller's timer is used.
+    static const bool wine = [] {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        const bool found = ntdll && GetProcAddress(ntdll, "wine_get_version");
+        if (found) Log("[present] running under Wine: the game's vblank keeps its own time\n");
+        return found;
+    }();
     const UINT divider = gVblankDivider.load();
-    if (off || !divider || !gReady || !gSwapChain) return false;
+    if (off || wine || !divider || !gReady || !gSwapChain) return false;
     // A display found not to keep time (below) is not waited for at all: waiting for its refreshes
     // first and only then saying "use the timer" left the game ticking at the display's pace.
     static UINT refusedHz = 0, refusedDivider = 0;

@@ -2129,6 +2129,44 @@ the place"):
   overrides. 420p (7 twelfths, a scale no setting used before) drew correctly in the lighthouse,
   and the Deck's log showed the modes switching. Seen on the Deck with the row's first form (no
   Native, values one lower).
+- Frame pacing on the Deck (VSync on, 60 fps, 720p, GPU forced to 1600 MHz so it is not the
+  limit): `[perf] present to present` (every 600 frames: median interval, how many within 1 ms
+  of it, shorter, longer, the 1% ends, the longest) showed 494-545 of 600 on time in play and
+  352-412 in heavier stretches, the late ones at 27-35 ms. `perf record -t <hottest tid>` on the
+  Deck, its addresses named on the PC with `llvm-symbolizer --obj=nier.exe` (the Deck runs the
+  PC's own build, so they match; our profiler names nothing of the exe under Wine), showed the
+  thread at 97% to be the GPU command thread: XXH3 38% (26.7% textures, 11.1% vertex data),
+  BuildDraw 11%, Wine's heap about 15%, CopySwapped and ReadIndices 6% each.
+  - Plain textures of 256 KB or more were hashed in full every frame (24.8 MB a frame in the
+    lighthouse, 16 MB of it one 2048x2048 format 6 texture). One whose hash has come out the
+    same 300 times is now checked by 64 bytes of every 1024 at an offset that moves each frame
+    (16 offsets, each sample taken while the full hash still was), a full hash every 600 frames
+    or when a sample differs: 1.5 MB a frame. `NIER_VERIFY_TEXTURE_HASH=1` takes the full hash
+    too and logs a miss (none in the lighthouse); `NIER_HASH_FULL=1` is the old way. The glyph
+    sheets are plain textures edited in place: a new glyph could be up to 16 frames late. The
+    user saw text draw correctly on the Deck.
+  - Vertex data: a range that has hashed the same 60 times is hashed once a frame (level
+    geometry is drawn two or three times a frame), and from 16 KB up by a moving sample of 64
+    bytes in 512: 8.4 MB a frame to 0.75 MB. `NIER_VERIFY_VERTEX_CACHE=1` found no difference.
+  - `Stream::Next` took a remainder by the buffer's length for every command word (ExecuteStream
+    11% in the Deck's profile of the village overview); now a compare.
+  - Result on the Deck after the texture change alone: 575-593 of 600 on time in play, 59.6-59.8
+    fps, the renderer's recording time 6.4-7.3 ms down to 3.1-3.4. The village overview cutscene
+    still ran at 30-33 fps, CPU bound (GPU 20% busy; render thread recording 11-12 ms a frame).
+    The vertex and stream changes are not measured there yet.
+  - Under Wine `IDXGIOutput::WaitForVBlank` is a timer that polls the performance counter, no
+    display clock; the vblank thread keeps its own time there (RendererWaitDisplayVblank). It
+    made no difference to the late frames.
+  - A late frame at 60 fps no longer waits for the next tick (VblankThread: when the last vblank
+    found no new flip and one is queued, the vblank comes at once and the ticks go on from
+    there; `NIER_FIXED_VBLANK=1` for ticks only). Only with the game's own timer, so not on a PC
+    display whose refreshes are followed (VSync on). On the Deck the village overview went from
+    30-33 fps to 52-55 (median interval 17.0-17.6 ms, 330-395 of 600 within 1 ms of it), play
+    staying at 59.4-59.8.
+  - Left in that cutscene (GPU 34% busy): the render thread spends 38% of its time in memmove,
+    copying each draw's vertex data to the upload arena every frame (recording 3 ms a frame in
+    play, 11 there); the command thread is BuildDraw 23%, DecodeTexture 10%, ReadIndices 10%,
+    ExecuteStream 9%, CopySwapped 8%, hashing 3.5%. Next: keep unchanged vertex data on the GPU.
 - White line down the right edge at 420p (Upscaling Quality's Balanced on the Deck; F12 captures
   from there, replayed on the PC with `NIER_RES_SCALE=0.5833`): at 7/12, 10/12 and 13/12 the
   1280-wide surfaces come to x.67 pixels and `Scaled()` rounded them up, a column wider than the

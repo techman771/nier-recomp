@@ -90,7 +90,17 @@ namespace
     std::unordered_map<uint64_t, VertexKept> gVertexCache;
     uint64_t gVertexCacheBytes = 0;
     // And per place (address, extent, byte order): how often in a row its bytes were new, and until which frame it is just copied.
-    struct VertexRange { uint32_t misses = 0; uint64_t copyUntil = 0; };
+    // (hits, hashedFrame, hashedKey: a range whose bytes have hashed the same 60 times running is
+    // hashed once a frame, and its other draws in that frame take that hash. Level geometry is drawn
+    // two or three times a frame (shadows, the scene), and hashing it for each was 8 MB a frame.)
+    // Such a range of 16 KB or more is then checked the way unchanging plain textures are
+    // (DecodeTexture): 64 bytes of every 512 at an offset that moves on each frame, the sample for
+    // each of the 8 offsets taken while the full hash still was, a full hash every 600 frames.
+    struct VertexRange
+    {
+        uint32_t misses = 0; uint64_t copyUntil = 0; uint32_t hits = 0; uint64_t hashedFrame = ~0ull, hashedKey = 0;
+        uint64_t fullFrame = 0, phases[8] = {}; uint32_t phaseMask = 0;
+    };
     std::unordered_map<uint64_t, VertexRange> gVertexRanges;
 
     // Once a frame: copies nobody drew from for two seconds go (sooner when a lot is held).
@@ -173,14 +183,16 @@ namespace
     struct Stream
     {
         uint32_t base, dwords, read, end;
-        uint32_t Available() const { return (end + dwords - read) % dwords; }
+        // (read and end stay below dwords. No division here: a remainder by a length only known at
+        // run time for every word read was a tenth of the command thread's time on the Steam Deck.)
+        uint32_t Available() const { return end >= read ? end - read : end + dwords - read; }
         uint32_t Next()
         {
             uint32_t value = R32(base + read * 4);
-            read = (read + 1) % dwords;
+            if (++read == dwords) read = 0;
             return value;
         }
-        void Skip(uint32_t count) { read = (read + count) % dwords; }
+        void Skip(uint32_t count) { read += count; if (read >= dwords) read %= dwords; }
     };
 
     uint32_t Swap(uint32_t value, uint32_t endian)
@@ -770,7 +782,8 @@ namespace
         // Hashing the contents on every use dominated the command thread. Small data textures (bone
         // matrices, rewritten between draws) are still hashed every time; the rest once per frame,
         // since the game streams them in between frames.
-        struct HashMemo { uint64_t frame = ~0ull, hash = 0, signature = 0, fullFrame = 0; };
+        // (stable, phases, phaseMask: plain textures that have stopped changing, below.)
+        struct HashMemo { uint64_t frame = ~0ull, hash = 0, signature = 0, fullFrame = 0; uint32_t stable = 0, phaseMask = 0; uint64_t phases[16] = {}; };
         static std::unordered_map<uint64_t, HashMemo> hashMemo;
         static const bool hashEveryUse = GetEnvironmentVariableA("NIER_HASH_EVERY_USE", nullptr, 0) > 0;   // debugging
         // Of the small ones only data textures are (one row, or a float format); hashing every small
@@ -795,6 +808,32 @@ namespace
             static const bool hashFull = GetEnvironmentVariableA("NIER_HASH_FULL", nullptr, 0) > 0;
             uint64_t signature = 0;
             bool unchanged = false;
+            // Plain (uncompressed) textures of 256 KB and more were hashed in full every frame: 25 MB a
+            // frame in the lighthouse, 16 MB of it one 2048x2048 texture, which on the Steam Deck was a
+            // quarter of this thread's time (the thread that decides whether a frame is late there).
+            // They can be edited in place (the glyph sheets are), so no fixed sample will do. Instead:
+            // while a texture's full hash keeps coming out the same, 64 bytes of every 1024 are hashed,
+            // at an offset that moves on each frame, so every byte is looked at once in 16 frames, and
+            // the sample for each of the 16 offsets was taken while the full hash was being checked
+            // too. A sample that differs brings the full hash back for the next 300 uses. As with the
+            // compressed ones, a full hash is taken every ten seconds or so regardless.
+            // NIER_VERIFY_TEXTURE_HASH=1 (testing): the full hash is taken as well and a difference logged.
+            static const bool verifyHash = GetEnvironmentVariableA("NIER_VERIFY_TEXTURE_HASH", nullptr, 0) > 0;
+            const bool plain = memo && blockSize != 4 && !hashFull && levels <= 1 && bytes >= (256u << 10);
+            const uint32_t phase = uint32_t(frameNow & 15);
+            auto plainSample = [&] {
+                uint64_t h = 0x9E3779B97F4A7C15ull + phase;
+                for (uint64_t at = uint64_t(phase) * 64; at + 64 <= bytes; at += 1024) h = XXH3_64bits_withSeed(source + at, 64, h);
+                return h;
+            };
+            if (plain && memo->stable >= 300 && memo->phaseMask == 0xFFFF)
+            {
+                unchanged = plainSample() == memo->phases[phase];
+                if (!unchanged) { memo->stable = 0; memo->phaseMask = 0; }
+                else if (frameNow - memo->fullFrame >= 600 + ((key * 0x9E3779B97F4A7C15ull) >> 55)) unchanged = false;   // its turn for a full hash
+                else if (verifyHash && XXH3_64bits(source, size_t(bytes)) != memo->hash)
+                    Log("[gpu] texture %08X (%ux%u, format %u) changed where the sample did not look (frame %llu)\n", t.base, t.width, t.height, t.format, (unsigned long long)frameNow);
+            }
             if (memo && blockSize == 4 && !hashFull && bytes >= 4096)
             {
                 uint8_t sample[48 * 64];
@@ -847,7 +886,17 @@ namespace
                 }
                 gFrameHashTicks += uint64_t(hashEnd.QuadPart - hashBegin.QuadPart);
                 gFrameHashBytes += bytes + (levels > 1 ? mipBytes : 0);
-                if (memo) *memo = { frameNow, content, signature, frameNow };
+                if (memo)
+                {
+                    const bool same = memo->hash == content && memo->frame != ~0ull;
+                    memo->stable = same ? memo->stable + 1 : 0;
+                    if (!same) memo->phaseMask = 0;
+                    memo->frame = frameNow;
+                    memo->hash = content;
+                    memo->signature = signature;
+                    memo->fullFrame = frameNow;
+                    if (plain && same) { memo->phases[phase] = plainSample(); memo->phaseMask |= 1u << phase; }
+                }
             }
         }
 
@@ -1328,10 +1377,37 @@ namespace
             range = &gVertexRanges[identity];
             if (frameNow >= range->copyUntil)
             {
-                contentKey = identity;
-                for (uint32_t i = 0; i < copyCount; i++)
-                    contentKey = XXH3_64bits_withSeed(copies[i].source + copies[i].first, copies[i].bytes, contentKey);
-                gFrameVertexHashed += totalBytes;
+                const uint32_t phase = uint32_t(frameNow & 7);
+                auto sample = [&] {
+                    uint64_t h = identity + phase;
+                    for (uint32_t i = 0; i < copyCount; i++)
+                        for (uint32_t at = phase * 64; at + 64 <= copies[i].bytes; at += 512)
+                            h = XXH3_64bits_withSeed(copies[i].source + copies[i].first + at, 64, h);
+                    return h;
+                };
+                const bool sampling = totalBytes >= 16384;
+                bool known = range->hashedFrame == frameNow && range->hits >= 60;
+                if (!known && sampling && range->hits >= 60 && range->phaseMask == 0xFF && frameNow - range->fullFrame < 600)
+                {
+                    gFrameVertexHashed += totalBytes / 8;
+                    if (sample() == range->phases[phase]) { known = true; range->hashedFrame = frameNow; }
+                    else { range->hits = 0; range->phaseMask = 0; }
+                }
+                if (known) contentKey = range->hashedKey;
+                else
+                {
+                    contentKey = identity;
+                    for (uint32_t i = 0; i < copyCount; i++)
+                        contentKey = XXH3_64bits_withSeed(copies[i].source + copies[i].first, copies[i].bytes, contentKey);
+                    gFrameVertexHashed += totalBytes;
+                    const bool same = contentKey == range->hashedKey;
+                    range->hits = same ? range->hits + 1 : 0;
+                    if (!same) range->phaseMask = 0;
+                    else if (sampling) { range->phases[phase] = sample(); range->phaseMask |= 1u << phase; }
+                    range->hashedFrame = frameNow;
+                    range->hashedKey = contentKey;
+                    range->fullFrame = frameNow;
+                }
                 auto found = gVertexCache.find(contentKey);
                 if (found != gVertexCache.end() && found->second.data.size() == totalBytes)
                 {
@@ -1997,6 +2073,7 @@ namespace
     // Uncapped frame rate: there is no fixed vblank; one is raised as soon as the game queues a flip
     // (QueueFlipEveryVblank sets this), and at least 60 a second otherwise.
     HANDLE gVblankKick = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    std::atomic<uint32_t> gFlipsQueued{ 0 };   // flips the game has queued (QueueFlipEveryVblank)
 
     void VblankThread()
     {
@@ -2047,13 +2124,32 @@ namespace
             // vblanks up to a millisecond late, and late vblanks delay 60 fps flips.
             next.QuadPart += period;
             const int64_t margin = frequency.QuadPart * 2 / 1000;
+            // A late frame is not held for the next tick. The game flips on a vblank, so a frame that
+            // took 17 ms waited for the tick at 33: any scene a little too heavy for 60 ran at exactly
+            // 30 (the console's double-buffered vsync; on the Steam Deck the village overview sat at
+            // 30-33 fps with frames 33 ms apart). When the last vblank found no new flip and one is
+            // queued now, the vblank comes at once and the ticks carry on from there, so such a scene
+            // runs at the rate it can manage. Only on the 60 fps setting and only with this timer: a
+            // display whose own refreshes are followed (above) keeps to them.
+            // NIER_FIXED_VBLANK=1: ticks only, as before.
+            static const bool fixedTicks = GetEnvironmentVariableA("NIER_FIXED_VBLANK", nullptr, 0) > 0;
+            static uint32_t flipsSeen = 0;
+            static bool lastEmpty = false;
+            const bool adaptive = !fixedTicks && rate == 60 && Settings().frameRate60 == 1;
             if (RendererWaitDisplayVblank()) QueryPerformanceCounter(&next);   // in step with the display
             else for (LARGE_INTEGER now;;)
             {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= next.QuadPart) break;
-                if (next.QuadPart - now.QuadPart > margin) Sleep(1);
+                if (adaptive && lastEmpty && gFlipsQueued.load() != flipsSeen) { next = now; break; }
+                if (adaptive && lastEmpty) WaitForSingleObject(gVblankKick, 1);
+                else if (next.QuadPart - now.QuadPart > margin) Sleep(1);
                 else SwitchToThread();
+            }
+            {
+                const uint32_t flips = gFlipsQueued.load();
+                lastEmpty = flips == flipsSeen;
+                flipsSeen = flips;
             }
             W32(MMIO_BASE + REG_VBLANK_STATUS * 4, 1);
             gVblanks++;
@@ -2125,7 +2221,8 @@ namespace
             ctx.r3.u64 = (word & ~0xF00u) | 0x100u;
         }
         __imp__sub_8257A4B0(ctx, base);
-        if (GuestRefreshHz() == 0) SetEvent(gVblankKick);   // unlocked: the flip's vblank comes at once
+        gFlipsQueued++;
+        SetEvent(gVblankKick);   // unlocked: the flip's vblank comes at once; 60 fps: a late frame's does (VblankThread)
     }
 }
 
