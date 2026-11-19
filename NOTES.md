@@ -2080,7 +2080,7 @@ What it took to run (Proton Experimental):
   9.1 s, 0 draws failed.
 - Fonts: Proton has no Segoe UI or Consolas, and GDI+ text in a missing font is not drawn (the frame rate
   counter, the "Preparing shaders" screen). AvailableFont (keyglyphs.cpp) falls back to Arial / Courier New /
-  Tahoma. Not yet confirmed on the Deck.
+  Tahoma. The user confirmed the frame rate counter draws on the Deck (2026-11-19).
 - nier.exe writes recomp/last_run.log itself (main.cpp): output of a program started from Steam is not kept.
 
 The user's first play log (12 minutes, 60 fps cap, 720p shown at 1280x800; "performance is a bit all over
@@ -2211,6 +2211,172 @@ the place"):
     ExecuteStream 17%, DecodeTexture 15%, BuildDraw's first lambda (a hash sample) 14%, memmove
     8%; the render thread still copies 6.6 MB of constants a frame; the game's own main thread
     is the second busiest at 59%.
+  - Tried and taken out again (2026-11-19): four more cuts to the command thread, from that
+    profile taken by source line (scratch `perflines.py`): the vertex ranges' moving sample
+    (12.4%) replaced by three 64-byte probes a frame with the sample every eighth frame; type 0
+    packets storing the constants (registers from 0x4000) straight into gRegisters (7.8%); a
+    draw's 32 texture slots made on first use (6.4%, and about 4% of the render thread);
+    IM_LOAD recognising a shader by its address and a fast hash of its bytes (4.3%). On the PC
+    they worked: the thread's work 0.9 ms a frame down to 0.6, all three verification switches
+    silent in three replays, a captured frame pixel for pixel the same. On the Deck the command
+    thread fell from 76% of a core to 56%, and the village overview got worse: 55.0-55.8 fps
+    against 58.7, 434-463 of 600 frames on time against 533, the render thread's recording
+    9.2-9.5 ms against 7.6, waiting for the GPU 4.7 against 3.6, the APU drawing 9.4 W against
+    15.2 with the GPU at 1040 MHz against 1600. The user: "feels a lot worse"; same power source
+    both runs. EXPLAINED AFTERWARDS: the GPU clock had dropped from 1600 MHz to 1040 between
+    the two runs (the user had switched from Proton-GE-Latest to Proton Experimental; see the
+    GPU clock entry); with the four changes taken out again the game played the same, at the
+    lower clock. Put back and run with the clock forced to 1600 MHz they read 59.7-59.9 fps in
+    the village overview, 562-571 of 600 frames on time, recording 6.9-7.2 ms (VSync off that
+    run). So these changes were not shown to be at fault
+    and deserve a fair run at a fixed clock. What follows was written before that was known. The whole system ran in a lower gear, CPU work and GPU wait about
+    a quarter slower together, which fits the Deck clocking down once no thread looks busy
+    enough, but that is not shown: `scaling_cur_freq` read 2.4 GHz with a deliberately pinned
+    loop too, so it says nothing, and `gamemoderun` (it starts; governor and EPP stay powersave
+    / balance_performance) made no difference by the user's eye. The changes are in scratch
+    `p26.py` should they be tried one at a time. Before more of the command thread is cut for
+    the Deck, find out what sets its clocks; the game's own main thread (73% of a core there)
+    is the busiest now in any case.
+  - GPU clock, and the Proton version (OPEN; two earlier forms of this note drew conclusions
+    that did not hold, first "the Deck now clocks up by itself", then "the good runs had the
+    clock forced"). What is observed: runs whose sensor log reads 1600 MHz on every sample,
+    none at 200, with the APU at 15 W, played well (60 fps, 562-586 of 600 frames on time in
+    play); runs reading 1040 MHz with dips to 200, at 7.6-9.4 W, played worse (57 fps, 550-560
+    on time, the render thread waiting 7.3 ms a frame for the GPU against 4.4). The user, on
+    2026-11-19: the good runs of that morning were on Proton-GE-Latest with the clock on
+    automatic, and switching to Proton Experimental lowered the clock. That fits the one hard
+    trace: at 09:25 the game's Wine libraries were mapped from `Latest/files/lib/wine` (a GE
+    layout). The evening of 2026-11-18 had the clock forced by hand ("I set the steam deck to
+    1600mhz and 15w"); which Proton each run of that evening used is not recorded. Why a Proton
+    version should change the GPU's clock is not known. To do: the same build and scene on
+    automatic under Proton Experimental, Proton-GE-Latest and a stable Proton, reading clock,
+    power and pacing for each; and every Deck run's log should name its Proton (the first
+    library line of `/proc/<pid>/maps` under `lib/wine` shows it). Comparisons across a change
+    of Proton or of clock setting are void, the next entry's among them.
+    Tested the same day, same build, clock on automatic (`steamosctl get-gpu-performance-level`:
+    auto), no launch options: Proton Experimental 1040 MHz with dips to 200 at 7.5 W; Proton-GE
+    Latest (confirmed from STEAM_COMPAT_TOOL_PATHS) the same, 1040 with dips at 8.3 W. So
+    Proton-GE does not raise the clock by itself, and what held 1600 MHz that morning is still
+    not known (the manual setting of the evening before surviving until the Proton switch is
+    the simplest guess, unproven). What is known to work is forcing the clock.
+    A lead, 11:08 the same day: the Deck's Performance menu and its real state can disagree.
+    The user had Manual GPU Clock switched off in the menu, yet `steamosctl
+    get-gpu-performance-level` said manual, `get-manual-gpu-clock` 1600, the driver's
+    `power_dpm_force_performance_level` manual, and the sensor 1600 MHz for the whole run since
+    its start at 11:04. Nothing of ours set it (only read-only queries have been run there;
+    tools/deck-launch.sh has never run on the Deck). So "the user believed it was on automatic"
+    and "the sensor read 1600" can both have been true that morning. For any Deck measurement
+    read the real state (steamosctl or the sensor log), never the menu.
+    Confirmed a minute later: the user switched the menu's toggle on and off again, and the real
+    state went to auto (steamosctl auto, driver auto, the sensor back to 1040 MHz with dips to
+    200 from 11:09:30). So the toggle had shown off while the manual clock was still in force.
+    How it gets into that state is not known (a switch of Proton version or a restart of the
+    game with the menu already set are the candidates).
+  - The HLSL compiler without a launch option (main.cpp `PreferOwnShaderCompiler`):
+    d3dcompiler_47.dll is linked for delayed loading (compile_ppc.ps1, /DELAYLOAD), and under
+    Wine the game writes `d3dcompiler_47 = native,builtin` to HKCU\Software\Wine\DllOverrides
+    and loads the copy beside nier.exe by its full path before anything compiles. With the
+    launch options empty, both Proton Experimental and Proton-GE Latest mapped only that copy
+    and drew the game. `[proton] HLSL compiler:` names the file taken (in playtest.log for now).
+  - The game cannot (yet) set the clock itself: started from the game through CreateProcess,
+    `/usr/bin/steamosctl` and `/run/host/usr/bin/steamosctl` gave nothing (a read-only probe,
+    since removed). Whether the tool is out of reach inside Proton's container or the way of
+    starting it is wrong is not settled. `tools/deck-launch.sh` does it from outside: sets the
+    clock through steamosctl (which answers to the deck user, SteamOS 3.9.5) while the game
+    runs and puts back what was there; its logic is tested against a stand-in only.
+  - What is left after that is a slight judder, with the limiter (the rate reading 58-60) and,
+    less, without it (the user, 2026-11-19). In the logs every configuration has 5-10% of
+    frames a millisecond or three off the beat: the game's 60 Hz tick is a timer of its own and
+    drifts against the display. An experiment against that, off unless asked for (renderer_d3d12.cpp
+    "Display-locked pacing", `RendererPaceTick`): frames are presented with an interval of 1,
+    the render thread passes on the moment the swap chain's frame latency waitable lets the
+    next frame in, and the vblank timer lets that nudge its tick (half a millisecond earlier at
+    most, three later), so its phase is pulled onto the compositor's. It is on while the file
+    `recomp/pace_lock` exists (looked for once a second: `touch` / `rm` it over SSH while the
+    game runs) or with NIER_PACE_LOCK=1; NIER_PACE_LOCK_ANYWHERE=1 allows it on Windows for
+    testing. `[perf] display-locked pacing:` counts ticks moved onto a signal and ticks left to
+    the timer. The first form waited for the signal with a 25 ms time-out and fell into the
+    known trap on the PC: once frames and signals stopped coming one for one, every tick was
+    the time-out and the game ran at 42 fps. The second form on the PC, lighthouse replay at
+    60 fps with VSync on: 600 of 600 ticks on signals, 582-591 of 600 frames on time, 1-4
+    early (8-13 without it), 8-14 late and those doubled, 59.1-59.3 fps against 59.7. Not a
+    gain there, where the timer already follows the real display. On the Deck (the Aerie,
+    limiter on, clock automatic, switched while the game ran): off 59.6 fps, 571-576 of 600 on
+    time, 15-19 late; on 59.2 then 58.5 fps, 533 then 499 on time, 47 then 69 late, with 600 of
+    600 ticks moved onto signals; off again 59.5 fps, 548-560 on time. So it makes the Deck
+    worse: the signal is there every frame but is no steady point in the refresh (Present
+    returns in 0.03 ms either way), and pulling the tick onto it adds jitter. Taken out of the
+    code again (scratch `p29.py` and `p30.py` hold it); its premise was wrong, see the next entry.
+  - THE JUDDER'S CAUSE, found by the user (2026-11-19): "setting a manual clock to 1100mhz
+    removed the judder". Read at that setting (steamosctl: manual, 1100; sensor 1100 MHz on
+    every sample): 59.8-60.0 fps, 582-593 of 600 frames on time, slowest 1% 17.2-18.8 ms, 7.8 W,
+    67 C (a somewhat lighter spot than the earlier Aerie readings: recording 3.7 ms against
+    5.5-6.1). On automatic the same clock speed (1040 MHz) came with dips to 200 MHz every few
+    seconds in the sensor log, 538-576 on time and 8.6-8.8 W. So the judder is the automatic
+    GPU clock going down and up, not the game's timer drifting against the display as supposed
+    above, and a fixed clock near what automatic reaches is steadier and no dearer.
+    tools/deck-launch.sh now asks for 1100 MHz by default (NIER_GPU_CLOCK=1600 or max for more).
+    tools/deck-launch.sh run on the Deck: around a stand-in it set manual 1100 from auto and
+    from manual 900 and put each back, passing the exit code through; started from Steam's
+    launch options with the real game the Deck read manual 1100, the Aerie 59.8 fps, 566-580 of
+    600 on time, slowest 1% 18.5-19.8 ms, 8.1 W. In the village overview the fixed 1100 MHz
+    does not beat automatic: 58.9-59.5 fps, 515-539 on time, slowest 1% 20.2-28.3 ms, 7.6 W
+    (automatic 59.2-59.4, 530-534, 22.8-28.4 ms, 8.7 W; 1600 MHz 59.7-59.9, 562-571, 18.6-19.5
+    ms, 12.7 W). That scene is short of CPU time (recording 8-9 ms a frame, 6-7 MB of constants
+    copied), and only the faster GPU clock makes room for it. After a real quit from the game's
+    menu the Deck read auto again (steamosctl, the driver, the sensor at 200 MHz) and the script
+    was gone. The kept vertex buffer stood at 101-106 MB there, near its 120 MB drop.
+    Open: doing it without a launch option (the game could not start steamosctl from inside
+    Proton with CreateProcess; other ways not tried), and whether a lower fixed clock would do.
+  - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
+    display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
+    values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as
+    7, a saved 2 (90) is read as 120. 40 runs through the limiter like the rates above 60
+    (`FrameRateCap`). On the PC with `NIER_FRAME_RATE=7`: 39.9-40.0 fps, median interval 25.00
+    ms. The row itself has not been seen on screen.
+  - The Deck's own frame rate limiter (Performance menu) with the game's VSync On gives the
+    "ticks" (the user's finding, 2026-11-19, then measured). The Aerie, same spot, Proton-GE
+    Latest, clock automatic (1040 MHz), 60 fps profile:
+      limiter off, VSync On : 59.5-59.6 fps, 554-556 of 600 on time, slowest 1% 20.9-21.5 ms, 9.8 W
+      limiter on,  VSync On : 56.4-57.6 fps, 538-553 on time, slowest 1% 33.6-33.7 ms, 5-7 frames
+                              of 600 skipped from view to shorten the queue, 8.1 W
+      limiter on,  VSync Off: 59.3-59.9 fps, 554-579 on time, slowest 1% 18.1-25.6 ms, 8.2 W
+    So it is the pair that is bad, not the limiter alone: with VSync On the game presents with
+    an interval of 1 and drops queued frames to stay level, and the limiter holding a frame back
+    makes that happen several times a second; a late frame becomes a doubled one. With VSync Off
+    the game presents at once and gamescope does the pacing. The "57 fps with frames doubled"
+    readings earlier that day were most likely this, not the GPU clock or the Proton version
+    (the limiter's state was not recorded then). Either cure works; under gamescope nothing
+    tears with VSync Off. Done since: under gamescope VSync counts as off whatever the setting
+    says (settings.h `SettingsVsync`: Wine and GAMESCOPE_WAYLAND_DISPLAY set; all three places
+    that acted on the setting read it), so the Deck's default limiter does no harm;
+    `NIER_GAMESCOPE_VSYNC=1` keeps the setting. Run on the Deck in that form, the same spot,
+    limiter on and VSync On in the menu: the log has the gamescope line, the [perf] lines read
+    vsync 0, 59.7-60.0 fps, 565-581 of 600 on time, slowest 1% 18.2-18.9 ms, 10.6 W. (The GPU
+    clock was at 1600 MHz for that run, see the setting read at the time below, so its figures
+    are a little better than the three runs above for that reason too; the test is that the
+    1% tail is at 18 ms and not 33.)
+    Run again with the real state read as auto (1040 MHz), limiter on, VSync On in the menu:
+    59.7-59.8 fps, 538-563 of 600 on time, slowest 1% 19.0-20.3 ms, 8.6 W, 68 C. That is the 60
+    fps profile as people will get it by default.
+  - Recommended Steam Deck settings, DRAFT (to be measured as two whole profiles; the figures
+    are from separate runs of 2026-11-18/19):
+    - 60 fps: Deck refresh 60 Hz, the Deck's limiter on or off, GPU clock automatic; in PC
+      Settings Frame Rate 60 fps, Resolution 720p, Upscaling Off, Shadow Quality High (VSync
+      does nothing in Game Mode). Measured in the Aerie on Proton-GE Latest at the automatic
+      1040 MHz: 59.7-59.8 fps, slowest 1% about 20 ms, 8.6 W. The village overview is heavier
+      at the automatic 1040 MHz (real state read as auto, limiter on): 59.2-59.4 fps, 530-534
+      of 600 frames on time, slowest 1% 22.8-28.4 ms, 8.7 W, 70 C, the busiest thread 58% of a
+      core. With the clock forced to 1600 MHz it read 59.7-59.9 fps, 562-571 on time, slowest 1%
+      18.6-19.5 ms at 12.7 W. So forcing the clock buys a slightly evener heaviest scene for
+      about 4 W: optional, not part of the profile (tools/deck-launch.sh does it).
+    - 40 fps with FSR 3.1: Deck refresh 40 Hz; Frame Rate 40 fps, VSync On, Resolution 720p,
+      Upscaling FSR 3.1, Upscaling Quality Native (anti-aliasing at the screen's resolution),
+      Shadow Quality High. Not run as a profile yet. Native with FSR 3.1 read 41-49 fps in the
+      heavy scene uncapped at 1600 MHz, so it should hold 40 there; power at 40 fps unknown.
+    Proton: both draw without launch options; the user found Proton-GE Latest smoother than
+    Proton Experimental at the same clock (60 against 57 fps in play, in runs that were not of
+    the same spot).
   - The Deck does not always load nier.exe at 0x140000000 (2026-11-19: 0x6ffffbc90000). For
     naming `perf` addresses take the base from the first nier.exe line of `/proc/<pid>/maps`
     and subtract it (scratch `perfsym.py <flat> <exe> <symbolizer> <base>`).

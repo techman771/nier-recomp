@@ -56,7 +56,7 @@ namespace
     {
         return {
             { "borderless", &gSettings.borderless, 0, 1 },
-            { "frame_rate", &gSettings.frameRate60, 0, 6 },
+            { "frame_rate", &gSettings.frameRate60, 0, 7 },
             { "vsync", &gSettings.vsync, 0, 1 },
             { "resolution_scale", &gSettings.resolutionScale, 0, 9 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
@@ -90,13 +90,14 @@ namespace
         T_Uncapped, T_90fps, T_120fps, T_144fps, T_240fps,
         T_FpsCounter, T_FpsCounterHelp,
         T_UpQuality, T_UpQualityHelp, T_UpCustom, T_UpUltraQuality, T_UpQualityMode, T_UpBalanced, T_UpPerformance, T_UpUltraPerformance, T_UpNative,
+        T_40fps,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
         "PC Settings", "Adjust display, frame rate and audio settings for PC.",
         "Display Mode", "Play in a window or in borderless fullscreen\n(also Alt+Enter).",
         "Frame Rate", "60 fps is well tested; higher rates are experimental.\nVSync also limits the game to the display's rate.",
-        "VSync", "Synchronize frames with the display to prevent tearing.",
+        "VSync", "Synchronize frames with the display to prevent tearing.\nOn a Steam Deck the system does this itself.",
         "Master Volume", "Adjust the overall volume.",
         "Mute in Background", "Silence the game while its window isn't focused.",
         "Save PC settings and return to Game Settings.",
@@ -122,6 +123,7 @@ namespace
         "Frame Rate Counter", "Show the current frame rate in the top left corner.",
         "Upscaling Quality", "With Upscaling on, draw the game at a share of the\nscreen's resolution. Native: FSR 3 anti-aliasing only.",
         "Custom", "Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance", "Native",
+        "40 fps",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -163,7 +165,7 @@ namespace
     struct Item { uint32_t id; uint8_t type; std::atomic<int>* value; uint8_t max; Text label, help; Text values[10]; };   // types 2 and 4 name their values
     const Item kItems[] = {
         { 60, 2, &gSettings.borderless, 1, T_DisplayMode, T_DisplayModeHelp, { T_Windowed, T_Borderless } },
-        { 61, 4, &gSettings.frameRate60, 6, T_FrameRate, T_FrameRateHelp, { T_30fps, T_60fps, T_90fps, T_120fps, T_144fps, T_240fps, T_Uncapped } },
+        { 61, 4, &gSettings.frameRate60, 6, T_FrameRate, T_FrameRateHelp, { T_30fps, T_40fps, T_60fps, T_120fps, T_144fps, T_240fps, T_Uncapped } },   // in menu order: see MenuValue
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.resolutionScale, 9, T_Resolution, T_ResolutionHelp, { T_Res360, T_Res480, T_Res540, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
@@ -175,6 +177,23 @@ namespace
         { 65, 6, &gSettings.mouseSensitivity, 10, T_MouseSensitivity, T_MouseSensitivityHelp, {} },
         { 66, 4, &gSettings.buttonIcons, 5, T_Icons, T_IconsHelp, { T_IconAuto, T_IconXbox, T_IconPs4, T_IconPs5, T_IconSteam, T_IconOriginal } },
     };
+    // The Frame Rate row lists 30, 40, 60, 120, 144, 240 and Uncapped. Stored values are older than
+    // that list: 40 fps was added later and is stored as 7, after the others, and 90 fps (stored as
+    // 2) was taken off the list (it still works when set in settings.ini's place by
+    // NIER_FRAME_RATE; a saved 90 is read as 120). The row's position for a stored value, and back.
+    int MenuValue(const Item& item, int stored)
+    {
+        if (item.value != &gSettings.frameRate60) return stored;
+        static const int kPosition[8] = { 0, 2, 3, 3, 4, 5, 6, 1 };
+        return kPosition[std::clamp(stored, 0, 7)];
+    }
+    int StoredValue(const Item& item, int menu)
+    {
+        if (item.value != &gSettings.frameRate60) return menu;
+        static const int kStored[7] = { 0, 7, 1, 3, 4, 5, 6 };
+        return kStored[std::clamp(menu, 0, 6)];
+    }
+
     // The number of the item's last value: Upscaling ends with FSR 4 only on a system that has it.
     int ItemMax(const Item& item)
     {
@@ -223,7 +242,7 @@ namespace
         {
             const int max = ItemMax(item);
             const Text help = item.value == &gSettings.upscaling && max == 3 ? Text(T_UpscalingHelp4) : item.help;
-            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t((std::min)(item.value->load(), max)), 0, uint8_t(max), (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, help);
+            WriteRecord(first + n++ * kRecordSize, item.type, uint8_t((std::min)(MenuValue(item, item.value->load()), max)), 0, uint8_t(max), (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, help);
         }
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysButtons, T_KeysButtons, T_KeysButtonsHelp);
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysMove, T_KeysMove, T_KeysMoveHelp);
@@ -269,7 +288,7 @@ namespace
             const uint32_t record = menu + kRecords + i * kRecordSize;
             const Item* item = FindItem(R32(record + 40));
             if (!item || (!includeDisplayMode && item->value == &gSettings.borderless)) continue;
-            item->value->store(std::clamp(int(int8_t(R8(record + 1))), 0, ItemMax(*item)));
+            item->value->store(StoredValue(*item, std::clamp(int(int8_t(R8(record + 1))), 0, ItemMax(*item))));
         }
     }
 
@@ -313,6 +332,7 @@ void SettingsLoad()
                 if (strcmp(field.key, key) == 0) field.value->store(std::clamp(value, field.min, field.max));
             // The setting's name before it had more than three values (0 30 fps, 1 60 fps, 2 and up uncapped).
             if (strcmp(key, "frame_rate_60") == 0) gSettings.frameRate60 = value <= 0 ? 0 : value == 1 ? 1 : 6;
+            if (strcmp(key, "frame_rate") == 0 && value == 2) gSettings.frameRate60 = 3;   // 90 fps is no longer offered: 120
             if (strncmp(key, "key_", 4) == 0) InputSetKeyById(key + 4, std::clamp(value, 0, 254));
         }
         fclose(file);
@@ -324,7 +344,7 @@ void SettingsLoad()
     if (GetEnvironmentVariableA("NIER_60FPS", value, sizeof(value))) gSettings.frameRate60 = value[0] != '0';
     if (GetEnvironmentVariableA("NIER_30FPS", value, sizeof(value))) gSettings.frameRate60 = 0;
     if (GetEnvironmentVariableA("NIER_VSYNC", value, sizeof(value))) gSettings.vsync = value[0] != '0';
-    if (GetEnvironmentVariableA("NIER_FRAME_RATE", value, sizeof(value))) gSettings.frameRate60 = std::clamp(atoi(value), 0, 6);   // the setting's index
+    if (GetEnvironmentVariableA("NIER_FRAME_RATE", value, sizeof(value))) gSettings.frameRate60 = std::clamp(atoi(value), 0, 7);   // the setting's index
 }
 
 void SettingsSave()
@@ -467,10 +487,22 @@ void TitleQuitToDesktop(PPCRegister& r31)
 // millisecond waited for the next one: 33 ms instead of 17.7, a hitch the rates above 60 never
 // showed, because those are paced by a limiter (a vblank when the frame is ready, no sooner than
 // the limit allows). So there 60 is a limit like the others. NIER_FIXED_60=1: the timer, as before.
+bool SettingsVsync()
+{
+    static const bool gamescope = [] {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        const bool found = ntdll && GetProcAddress(ntdll, "wine_get_version") && GetEnvironmentVariableA("GAMESCOPE_WAYLAND_DISPLAY", nullptr, 0) > 0 &&
+            GetEnvironmentVariableA("NIER_GAMESCOPE_VSYNC", nullptr, 0) == 0;
+        if (found) Log("[settings] running under gamescope: VSync counts as off (the compositor paces the frames)\n");
+        return found;
+    }();
+    return gSettings.vsync.load() != 0 && !gamescope;
+}
+
 static bool LimiterAt60()
 {
     static const bool fixed = GetEnvironmentVariableA("NIER_FIXED_60", nullptr, 0) > 0;
-    return !fixed && (!gSettings.vsync.load() || RendererDisplayTicksOff());
+    return !fixed && (!SettingsVsync() || RendererDisplayTicksOff());
 }
 
 int GuestRefreshHz()
@@ -492,6 +524,7 @@ int FrameRateCap()
     case 3: return 120;
     case 4: return 144;
     case 5: return 240;
+    case 7: return 40;
     default: return 0;
     }
 }

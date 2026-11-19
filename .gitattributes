@@ -1,0 +1,2 @@
+# Shell scripts run on Linux (the Steam Deck): never CRLF, whatever the checkout.
+*.sh text eol=lf

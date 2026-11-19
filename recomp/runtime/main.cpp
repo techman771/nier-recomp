@@ -558,6 +558,37 @@ void RegisterGuestThread(PPCContext* ctx)
     gThreads.push_back({ ctx, tRecent, &tRecentNext, thread });
 }
 
+// Under Wine (Proton, the Steam Deck): the HLSL compiler must be Microsoft's d3dcompiler_47.dll,
+// shipped beside nier.exe. Wine's own takes its place by default and cannot compile the game's
+// shaders (only the videos drew). Until now the user had to say so in Steam's launch options
+// (WINEDLLOVERRIDES="d3dcompiler_47=n,b"). The DLL is now linked for delayed loading
+// (tools/compile_ppc.ps1), so nothing has loaded it when this runs: the same wish is written
+// where Wine looks for it next, HKCU\Software\Wine\DllOverrides, which it reads for every load,
+// and the copy beside the executable is loaded by its full path. The log says which file was
+// taken. With the launch option still set nothing changes: it comes first.
+static void PreferOwnShaderCompiler(const char* folder)
+{
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    const bool wine = ntdll && GetProcAddress(ntdll, "wine_get_version");
+    const std::string own = std::string(folder) + "\\d3dcompiler_47.dll";
+    if (wine && GetFileAttributesA(own.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        HKEY key = nullptr;
+        if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\DllOverrides", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS)
+        {
+            const char order[] = "native,builtin";
+            RegSetValueExA(key, "d3dcompiler_47", 0, REG_SZ, reinterpret_cast<const BYTE*>(order), sizeof(order));
+            RegCloseKey(key);
+        }
+        LoadLibraryA(own.c_str());
+    }
+    if (!wine) return;
+    char loaded[MAX_PATH] = "(not loaded)";
+    if (HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll")) GetModuleFileNameA(compiler, loaded, sizeof(loaded));
+    Log("[proton] HLSL compiler: %s%s\n", loaded,
+        _stricmp(loaded, own.c_str()) ? " (not the one beside nier.exe: if only videos draw, put Microsoft's d3dcompiler_47.dll there)" : "");
+}
+
 int main(int argc, char** argv)
 {
     // The build uses AVX2 (tools/compile_ppc.ps1): say so plainly on a processor without it, rather
@@ -592,6 +623,7 @@ int main(int argc, char** argv)
         freopen("..\\playtest.log.err", "w", stderr);
         if (GetEnvironmentVariableA("NIER_LOG_STALLS", nullptr, 0) == 0) SetEnvironmentVariableA("NIER_LOG_STALLS", "1");
     }
+    if (self[0]) PreferOwnShaderCompiler(self);
     std::string gameDir = argc > 1 ? argv[1] : "..\\..\\Nier";
     char* trace = nullptr;
     size_t length = 0;

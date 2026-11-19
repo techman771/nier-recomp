@@ -6,7 +6,10 @@
 struct PcSettings
 {
     std::atomic<int> borderless{ 1 };          // display mode: 0 windowed, 1 borderless fullscreen
-    std::atomic<int> frameRate60{ 1 };         // Frame Rate: 0 the original 30 fps cap, 1 60 fps, 2 90, 3 120, 4 144, 5 240, 6 uncapped
+    // Frame Rate: 0 the original 30 fps cap, 1 60 fps, 2 90, 3 120, 4 144, 5 240, 6 uncapped, 7 40 fps
+    // (added later, for handhelds on a 40 Hz display: numbered last so saved settings keep their
+    // meaning; the menu shows it between 30 and 60).
+    std::atomic<int> frameRate60{ 1 };
     std::atomic<int> vsync{ 1 };
     // Internal resolution (applied between frames): 0 640x360, 1 854x480, 2 960x540, 3 1280x720 (the original),
     // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
@@ -27,6 +30,12 @@ struct PcSettings
 };
 
 PcSettings& Settings();
+// VSync as it is to be acted on: the setting, except under gamescope (the Steam Deck's compositor,
+// Game Mode), where it counts as off whatever the setting says. gamescope shows whole frames at the
+// display's pace by itself, and with VSync on its frame limiter, which most people leave on, made
+// the game present late and drop frames to catch up: 56-58 fps with frames doubled in the Aerie,
+// against 59-60 with VSync off, same spot (2026-11-19). NIER_GAMESCOPE_VSYNC=1 keeps the setting.
+bool SettingsVsync();
 void SettingsLoad();     // reads settings.ini, then applies environment overrides
 void SettingsSave();
 // The rate of the game's vertical blank, which is what paces its frames: 60 Hz, or 0 for the

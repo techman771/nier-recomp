@@ -4257,7 +4257,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             gWriteBackUsed = 0;
         };
         if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); FrameOutOfHand(); }
-        const bool vsync = Settings().vsync != 0;
+        const bool vsync = SettingsVsync();
         const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
         // Even frame pacing: on a display refreshing at a multiple of 60 Hz (120, 180, 240) a 60 fps
         // frame presented at the next refresh lasted 3, 4 or 5 refreshes depending on when it happened

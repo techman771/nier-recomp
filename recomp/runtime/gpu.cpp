@@ -96,10 +96,16 @@ namespace
     // Such a range of 16 KB or more is then checked the way unchanging plain textures are
     // (DecodeTexture): 64 bytes of every 512 at an offset that moves on each frame, the sample for
     // each of the 8 offsets taken while the full hash still was, a full hash every 600 frames.
+    // The moving sample was itself 12% of this thread in a wide scene on the Steam Deck (a cache
+    // miss for every 512 bytes of all the geometry in view, every frame). A range is now sampled
+    // that way on every eighth frame only (which frame depends on the range, so the work is spread),
+    // and on the others three probes are hashed: the first, middle and last 64 bytes of each
+    // buffer, which catch the case that matters at once, a buffer given to other geometry.
     struct VertexRange
     {
         uint32_t misses = 0; uint64_t copyUntil = 0; uint32_t hits = 0; uint64_t hashedFrame = ~0ull, hashedKey = 0;
         uint64_t fullFrame = 0, phases[8] = {}; uint32_t phaseMask = 0;
+        uint64_t probe = 0;
     };
     std::unordered_map<uint64_t, VertexRange> gVertexRanges;
 
@@ -463,7 +469,8 @@ namespace
     }
 
     // Shader microcode as last uploaded by the game, kept by stage (0 vertex, 1 pixel).
-    struct ShaderCapture { std::vector<uint32_t> words; uint64_t hash = 0; };
+    // (words: the microcode, in gShaderLibrary, whose entries never move or go.)
+    struct ShaderCapture { const std::vector<uint32_t>* words = nullptr; uint64_t hash = 0; };
     ShaderCapture gShaders[2];
     std::map<uint64_t, std::vector<uint32_t>> gShaderLibrary[2];
 
@@ -509,7 +516,6 @@ namespace
         uint64_t hash = 1469598103934665603ull;
         for (uint32_t w : words) hash = (hash ^ w) * 1099511628211ull;
         gShaders[stage].hash = hash;
-        gShaders[stage].words = words;
         if (!gShaderLibrary[stage].count(hash) && words.size() > 24 && !words[0] && !words[1] && !words[2])
         {
             // Real programs never start with zeros. This happened when D3D read microcode through a
@@ -524,6 +530,27 @@ namespace
             WriteDumpLater(path, words.data(), words.size() * 4);
             gShaderLibrary[stage][hash] = std::move(words);
         }
+        gShaders[stage].words = &gShaderLibrary[stage][hash];
+    }
+
+    // IM_LOAD names its microcode by address, and the game sets the same few hundred shaders over
+    // and over: thousands of loads a frame in a wide scene, each read word by word into a new list,
+    // hashed a word at a time and looked up twice (4% of the command thread on the Steam Deck).
+    // What was loaded from an address is remembered with a fast hash of the game's bytes there;
+    // when those are the same the shader is the one already known. False: not known, load it.
+    struct ShaderLoad { uint64_t bytesHash = 0, hash = 0; const std::vector<uint32_t>* words = nullptr; };
+    std::unordered_map<uint64_t, ShaderLoad> gShaderLoads;
+
+    bool StoreKnownShader(uint32_t stage, uint32_t guest, uint32_t dwords, ShaderLoad*& load, uint64_t& bytesHash)
+    {
+        load = nullptr;
+        if (stage > 1 || !dwords) return false;
+        bytesHash = XXH3_64bits(g_base + guest, size_t(dwords) * 4) | 1;
+        load = &gShaderLoads[uint64_t(guest) | uint64_t(dwords) << 32 | uint64_t(stage) << 48];
+        if (load->bytesHash != bytesHash) return false;
+        gShaders[stage].hash = load->hash;
+        gShaders[stage].words = load->words;
+        return true;
     }
 
     const std::vector<uint32_t>* ShaderWords(bool pixel, uint64_t hash)
@@ -549,12 +576,12 @@ namespace
     CachedShader* ShaderFor(uint32_t stage)
     {
         ShaderCapture& capture = gShaders[stage];
-        if (capture.words.empty()) return nullptr;
+        if (!capture.words || capture.words->empty()) return nullptr;
         auto found = gTranslated[stage].find(capture.hash);
         if (found != gTranslated[stage].end()) return &found->second;
 
         CachedShader entry;
-        entry.info = TranslateShader(capture.words, stage == 1, capture.hash);
+        entry.info = TranslateShader(*capture.words, stage == 1, capture.hash);
         if (!entry.info.ok) Log("[shader] %s %016llX not translated: %s\n", stage ? "pixel" : "vertex", capture.hash, entry.info.error.c_str());
         auto shader = std::make_shared<GuestShader>();
         shader->hash = capture.hash;
@@ -1500,20 +1527,40 @@ namespace
             range = &gVertexRanges[identity];
             if (frameNow >= range->copyUntil)
             {
-                const uint32_t phase = uint32_t(frameNow & 7);
-                auto sample = [&] {
+                auto sample = [&](uint32_t phase) {
                     uint64_t h = identity + phase;
                     for (uint32_t i = 0; i < copyCount; i++)
                         for (uint32_t at = phase * 64; at + 64 <= copies[i].bytes; at += 512)
                             h = XXH3_64bits_withSeed(copies[i].source + copies[i].first + at, 64, h);
                     return h;
                 };
+                auto probe = [&] {
+                    uint64_t h = identity;
+                    for (uint32_t i = 0; i < copyCount; i++)
+                    {
+                        const uint8_t* bytes = copies[i].source + copies[i].first;
+                        const uint32_t size = copies[i].bytes;
+                        if (size < 192) { h = XXH3_64bits_withSeed(bytes, size, h); continue; }
+                        h = XXH3_64bits_withSeed(bytes, 64, h);
+                        h = XXH3_64bits_withSeed(bytes + (size / 2 & ~3u), 64, h);
+                        h = XXH3_64bits_withSeed(bytes + size - 64, 64, h);
+                    }
+                    return h;
+                };
                 const bool sampling = totalBytes >= 16384;
                 bool known = range->hashedFrame == frameNow && range->hits >= 60;
                 if (!known && sampling && range->hits >= 60 && range->phaseMask == 0xFF && frameNow - range->fullFrame < 600)
                 {
-                    gFrameVertexHashed += totalBytes / 8;
-                    if (sample() == range->phases[phase]) { known = true; range->hashedFrame = frameNow; }
+                    const uint64_t turn = frameNow + (identity >> 20);   // this range's own count of frames
+                    bool same = probe() == range->probe;
+                    gFrameVertexHashed += copyCount * 192;
+                    if (same && (turn & 7) == 0)
+                    {
+                        const uint32_t phase = uint32_t(turn >> 3) & 7;
+                        same = sample(phase) == range->phases[phase];
+                        gFrameVertexHashed += totalBytes / 8;
+                    }
+                    if (same) { known = true; range->hashedFrame = frameNow; }
                     else { range->hits = 0; range->phaseMask = 0; }
                 }
                 if (known) contentKey = range->hashedKey;
@@ -1526,7 +1573,15 @@ namespace
                     const bool same = contentKey == range->hashedKey;
                     range->hits = same ? range->hits + 1 : 0;
                     if (!same) range->phaseMask = 0;
-                    else if (sampling) { range->phases[phase] = sample(); range->phaseMask |= 1u << phase; }
+                    else if (sampling)
+                    {
+                        // One offset's sample for each full hash, whichever is still missing.
+                        uint32_t phase = 0;
+                        while (phase < 7 && (range->phaseMask >> phase & 1)) phase++;
+                        range->phases[phase] = sample(phase);
+                        range->phaseMask |= 1u << phase;
+                        range->probe = probe();
+                    }
                     range->hashedFrame = frameNow;
                     range->hashedKey = contentKey;
                     range->fullFrame = frameNow;
@@ -2036,10 +2091,14 @@ namespace
             uint32_t addressType = s.Next();
             uint32_t startSize = s.Next();
             uint32_t guest = PhysicalToGuest(addressType & ~3u);
+            const uint32_t stage = addressType & 3;
+            ShaderLoad* load = nullptr;
+            uint64_t bytesHash = 0;
+            if (StoreKnownShader(stage, guest, startSize & 0xFFFF, load, bytesHash)) break;
             std::vector<uint32_t> words(startSize & 0xFFFF);
             for (size_t i = 0; i < words.size(); i++) words[i] = R32(guest + uint32_t(i) * 4);
-            const uint32_t stage = addressType & 3;
             StoreShader(stage, std::move(words));
+            if (load) *load = { bytesHash, gShaders[stage].hash, gShaders[stage].words };
             if (stage <= 1)
             {
                 static std::set<uint64_t> logged;   // where each shader's microcode lives (debugging)
@@ -2141,7 +2200,13 @@ namespace
                 uint32_t index = header & 0x7FFF, count = ((header >> 16) & 0x3FFF) + 1;
                 bool oneRegister = (header >> 15) & 1;
                 if (count > s.Available()) goto corrupt;
-                for (uint32_t i = 0; i < count; i++) WriteRegister(oneRegister ? index : index + i, s.Next());
+                // The shader constants (0x4000 on) are most of what these packets carry, in runs of
+                // dozens of words, and none of those registers does anything when written: stored
+                // straight, without WriteRegister's tests for each word.
+                if (!oneRegister && index >= 0x4000 && index + count <= REG_COUNT)
+                    for (uint32_t i = 0; i < count; i++) gRegisters[index + i] = s.Next();
+                else
+                    for (uint32_t i = 0; i < count; i++) WriteRegister(oneRegister ? index : index + i, s.Next());
             }
             else if (type == 1)
             {
@@ -2224,7 +2289,7 @@ namespace
                 // refresh (240, 120, 80...), where a variable refresh display shows it when it is ready.
                 // The Frame Rate setting's own limit (90, 120, 144, 240) works the same way: the larger
                 // of the two gaps applies.
-                int64_t gap = Settings().vsync ? frequency.QuadPart / std::max<int64_t>(RendererDisplayHz(), 30) : frequency.QuadPart / 1000;
+                int64_t gap = SettingsVsync() ? frequency.QuadPart / std::max<int64_t>(RendererDisplayHz(), 30) : frequency.QuadPart / 1000;
                 if (const int cap = FrameRateCap()) gap = std::max<int64_t>(gap, frequency.QuadPart / cap);
                 // The earliest moment for the next vblank steps on by the gap from the one before, so the
                 // rate averages the limit exactly; after a pause it starts again from now.

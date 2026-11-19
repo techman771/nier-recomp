@@ -58,6 +58,42 @@ struct TextureBinding
     float expScale = 1.0f;   // 2^exp_adjust from the fetch constant (dword 3 bits 13-18): scales every sampled value
 };
 
+// A draw's 32 texture slots (one per fetch constant). A slot is only made when it is first written:
+// a draw uses two to four of them, and making, copying and destroying all 32 for every draw was 6%
+// of the command thread and 4% of the render thread in a wide scene on the Steam Deck. Reading a
+// slot that was never written gives an empty binding (valid false).
+class TextureSet
+{
+    alignas(TextureBinding) unsigned char storage[32 * sizeof(TextureBinding)];
+    uint32_t used = 0;
+    TextureBinding* at(size_t slot) { return reinterpret_cast<TextureBinding*>(storage) + slot; }
+    const TextureBinding* at(size_t slot) const { return reinterpret_cast<const TextureBinding*>(storage) + slot; }
+    void clear() { for (uint32_t bits = used; bits; bits &= bits - 1) at(Lowest(bits))->~TextureBinding(); used = 0; }
+    static uint32_t Lowest(uint32_t bits) { uint32_t n = 0; while (!(bits >> n & 1)) n++; return n; }
+    static const TextureBinding& Empty() { static const TextureBinding empty; return empty; }
+public:
+    TextureSet() {}
+    TextureSet(const TextureSet& other) { for (uint32_t bits = other.used; bits; bits &= bits - 1) new (at(Lowest(bits))) TextureBinding(*other.at(Lowest(bits))); used = other.used; }
+    TextureSet(TextureSet&& other) noexcept { for (uint32_t bits = other.used; bits; bits &= bits - 1) new (at(Lowest(bits))) TextureBinding(std::move(*other.at(Lowest(bits)))); used = other.used; }
+    TextureSet& operator=(const TextureSet& other) { if (this != &other) { clear(); new (this) TextureSet(other); } return *this; }
+    TextureSet& operator=(TextureSet&& other) noexcept { if (this != &other) { clear(); new (this) TextureSet(std::move(other)); } return *this; }
+    ~TextureSet() { clear(); }
+    size_t size() const { return 32; }
+    TextureBinding& operator[](size_t slot) { if (!(used >> slot & 1)) { new (at(slot)) TextureBinding(); used |= 1u << slot; } return *at(slot); }
+    const TextureBinding& operator[](size_t slot) const { return (used >> slot & 1) ? *at(slot) : Empty(); }
+    template <class Set, class Binding> struct Iterator
+    {
+        Set* set; size_t slot;
+        Binding& operator*() const { return (*set)[slot]; }
+        Iterator& operator++() { slot++; return *this; }
+        bool operator!=(const Iterator& other) const { return slot != other.slot; }
+    };
+    Iterator<TextureSet, TextureBinding> begin() { return { this, 0 }; }
+    Iterator<TextureSet, TextureBinding> end() { return { this, 32 }; }
+    Iterator<const TextureSet, const TextureBinding> begin() const { return { this, 0 }; }
+    Iterator<const TextureSet, const TextureBinding> end() const { return { this, 32 }; }
+};
+
 struct RenderTargetKey
 {
     uint32_t edramBase = 0, width = 0, height = 0;
@@ -137,7 +173,7 @@ struct RendererDraw
     std::array<uint32_t, 96> vertexBase{};
     std::array<float, 2048> constants;         // not initialized (see the constructor)
     std::array<uint32_t, 8> boolConstants{};
-    std::array<TextureBinding, 32> textures;   // one per fetch constant
+    TextureSet textures;                       // one per fetch constant
     bool bypassViewport = false;
     float ndcScale[2] = { 1, 1 }, ndcOffset[2] = { 0, 0 };
     float viewport[4] = { 0, 0, 1, 1 };
