@@ -2500,6 +2500,48 @@ the place"):
     36.9-42.8 fps in the cutscene, median present to present 19-31 ms, 42-157 of 600 on the
     median; recording 8.9-10.9 ms plus 6.5-7.2 waiting for the GPU. So the overlap is not what
     makes the remaining late frames: without it this scene is nowhere near 60.
+  - Late frame trace (2026-11-19): `NIER_LOG_LATE=1`, or a file `recomp/late_on` when the
+    renderer starts. One `[late]` line for each frame presented more than 1.3 times the usual
+    interval after the one before (at most 24 in 600 frames), with the game's side (arrived how
+    long after the frame before, waited for room, lay queued) and the render thread's (free
+    before it came, waiting for its set, recording, handing to the GPU, swap chain, Present).
+    `RendererFrame::handOverBegan` / `queued` carry the game's times.
+    First reading, Deck, village overview at 60 fps (720p FSR 3.1 Native, 1300 MHz, overlap
+    on), 8 late frames in the cutscene: six had the game on time (16.7 ms after the frame
+    before), recording as usual (7-12 ms), nothing to wait for on the GPU (the frame before had
+    finished there) and then 13-22 ms waiting for the swap chain, where 6.5 is usual; two had
+    the recording itself take 15 and 24 ms. So most of what is left is on the presenting side:
+    the frame before had been drawn and was not yet taken by the display. The GPU is at
+    99-100% busy there with 14 ms of stages in 16.7 and gamescope scaling 720p to the panel
+    on top, which is the likely reason (not shown: a run at a higher GPU clock would tell).
+    The long ones at scene changes are the game arriving late (70-140 ms) or a long recording
+    (24-60 ms) and are another matter.
+    The run at 1600 MHz (read from steamosctl; else the same) says the GPU clock is not it:
+    59.5-59.7 fps with 6-16 long frames a window, the same picture in the trace (game on
+    time, 10-24 ms waiting for the swap chain), and the same kind of late frame in light
+    scenes where the GPU has most of the frame to spare (frames 2561-5528: recording 3-6 ms,
+    swap chain 20-30). The GPU stages were no shorter at 1600 and recording was longer
+    (10.5-11.2 ms): the CPU ran at 2400-2700 MHz against 3100-3500, the two sharing 15 W. So
+    1600 gains nothing here, and the late frames are in how frames meet the display: the wait
+    for the swap chain follows the display's refreshes, the game's frames come from its own 60
+    Hz timer, and where the two drift past each other a frame waits a refresh more.
+    Second thoughts the same day, nothing new measured: (1) the 1600 MHz run gave the GPU no
+    more room (its stages were no shorter), so it does not rule out a full GPU in the heavy
+    scene; only the late frames in light scenes do that, and there are few of them (about one
+    in ten seconds), so there may be two causes. (2) Taking the game's tick from the swap
+    chain's release would not help: in the late frames the game was early and its frame lay
+    queued 4-13 ms for the render thread. Not built.
+    The trace was extended to tell the two apart (overlap only): a second `[late]` line for
+    the frame before (handed to the GPU how long before its present, finished there how long
+    after, the swap chain taking the next how long after) and a summary of those every 600
+    frames; DeliveryThread notes when the GPU finished each frame (`gGpuDone`). Works on the
+    PC; not yet read on the Deck. The user called the performance good enough for now
+    (2026-11-19), so this is where it rests.
+  - Overlap is the default (2026-11-19, at the user's word, after the Deck runs above and
+    before any long play session with it). Off with `NIER_OVERLAP=0` or a file
+    `recomp/overlap_off`; the log says which ("overlap on" / "overlap off"). The earlier
+    `recomp/overlap_on` file no longer means anything. What to watch for is the exposure: the
+    read-backs reach the game 1 to 3 frames late at 240 fps where it was a steady 2.
   - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
     display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
     values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as

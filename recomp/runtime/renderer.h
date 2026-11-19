@@ -214,6 +214,9 @@ struct RendererFrame
     uint64_t frame = 0;
     std::vector<RendererCommand> commands;
     uint32_t scanoutBase = 0;                  // resolve destination to display; 0 for none
+    // Set by RendererSubmitFrame (performance counter ticks): when the game arrived with the
+    // frame and when it was queued (it may wait for room in between). For the late frame trace.
+    int64_t handOverBegan = 0, queued = 0;
 };
 
 // `nativeWindow` is the platform's window handle.

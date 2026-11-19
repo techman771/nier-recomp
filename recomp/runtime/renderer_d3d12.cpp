@@ -129,7 +129,7 @@ float4 PSMain(Interpolated input) : SV_Target
     UINT64 gFenceValue = 0;
     HANDLE gFenceEvent = nullptr, gFrameWait = nullptr;
     // The next frame is recorded while the GPU still draws the last one (RenderFrame; chosen when
-    // the renderer starts): everything a frame's commands read that the CPU fills in exists twice
+    // the renderer starts, on unless switched off, CreateDeviceObjects): everything a frame's commands read that the CPU fills in exists twice
     // and frames take the two sets in turn. Whoever needs the GPU idle calls WaitForGpu first.
     bool gOverlap = false;
 
@@ -3680,7 +3680,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
     // gOverlap: the render thread does not wait for a frame's GPU work, so this thread does, and
     // hands the game its read-backs the moment they exist (as early as the render thread did).
-    struct Delivery { UINT64 fence = 0; ComPtr<ID3D12Resource> buffer; UINT64 used = 0; std::vector<PendingWriteBack> pendings; uint64_t guestFrame = 0, number = 0; };
+    struct Delivery { UINT64 fence = 0; ComPtr<ID3D12Resource> buffer; UINT64 used = 0; std::vector<PendingWriteBack> pendings; uint64_t guestFrame = 0, number = 0, sequence = 0; };
+    // For the late frame trace (RenderFrame), by a frame's sequence number & 7: when the GPU
+    // finished it (performance counter ticks, set by DeliveryThread; 0 until then), when it was
+    // handed to the GPU and when it was presented.
+    std::atomic<int64_t> gGpuDone[8];
+    int64_t gTraceHanded[8] = {}, gTracePresented[8] = {};
     std::mutex gDeliveryMutex;
     std::condition_variable gDeliveryChanged;
     std::deque<Delivery> gDeliveries;
@@ -3702,6 +3707,11 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             {
                 gFence->SetEventOnCompletion(job.fence, event);
                 WaitForSingleObject(event, INFINITE);
+            }
+            {
+                LARGE_INTEGER done;
+                QueryPerformanceCounter(&done);
+                gGpuDone[job.sequence & 7] = done.QuadPart;
             }
             DeliverWriteBacks(job.buffer.Get(), job.used, job.pendings, job.guestFrame);
             { std::lock_guard lock(gDeliveryMutex); gDeliveriesDone = job.number; }
@@ -4092,12 +4102,13 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
     bool CreateDeviceObjects()
     {
-        // NIER_OVERLAP=1, or a file recomp\overlap_on (to switch it where the launch options are
-        // not at hand): see gOverlap. NIER_OVERLAP=0 wins over the file.
+        // The overlap (gOverlap) is on unless NIER_OVERLAP=0 is set or a file recomp\overlap_off
+        // exists (to switch it where the launch options are not at hand). NIER_OVERLAP=1 wins
+        // over the file.
         {
             char v[8];
             if (GetEnvironmentVariableA("NIER_OVERLAP", v, sizeof(v))) gOverlap = atoi(v) != 0;
-            else gOverlap = GetFileAttributesA("..\\overlap_on") != INVALID_FILE_ATTRIBUTES;
+            else gOverlap = GetFileAttributesA("..\\overlap_off") == INVALID_FILE_ATTRIBUTES;
         }
         char debug[8];
         if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
@@ -4173,6 +4184,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             std::thread(DeliveryThread).detach();
             Log("[d3d12] the next frame is recorded while the GPU draws the last one (overlap on)\n");
         }
+        else Log("[d3d12] overlap off: the render thread waits for the GPU to finish each frame\n");
         if (!Check(gDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gAllocator.Get(), nullptr, IID_PPV_ARGS(&gList)), "command list")) return false;
         gList->Close();
         if (!Check(gDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gFence)), "fence")) return false;
@@ -4538,6 +4550,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         // NIER_LATE_WRITEBACK=1: after the present, as it used to be (for comparing).
         static const bool lateWriteBack = GetEnvironmentVariableA("NIER_LATE_WRITEBACK", nullptr, 0) > 0;
         LARGE_INTEGER perfWrittenBack = perfRecorded;
+        LARGE_INTEGER perfSwapChain{};   // overlap: after the wait for the swap chain, before Present
+        uint64_t traceSequence = 0;      // overlap: this frame's number for the late frame trace
         const auto deliverWriteBacks = [&]
         {
             if (!gPendingWriteBacks.empty()) WaitForGpu();
@@ -4549,9 +4563,16 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         {
             gSetFence = ++gFenceValue;
             gQueue->Signal(gFence.Get(), gSetFence);
-            if (!gPendingWriteBacks.empty())
             {
+                // (Every frame, read-backs or not: the thread also notes when the GPU finished.)
+                static uint64_t sequence = 0;
+                traceSequence = ++sequence;
+                LARGE_INTEGER handed;
+                QueryPerformanceCounter(&handed);
+                gTraceHanded[traceSequence & 7] = handed.QuadPart;
+                gGpuDone[traceSequence & 7] = 0;
                 Delivery job;
+                job.sequence = traceSequence;
                 job.fence = gSetFence;
                 job.buffer = gWriteBack;
                 job.used = gWriteBackUsed;
@@ -4567,6 +4588,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             QueryPerformanceCounter(&perfWrittenBack);
             FrameOutOfHand();   // the game may hand over its next frame: it is recorded while this one is drawn
             WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+            QueryPerformanceCounter(&perfSwapChain);
         }
         else
         if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); FrameOutOfHand(); }
@@ -4647,6 +4669,68 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         if (movie) RecordImageTiming(planes[0]);
         LARGE_INTEGER perfPresented;
         QueryPerformanceCounter(&perfPresented);
+        // NIER_LOG_LATE=1, or a file recomp\\late_on when the renderer starts: one line for each
+        // frame presented more than 1.3 times the usual interval after the one before, saying where the time
+        // went (at most 24 lines in 600 frames). Game side: how long after the frame before it
+        // this one arrived at the renderer, how long it then waited for room, how long it lay
+        // queued. Render thread: waiting for the set's GPU work (overlap), recording, handing it to
+        // the GPU (overlap: waiting for the frame before to finish there), waiting for the swap
+        // chain, Present.
+        if (guest)
+        {
+            static const bool traceLate = [] { char v[8]; return GetEnvironmentVariableA("NIER_LOG_LATE", v, sizeof(v)) ? atoi(v) != 0 : GetFileAttributesA("..\\late_on") != INVALID_FILE_ATTRIBUTES; }();
+            static LARGE_INTEGER frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+            static int64_t lastPresent = 0, lastArrived = 0, lastReturned = 0;
+            static uint32_t lines = 0, frames = 0;
+            const double k = 1000.0 / double(frequency.QuadPart);
+            // (The usual interval: a slow average that a late frame hardly moves. The game's frame
+            // clock gives none when a limiter paces it.)
+            static double usual = 0;
+            const double interval = lastPresent ? double(perfPresented.QuadPart - lastPresent) * k : 0.0;
+            if (interval > 0) usual = usual > 0 ? usual * 0.98 + (std::min)(interval, usual * 1.5) * 0.02 : interval;
+            static uint32_t seen = 0;   // the average needs some frames first
+            if (seen < 61) seen++;
+            if (++frames >= 600) frames = lines = 0;
+            if (traceLate && seen > 60 && interval > usual * 1.3 && lines < 24)
+            {
+                lines++;
+                const int64_t swapEnd = overlap ? perfSwapChain.QuadPart : perfWrittenBack.QuadPart;
+                Log("[late] frame %llu: %.1f ms since the last present. Game: arrived %.1f after the frame before, waited %.1f for room, queued %.1f. Render thread: free %.1f before it came, %s %.1f, recording %.1f, to the GPU %.1f, swap chain %.1f, present %.1f; %d queued behind\n",
+                    (unsigned long long)frame, double(perfPresented.QuadPart - lastPresent) * k,
+                    lastArrived ? double(guest->handOverBegan - lastArrived) * k : 0.0, double(guest->queued - guest->handOverBegan) * k, double(perfEntered.QuadPart - guest->queued) * k,
+                    lastReturned ? double(perfEntered.QuadPart - lastReturned) * k : 0.0,
+                    overlap ? "GPU set" : "swap chain first", double(perfStart.QuadPart - perfEntered.QuadPart) * k,
+                    double(perfRecorded.QuadPart - perfStart.QuadPart) * k, double(perfWrittenBack.QuadPart - perfRecorded.QuadPart) * k,
+                    double(swapEnd - perfWrittenBack.QuadPart) * k, double(perfPresented.QuadPart - swapEnd) * k, gPaceQueued);
+            }
+            // Overlap: where the frame before stood. It was handed to the GPU, presented, and the
+            // swap chain took the next frame (this one) once it was shown: was the GPU done with
+            // it in time for its refresh, or was it done and shown late all the same?
+            if (overlap && traceSequence > 1)
+            {
+                static double sumDone = 0, mostDone = -1e9, sumTaken = 0;
+                static uint32_t counted = 0;
+                const uint64_t before = (traceSequence - 1) & 7;
+                const int64_t done = gGpuDone[before].load();
+                if (done && gTracePresented[before])
+                {
+                    const double doneMs = double(done - gTracePresented[before]) * k, takenMs = double(perfSwapChain.QuadPart - gTracePresented[before]) * k;
+                    sumDone += doneMs; mostDone = (std::max)(mostDone, doneMs); sumTaken += takenMs; counted++;
+                    if (traceLate && seen > 60 && interval > usual * 1.3 && lines <= 24)
+                        Log("[late]   the frame before: handed to the GPU %.1f ms before its present, finished there %.1f ms after it; the swap chain took this frame %.1f ms after it\n",
+                            double(gTracePresented[before] - gTraceHanded[before]) * k, doneMs, takenMs);
+                }
+                if (frames == 0 && counted)
+                {
+                    if (traceLate) Log("[late] last 600 frames: the GPU finished a frame %.1f ms after its present on average (%.1f at most); the swap chain took the next %.1f ms after it on average\n", sumDone / counted, mostDone, sumTaken / counted);
+                    sumDone = sumTaken = 0; mostDone = -1e9; counted = 0;
+                }
+            }
+            if (overlap) gTracePresented[traceSequence & 7] = perfPresented.QuadPart;
+            lastPresent = perfPresented.QuadPart;
+            lastArrived = guest->handOverBegan;
+            lastReturned = perfPresented.QuadPart;
+        }
         static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
         if (logPacing && guest)
         {
@@ -4895,6 +4979,11 @@ void RendererSubmitFrame(RendererFrame&& frame)
 {
     gSubmitted++;
     {
+        LARGE_INTEGER arrived;
+        QueryPerformanceCounter(&arrived);
+        frame.handOverBegan = arrived.QuadPart;
+    }
+    {
         // NIER_LOG_PACING=1: a hand-over that had to wait (for the lock, or for room in the queue).
         static const bool logPacing = GetEnvironmentVariableA("NIER_LOG_PACING", nullptr, 0) > 0;
         LARGE_INTEGER begin{}, locked{}, end{}, frequency{};
@@ -4921,6 +5010,11 @@ void RendererSubmitFrame(RendererFrame&& frame)
             if (double(end.QuadPart - begin.QuadPart) * k > 2.0)
                 Log("[pace] frame %llu: handing it to the renderer took %.1f ms (%.1f for the lock, %.1f for room: %zu frames were queued)\n", (unsigned long long)frame.frame,
                     double(end.QuadPart - begin.QuadPart) * k, double(locked.QuadPart - begin.QuadPart) * k, double(end.QuadPart - locked.QuadPart) * k, queuedOnEntry);
+        }
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            frame.queued = now.QuadPart;
         }
         gFrameQueue.push_back(std::move(frame));
     }
