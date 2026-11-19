@@ -2192,6 +2192,28 @@ the place"):
     ms a frame, 477 of 600 frames within 1 ms of 16.7; play 59.6-60. Copied a frame there: vertex
     data 0.6 MB, constants 5.8 MB, index lists 6.1 MB; memmove still 24% of the render thread,
     the command thread at 95% of a core.
+  - Index lists are now shared too (gpu.cpp `gIndexCache`, renderer.h `IndexList`): the list
+    assembled for a draw is kept by where its indices came from and how they were to be read
+    (address, the draw initiator, byte order, index offset, restart value), with a hash of the
+    game's bytes there, and a later draw of the same bytes takes the list, its strip or rectangle
+    flag and its smallest and largest index as they are: no read, byte swap, widening, primitive
+    assembly or range scan. The bytes are checked like vertex ranges (in full 60 times, then
+    once a frame, from 4 KB by a moving sample, a full hash every 600 frames; three misses in a
+    row and the place is left alone for two seconds). A list that has outlived a frame
+    (`indicesKept`) is kept on the GPU in the same buffer as vertex data (`KeptBytes`).
+    Lighthouse on the PC: index lists copied 2.0 MB a frame down to 5 KB, the command thread's
+    work 1.6 ms a frame (median) down to 0.9. `NIER_VERIFY_INDEX_CACHE=1` assembles anyway and
+    compares: no difference in the lighthouse, the desert (kaine_desert) or fishing replays, with
+    the vertex and texture checks on as well. `NIER_NO_INDEX_CACHE=1` turns it off. On the Deck
+    (village overview, VSync on): the command thread 76% of a core against 95%, 58.7 fps, 533 of
+    600 frames within 1 ms of 16.7 against 477, index lists 0.04 MB a frame against 6.1,
+    recording 7.6 ms; the user saw the geometry right. Left in the command thread there:
+    ExecuteStream 17%, DecodeTexture 15%, BuildDraw's first lambda (a hash sample) 14%, memmove
+    8%; the render thread still copies 6.6 MB of constants a frame; the game's own main thread
+    is the second busiest at 59%.
+  - The Deck does not always load nier.exe at 0x140000000 (2026-11-19: 0x6ffffbc90000). For
+    naming `perf` addresses take the base from the first nier.exe line of `/proc/<pid>/maps`
+    and subtract it (scratch `perfsym.py <flat> <exe> <symbolizer> <base>`).
 - White line down the right edge at 420p (Upscaling Quality's Balanced on the Deck; F12 captures
   from there, replayed on the PC with `NIER_RES_SCALE=0.5833`): at 7/12, 10/12 and 13/12 the
   1280-wide surfaces come to x.67 pixels and `Scaled()` rounded them up, a column wider than the

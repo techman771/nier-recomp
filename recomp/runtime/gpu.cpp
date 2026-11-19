@@ -103,10 +103,38 @@ namespace
     };
     std::unordered_map<uint64_t, VertexRange> gVertexRanges;
 
+    // Index lists (BuildDraw). Every indexed draw read its indices from the game's memory, turned
+    // them the right way round, widened them to 32 bits, assembled its primitive and found its
+    // smallest and largest index, and the renderer then copied the list to the GPU: on the Steam
+    // Deck a tenth of this thread and 6 MB a frame for the renderer in a wide scene, for meshes
+    // whose indices never change. The list assembled for a draw is kept, by where its indices came
+    // from and how they were to be read, with a hash of the game's bytes there; a later draw of the
+    // same bytes takes the list, the flags and the index range as they are. The bytes are checked as
+    // vertex ranges are: in full until they have come out the same 60 times, then once a frame, and
+    // from 4 KB up by a moving sample (64 bytes of every 512, 8 offsets) with a full hash every 600
+    // frames. Places whose indices keep changing are told by three misses in a row and left alone
+    // for two seconds. NIER_NO_INDEX_CACHE=1: assemble for every draw, as before.
+    // NIER_VERIFY_INDEX_CACHE=1 (testing): assemble anyway and compare with the kept list.
+    struct IndexKept
+    {
+        IndexList list;
+        bool rectList = false, strip = false;
+        uint32_t minIndex = 0xFFFFFFFF, maxIndex = 0;
+        uint64_t contentKey = 0, lastFrame = 0, bornFrame = 0, hashedFrame = ~0ull, fullFrame = 0, copyUntil = 0;
+        uint64_t phases[8] = {};
+        uint32_t hits = 0, misses = 0, phaseMask = 0;
+    };
+    std::unordered_map<uint64_t, IndexKept> gIndexCache;
+
     // Once a frame: copies nobody drew from for two seconds go (sooner when a lot is held).
     void VertexCacheTrim(uint64_t frame)
     {
         if (frame % 30) return;
+        for (auto it = gIndexCache.begin(); it != gIndexCache.end();)
+        {
+            if (it->second.lastFrame + 120 < frame && it->second.copyUntil < frame) it = gIndexCache.erase(it);
+            else ++it;
+        }
         const uint64_t age = gVertexCacheBytes > (768ull << 20) ? 15 : 120;
         for (auto it = gVertexCache.begin(); it != gVertexCache.end();)
         {
@@ -1171,7 +1199,8 @@ namespace
     // `in` is consumed: a triangle list without restart markers, the usual case, is taken as it is.
     bool AssemblePrimitives(uint32_t primitive, std::vector<uint32_t>& in, RendererDraw& draw)
     {
-        auto& out = draw.indices;
+        std::vector<uint32_t> out;
+        struct Hand { RendererDraw& draw; std::vector<uint32_t>& out; ~Hand() { if (!out.empty()) draw.indices = std::move(out); } } hand{ draw, out };
         auto forEachSegment = [&](auto&& emit) {
             size_t segmentStart = 0;
             for (size_t i = 0; i <= in.size(); i++)
@@ -1298,16 +1327,99 @@ namespace
         if (!hasColor && !draw.depthBound) { SkipDraw("depth pass with depth disabled"); return; }
 
         const uint32_t primitive = initiator & 0x3F;
-        std::vector<uint32_t> sequence;
-        if (!ReadIndices(initiator, source, sequence)) { SkipDraw("unreadable index buffer"); return; }
-        if (primitive == 1)
+        uint32_t minIndex = 0xFFFFFFFF, maxIndex = 0;
+        bool rangeKnown = false;
+        // The index cache (see gIndexCache): only for indices read from the game's memory.
+        static const bool noIndexCache = GetEnvironmentVariableA("NIER_NO_INDEX_CACHE", nullptr, 0) > 0;
+        static const bool verifyIndexCache = GetEnvironmentVariableA("NIER_VERIFY_INDEX_CACHE", nullptr, 0) > 0;
+        const uint64_t indexFrame = gFrames.load();
+        IndexKept* indexEntry = nullptr;
+        uint64_t indexKey = 0;
+        bool indexHit = false, indexStore = false;
         {
-            static int logged = 0;   // point lists: what they are and how big (debugging)
-            if (logged++ < 12)
-                Log("[gpu] point list f%llu: %zu points vs %016llX ps %016llX point size %08X minmax %08X program %08X misc %08X vte %08X target %X\n",
-                    GpuFrameCount(), sequence.size(), vs->shader->hash, ps->shader->hash, r[0x2280], r[0x2281], r[0x2180], r[0x2181], r[0x2206], draw.target.edramBase);
+            const uint32_t count = initiator >> 16, bytes = count * (((initiator >> 11) & 1) ? 4 : 2);
+            if (!noIndexCache && ((initiator >> 6) & 3) == 0 && source.base && count >= 24 && bytes <= 0x4000000)
+            {
+                const uint8_t* guest = g_base + PhysicalToGuest(source.base);
+                const uint64_t where[4] = { uint64_t(source.base) | uint64_t(initiator) << 32, uint64_t(source.size >> 30) | uint64_t(r[0x2102]) << 32,
+                                            uint64_t(r[0x2103]) | uint64_t((r[0x2205] >> 21) & 1) << 32, bytes };
+                const uint64_t identity = XXH3_64bits(where, sizeof(where));
+                indexEntry = &gIndexCache[identity];
+                IndexKept& e = *indexEntry;
+                if (indexFrame >= e.copyUntil)
+                {
+                    const uint32_t phase = uint32_t(indexFrame & 7);
+                    auto sample = [&] {
+                        uint64_t h = identity + phase;
+                        for (uint32_t at = phase * 64; at + 64 <= bytes; at += 512) h = XXH3_64bits_withSeed(guest + at, 64, h);
+                        return h;
+                    };
+                    const bool sampling = bytes >= 4096;
+                    bool known = e.hashedFrame == indexFrame && e.hits >= 60;
+                    if (!known && sampling && e.hits >= 60 && e.phaseMask == 0xFF && indexFrame - e.fullFrame < 600)
+                    {
+                        if (sample() == e.phases[phase]) { known = true; e.hashedFrame = indexFrame; }
+                        else { e.hits = 0; e.phaseMask = 0; }
+                    }
+                    if (known) indexKey = e.contentKey;
+                    else
+                    {
+                        indexKey = XXH3_64bits_withSeed(guest, bytes, identity) | 1;   // never zero
+                        const bool same = indexKey == e.contentKey;
+                        e.hits = same ? e.hits + 1 : 0;
+                        if (!same) e.phaseMask = 0;
+                        else if (sampling) { e.phases[phase] = sample(); e.phaseMask |= 1u << phase; }
+                        e.hashedFrame = indexFrame;
+                        e.fullFrame = indexFrame;
+                    }
+                    if (indexKey == e.contentKey && !e.list.empty())
+                    {
+                        indexHit = true;
+                        e.misses = 0;
+                        e.lastFrame = indexFrame;
+                    }
+                    else if (++e.misses >= 3 && e.contentKey)
+                    {
+                        // Indices that keep changing: not hashed or kept for two seconds.
+                        e = IndexKept{};
+                        e.copyUntil = indexFrame + 120;
+                        e.lastFrame = indexFrame;
+                    }
+                    else indexStore = true;
+                }
+            }
         }
-        if (!AssemblePrimitives(primitive, sequence, draw)) { SkipDraw("primitive type " + std::to_string(primitive)); return; }
+        if (indexHit && !verifyIndexCache)
+        {
+            const IndexKept& e = *indexEntry;
+            draw.indices = e.list;
+            draw.indicesKept = e.bornFrame + 2 <= indexFrame;
+            draw.rectList = e.rectList;
+            draw.strip = e.strip;
+            minIndex = e.minIndex;
+            maxIndex = e.maxIndex;
+            rangeKnown = true;
+        }
+        else
+        {
+            std::vector<uint32_t> sequence;
+            if (!ReadIndices(initiator, source, sequence)) { SkipDraw("unreadable index buffer"); return; }
+            if (primitive == 1)
+            {
+                static int logged = 0;   // point lists: what they are and how big (debugging)
+                if (logged++ < 12)
+                    Log("[gpu] point list f%llu: %zu points vs %016llX ps %016llX point size %08X minmax %08X program %08X misc %08X vte %08X target %X\n",
+                        GpuFrameCount(), sequence.size(), vs->shader->hash, ps->shader->hash, r[0x2280], r[0x2281], r[0x2180], r[0x2181], r[0x2206], draw.target.edramBase);
+            }
+            if (!AssemblePrimitives(primitive, sequence, draw)) { SkipDraw("primitive type " + std::to_string(primitive)); return; }
+            if (indexHit)   // NIER_VERIFY_INDEX_CACHE: what was kept against what the game has now
+            {
+                const IndexKept& e = *indexEntry;
+                static int differences = 0;
+                if ((e.list.size() != draw.indices.size() || memcmp(e.list.data(), draw.indices.data(), e.list.size() * 4) || e.rectList != draw.rectList || e.strip != draw.strip) && differences++ < 20)
+                    Log("[gpu] kept index list differs from the game's: frame %llu, %zu indices kept, %zu now, at %08X\n", (unsigned long long)indexFrame, e.list.size(), draw.indices.size(), source.base);
+            }
+        }
         if (draw.indices.empty()) return;
         draw.vertexCount = uint32_t(draw.indices.size());
 
@@ -1315,11 +1427,22 @@ namespace
         // vertices between the draw's smallest and largest index are copied (a fetch constant often
         // covers a whole level's geometry). The base is then shifted so index * stride still lands
         // on the copied bytes (unsigned wrap-around is fine).
-        uint32_t minIndex = 0xFFFFFFFF, maxIndex = 0;
         static const bool noTrim = GetEnvironmentVariableA("NIER_NO_VERTEX_TRIM", nullptr, 0) > 0;   // debugging
-        if (vs->info.directVertexIndex && !noTrim)
+        if (!rangeKnown && ((vs->info.directVertexIndex && !noTrim) || indexStore))
             for (uint32_t index : draw.indices)
                 if (index != kRestart) { minIndex = std::min(minIndex, index); maxIndex = std::max(maxIndex, index); }   // a strip keeps its restart markers
+        if (indexStore)
+        {
+            IndexKept& e = *indexEntry;
+            e.list = draw.indices;
+            e.rectList = draw.rectList;
+            e.strip = draw.strip;
+            e.minIndex = minIndex;
+            e.maxIndex = maxIndex;
+            e.contentKey = indexKey;
+            e.lastFrame = e.bornFrame = indexFrame;
+        }
+        if (!(vs->info.directVertexIndex && !noTrim)) { minIndex = 0xFFFFFFFF; maxIndex = 0; }   // the range is only used for trimming
         struct VertexCopy { uint32_t slot, first, bytes, endian; const uint8_t* source; };
         VertexCopy copies[96];
         uint32_t copyCount = 0, totalBytes = 0;

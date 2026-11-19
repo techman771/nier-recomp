@@ -82,6 +82,23 @@ struct ByteBuffer
     bool empty() const { return count == 0; }
 };
 
+// A draw's index list. Copies share the list: once handed to a draw it is never written again, so
+// a mesh whose indices have not changed is drawn, frame after frame, from the list assembled for
+// it once (gpu.cpp, the index cache), and the renderer keeps such a list on the GPU.
+struct IndexList
+{
+    std::shared_ptr<std::vector<uint32_t>> shared;
+    IndexList() = default;
+    IndexList& operator=(std::vector<uint32_t>&& list) { shared = std::make_shared<std::vector<uint32_t>>(std::move(list)); return *this; }
+    void resize(size_t size) { shared = std::make_shared<std::vector<uint32_t>>(size); }   // a new list of its own
+    size_t size() const { return shared ? shared->size() : 0; }
+    bool empty() const { return size() == 0; }
+    uint32_t* data() { return shared ? shared->data() : nullptr; }
+    const uint32_t* data() const { return shared ? shared->data() : nullptr; }
+    const uint32_t* begin() const { return data(); }
+    const uint32_t* end() const { return data() + size(); }
+};
+
 struct RendererDraw
 {
     // Written out so that making one doesn't zero it first: `constants` (8 KB) is filled straight
@@ -113,7 +130,8 @@ struct RendererDraw
     uint8_t cull = 0;
     bool frontCounterClockwise = true;
     uint32_t vertexCount = 0;
-    std::vector<uint32_t> indices;             // empty means non-indexed
+    IndexList indices;                         // empty means non-indexed
+    bool indicesKept = false;                  // the list is one shared with earlier frames' draws: worth keeping on the GPU
     ByteBuffer vertexData;                     // byte order already corrected
     bool vertexKept = false;                   // these bytes are a copy shared with earlier draws (gpu.cpp's vertex cache): worth keeping on the GPU
     std::array<uint32_t, 96> vertexBase{};

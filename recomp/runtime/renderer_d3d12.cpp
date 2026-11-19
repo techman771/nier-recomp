@@ -1297,24 +1297,22 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // everything in it is dropped at the start of the next frame, with the GPU idle, and what is
     // still drawn is copied in again as it comes up, as every frame used to do.
     // NIER_NO_KEPT_VERTICES=1 turns it off.
-    struct KeptUpload { std::weak_ptr<uint8_t[]> owner; size_t size; ArenaBlock block; };
+    struct KeptUpload { std::weak_ptr<void> owner; size_t size; ArenaBlock block; };
     UINT64 gKeptOffset = 0;
     bool gKeptResetWanted = false;
     std::unordered_map<const uint8_t*, KeptUpload> gKeptUploads;
     uint64_t gVertexBytesCopied = 0, gVertexBytesKept = 0;   // since the last [perf] line
 
-    bool KeptVertices(const RendererDraw& draw, ArenaBlock& block)
+    // (Index lists shared with earlier frames are kept the same way: RendererDraw::indicesKept.)
+    bool KeptBytes(const uint8_t* bytes, size_t size, const std::shared_ptr<void>& owner, ArenaBlock& block, uint64_t& copied)
     {
         static const bool off = GetEnvironmentVariableA("NIER_NO_KEPT_VERTICES", nullptr, 0) > 0;
         if (off || !gKeptCpu) return false;
-        const uint8_t* bytes = draw.vertexData.data();
-        const size_t size = draw.vertexData.size();
         auto found = gKeptUploads.find(bytes);
         // (The address alone is no identity: once the owner has gone it can be handed out again.)
-        if (found != gKeptUploads.end() && found->second.size == size && found->second.owner.lock() == draw.vertexData.bytes)
+        if (found != gKeptUploads.end() && found->second.size == size && found->second.owner.lock() == owner)
         {
             block = found->second.block;
-            gVertexBytesKept += size;
             return true;
         }
         const UINT64 begin = (gKeptOffset + 15) & ~15ull;
@@ -1322,8 +1320,15 @@ float PSMain(float4 position : SV_Position) : SV_Target
         gKeptOffset = begin + size;
         block = { gKeptCpu + begin, gKept->GetGPUVirtualAddress() + begin, begin };
         memcpy(block.cpu, bytes, size);
-        gKeptUploads[bytes] = { draw.vertexData.bytes, size, block };
-        gVertexBytesCopied += size;
+        gKeptUploads[bytes] = { owner, size, block };
+        copied += size;
+        return true;
+    }
+
+    bool KeptVertices(const RendererDraw& draw, ArenaBlock& block)
+    {
+        if (!KeptBytes(draw.vertexData.data(), draw.vertexData.size(), draw.vertexData.bytes, block, gVertexBytesCopied)) return false;
+        gVertexBytesKept += draw.vertexData.size();
         return true;
     }
 
@@ -1498,9 +1503,13 @@ float PSMain(float4 position : SV_Position) : SV_Target
         }
         else
         {
-            ArenaBlock indices = ArenaAlloc(draw.indices.size() * 4, 4);
-            memcpy(indices.cpu, draw.indices.data(), draw.indices.size() * 4);
-            gIndexBytesCopied += draw.indices.size() * 4;
+            ArenaBlock indices;
+            if (!(draw.indicesKept && KeptBytes(reinterpret_cast<const uint8_t*>(draw.indices.data()), draw.indices.size() * 4, draw.indices.shared, indices, gIndexBytesCopied)))
+            {
+                indices = ArenaAlloc(draw.indices.size() * 4, 4);
+                memcpy(indices.cpu, draw.indices.data(), draw.indices.size() * 4);
+                gIndexBytesCopied += draw.indices.size() * 4;
+            }
             D3D12_INDEX_BUFFER_VIEW view{ indices.gpu, UINT(draw.indices.size() * 4), DXGI_FORMAT_R32_UINT };
             gList->IASetIndexBuffer(&view);
             gList->DrawIndexedInstanced(UINT(draw.indices.size()), 1, 0, 0, 0);
