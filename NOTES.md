@@ -1072,6 +1072,28 @@ Lighthouse hitching (18 November 2026): NOT reproduced, cause unknown.
   the main loop has not turned for 100 ms the log gets "[stall] ..." and every guest thread's
   stack (the first 25 stalls of a run). Look for [stall] in recomp\playtest.log.
 
+Replays hold only at the speed they were recorded at (18 November 2026).
+- A replayed fight went differently (the user: "I was hit by an enemy"). The enemies' choices
+  come from the game's random numbers: an inlined rand() at over a thousand places, nearly all
+  on the seed at 0x826303A0, 43 on 0x826908A0; and from its frame counter (0x85F08468). A
+  recording now keeps those three words from the route's first tick (<recording>.state) and a
+  replay puts them back there (gametick.cpp).
+- The log gets "[route] tick N: random ..." every 600 ticks while recording or replaying:
+  two runs are in step exactly as long as the first seed agrees. A recorded run and two replays
+  of it at the same speed agreed at every one of 16 checkpoints over 9,000 ticks, fights
+  included. The second seed differs from run to run (not traced; it did not disturb the first).
+- At another speed they do not agree. The Game 1 route (recorded at 60 fps) replayed at its own
+  speed and at five times it: the same through the Aerie's opening cutscene (2,400 ticks), and
+  different from its end on. The cutscene ends by a real clock, not by the main loop's step (the
+  user saw its pan to the tower come late). The lighthouse recording (240 fps) replayed at 240
+  and at 60: different within 600 ticks, so something at a scene's start goes by real time too
+  (not traced; loading is a candidate).
+- So: tick-for-tick replay is for test runs on the machine and at the frame rate of the
+  recording. To hold at any speed, the game's real-time clocks would have to be found and made
+  to follow the recording (not started).
+- God mode (asked about by the user) would not keep a route on course: a hit staggers and moves
+  the player whatever the damage.
+
 ### Other aspect ratios (16:10, ultrawide): findings so far, nothing built
 
 SET ASIDE by the user for later (16 November 2026, after these findings): "let's have this for

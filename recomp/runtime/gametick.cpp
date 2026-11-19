@@ -30,6 +30,30 @@ namespace
     std::vector<float> gSteps;                 // <recording>.steps being replayed
     bool gReplaying = false;
 
+    // What the game's behaviour depends on besides the time steps and the pad, taken when a
+    // recorded route begins (<recording>.state) and put back when a replay reaches that point:
+    // the two seeds of its random numbers (an inlined rand() at over a thousand places, nearly all
+    // on the seed at 0x826303A0, some on 0x826908A0) and its frame counter (0x85F08468, tested for
+    // "every N frames"). Without them a replayed fight went differently: the enemies made other
+    // choices and hit the player (the user: "it was off ... I was hit by an enemy").
+    const uint32_t kRouteState[] = { 0x826303A0, 0x826908A0, 0x85F08468 };
+    std::string gReplayPath;
+
+    void RouteState(bool save, const std::string& path)
+    {
+        if (FILE* file = fopen(path.c_str(), save ? "wb" : "rb"))
+        {
+            for (uint32_t address : kRouteState)
+            {
+                uint32_t value = R32(address);
+                if (save) fwrite(&value, 4, 1, file);
+                else if (fread(&value, 4, 1, file) == 1) W32(address, value);
+            }
+            fclose(file);
+            Log("[input] the route's random seeds and frame counter %s\n", save ? "saved" : "restored");
+        }
+    }
+
     // NIER_LOG_STALLS=1 (set for playtests by run_boot.ps1): when the main loop has not turned for
     // 100 ms, the log gets every guest thread's stack, so a hitch that can't be reproduced on
     // demand still shows what the game was doing. The first 25 stalls of a run; loading screens
@@ -68,6 +92,7 @@ namespace
             if (GetEnvironmentVariableA("NIER_REPLAY_INPUT", path, sizeof(path)) && GetEnvironmentVariableA("NIER_REPLAY_BY_FRAME", nullptr, 0) == 0)
                 if (FILE* file = fopen((std::string(path) + ".steps").c_str(), "rb"))
                 {
+                    gReplayPath = path;
                     float step;
                     while (fread(&step, sizeof(step), 1, file) == 1) gSteps.push_back(step);
                     fclose(file);
@@ -101,9 +126,16 @@ void GameStepHook(PPCRegister& f31)
     const uint64_t mark = gMarkTick.load();
     if (mark == ~0ull || tick <= mark) return;
     const uint64_t index = tick - mark - 1;
+    const bool recording = !gReplaying && !gRecordPath.empty();
+    if (index == 0 && recording) RouteState(true, gRecordPath.substr(0, gRecordPath.size() - 6) + ".state");
+    if (index == 0 && gReplaying) RouteState(false, gReplayPath + ".state");
+    // Whether a replay is in step with its recording shows in the seeds: compare these lines.
+    if ((recording || (gReplaying && index < gSteps.size())) && index % 600 == 0)
+        Log("[route] tick %llu: random %08X %08X, counter %u\n", (unsigned long long)index, R32(kRouteState[0]), R32(kRouteState[1]), R32(kRouteState[2]));
     if (gReplaying)
     {
-        if (index < gSteps.size()) f31.f64 = double(gSteps[index]);
+        if (index >= gSteps.size()) return;
+        f31.f64 = double(gSteps[index]);
         return;
     }
     std::lock_guard lock(gMutex);
