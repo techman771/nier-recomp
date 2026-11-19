@@ -2166,7 +2166,32 @@ the place"):
   - Left in that cutscene (GPU 34% busy): the render thread spends 38% of its time in memmove,
     copying each draw's vertex data to the upload arena every frame (recording 3 ms a frame in
     play, 11 there); the command thread is BuildDraw 23%, DecodeTexture 10%, ReadIndices 10%,
-    ExecuteStream 9%, CopySwapped 8%, hashing 3.5%. Next: keep unchanged vertex data on the GPU.
+    ExecuteStream 9%, CopySwapped 8%, hashing 3.5%.
+  - Unchanged vertex data now stays on the GPU (renderer_d3d12.cpp `KeptVertices`): a draw whose
+    bytes come from the command thread's vertex cache and have outlived a frame
+    (`RendererDraw::vertexKept`; a posed character's bytes are shared by its shadow and scene
+    draws of one frame and must not count) is copied once into a second 160 MB upload buffer and
+    drawn from there while those bytes live (found by address, checked against the owner, since
+    an address is reused). The buffer only grows; at three quarters full everything in it is
+    dropped at the start of a frame and copied in again as drawn. `[perf] vertex data` gives the
+    bytes copied a frame and drawn from kept copies. Lighthouse on the PC: 4.2 MB a frame copied
+    down to 0.08 MB, recording 1.0 ms to 0.8; the route leaves 59 MB in the buffer (7 MB of it
+    live). `NIER_KEPT_RESET_MB=12` (drops at 12 MB, many times over the route) drew correctly;
+    `NIER_NO_KEPT_VERTICES=1` turns it off. On the Deck (village overview, VSync off that run):
+    55.4 fps against 52-55, recording 8.9 ms a frame against 10.6-11.3, 0.58 MB of vertex data
+    copied a frame, memmove 24% of the render thread against 38%; the user saw the geometry
+    right.
+  - What memmove is left there is the other per-draw copies. Constants: every draw copied all
+    8 KB (c[0..511]) to the arena; now only up to the last constant each of its two shaders can
+    read, taken once from the shader's text (`ConstantEnd`: literal indices, or the whole half
+    when it indexes by a0). A frame captured on the Deck replays pixel for pixel the same with
+    `NIER_ALL_CONSTANTS=1` and without. Lighthouse: 1.5 MB a frame now, with index lists 2.0 MB
+    (`[perf] vertex data` line). Index lists are still built by the command thread and copied by
+    the render thread for every draw: the next thing to share the way vertex data is.
+    On the Deck with the trimmed constants (village overview, VSync on): 58.4 fps, recording 8.2
+    ms a frame, 477 of 600 frames within 1 ms of 16.7; play 59.6-60. Copied a frame there: vertex
+    data 0.6 MB, constants 5.8 MB, index lists 6.1 MB; memmove still 24% of the render thread,
+    the command thread at 95% of a core.
 - White line down the right edge at 420p (Upscaling Quality's Balanced on the Deck; F12 captures
   from there, replayed on the PC with `NIER_RES_SCALE=0.5833`): at 7/12, 10/12 and 13/12 the
   1280-wide surfaces come to x.67 pixels and `Scaled()` rounded them up, a column wider than the

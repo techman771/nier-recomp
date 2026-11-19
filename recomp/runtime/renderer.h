@@ -20,6 +20,7 @@ struct GuestShader
     uint64_t hash = 0;
     std::string hlsl;
     bool pixel = false;
+    int constantEnd = -1;   // one past the last float4 of c[] the shader can read (renderer_d3d12.cpp ConstantEnd); -1 not worked out yet
 };
 
 enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8, RGBA16F, RG16F, R32F, RG32F, RGBA32F };
@@ -114,6 +115,7 @@ struct RendererDraw
     uint32_t vertexCount = 0;
     std::vector<uint32_t> indices;             // empty means non-indexed
     ByteBuffer vertexData;                     // byte order already corrected
+    bool vertexKept = false;                   // these bytes are a copy shared with earlier draws (gpu.cpp's vertex cache): worth keeping on the GPU
     std::array<uint32_t, 96> vertexBase{};
     std::array<float, 2048> constants;         // not initialized (see the constructor)
     std::array<uint32_t, 8> boolConstants{};

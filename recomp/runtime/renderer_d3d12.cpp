@@ -361,6 +361,9 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     // The draw root signature plus its sampler table (root parameter 4).
     void BindDrawRoot();
     ComPtr<ID3D12Resource> gArena;
+    constexpr UINT64 kKeptBytes = 160ull * 1024 * 1024;   // vertex bytes that stay on the GPU (KeptVertices)
+    ComPtr<ID3D12Resource> gKept;
+    uint8_t* gKeptCpu = nullptr;
     ComPtr<ID3DBlob> gRectBlob;
     uint8_t* gArenaCpu = nullptr;
     UINT64 gArenaOffset = 0;
@@ -508,6 +511,8 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
         gArena = MakeBuffer(kArenaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         gArena->Map(0, nullptr, (void**)&gArenaCpu);
+        gKept = MakeBuffer(kKeptBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (gKept) gKept->Map(0, nullptr, (void**)&gKeptCpu);
 
         ComPtr<ID3DBlob> shaderErrors;
         if (FAILED(D3DCompile(kRectGeometry, sizeof(kRectGeometry) - 1, "rect", nullptr, nullptr, "main", "gs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &gRectBlob, &shaderErrors)))
@@ -1282,6 +1287,83 @@ float PSMain(float4 position : SV_Position) : SV_Target
     std::set<const DepthResource*> gFlatDepthsCleared;   // per frame
     std::unordered_map<const uint8_t*, ArenaBlock> gFrameVertexUploads;   // per frame: vertex bytes already in the arena, by their address
 
+    // Vertex bytes that stay on the GPU. Every draw's vertex data was copied into the arena again
+    // each frame: on the Steam Deck that copy was 38% of the render thread in a wide scene (the
+    // village overview: 11 ms of recording a frame against 3 in play). Most of it is geometry the
+    // command thread already knows to be unchanged and hands over as the same shared bytes frame
+    // after frame (RendererDraw::vertexKept). Those are copied once into this second buffer and
+    // drawn from there for as long as the bytes live. The buffer only grows; bytes whose owner has
+    // gone are not reclaimed one by one. When three quarters are used (or something no longer fits)
+    // everything in it is dropped at the start of the next frame, with the GPU idle, and what is
+    // still drawn is copied in again as it comes up, as every frame used to do.
+    // NIER_NO_KEPT_VERTICES=1 turns it off.
+    struct KeptUpload { std::weak_ptr<uint8_t[]> owner; size_t size; ArenaBlock block; };
+    UINT64 gKeptOffset = 0;
+    bool gKeptResetWanted = false;
+    std::unordered_map<const uint8_t*, KeptUpload> gKeptUploads;
+    uint64_t gVertexBytesCopied = 0, gVertexBytesKept = 0;   // since the last [perf] line
+
+    bool KeptVertices(const RendererDraw& draw, ArenaBlock& block)
+    {
+        static const bool off = GetEnvironmentVariableA("NIER_NO_KEPT_VERTICES", nullptr, 0) > 0;
+        if (off || !gKeptCpu) return false;
+        const uint8_t* bytes = draw.vertexData.data();
+        const size_t size = draw.vertexData.size();
+        auto found = gKeptUploads.find(bytes);
+        // (The address alone is no identity: once the owner has gone it can be handed out again.)
+        if (found != gKeptUploads.end() && found->second.size == size && found->second.owner.lock() == draw.vertexData.bytes)
+        {
+            block = found->second.block;
+            gVertexBytesKept += size;
+            return true;
+        }
+        const UINT64 begin = (gKeptOffset + 15) & ~15ull;
+        if (begin + size > kKeptBytes) { gKeptResetWanted = true; return false; }
+        gKeptOffset = begin + size;
+        block = { gKeptCpu + begin, gKept->GetGPUVirtualAddress() + begin, begin };
+        memcpy(block.cpu, bytes, size);
+        gKeptUploads[bytes] = { draw.vertexData.bytes, size, block };
+        gVertexBytesCopied += size;
+        return true;
+    }
+
+    void KeptVerticesBeginFrame()
+    {
+        // NIER_KEPT_RESET_MB=<n> (testing): drop everything at that many megabytes instead.
+        static const UINT64 limit = [] { char v[16]; return GetEnvironmentVariableA("NIER_KEPT_RESET_MB", v, sizeof(v)) ? UINT64(atoi(v)) << 20 : kKeptBytes / 4 * 3; }();
+        if (!gKeptResetWanted && gKeptOffset <= limit) return;
+        static int logged = 0;
+        if (logged++ < 20) Log("[d3d12] kept vertex data: %llu MB in %zu pieces dropped, to be copied in again as drawn (frame %llu)\n", (unsigned long long)(gKeptOffset >> 20), gKeptUploads.size(), (unsigned long long)gExecutingFrame);
+        gKeptUploads.clear();
+        gKeptOffset = 0;
+        gKeptResetWanted = false;
+    }
+
+    // One past the last constant (float4 of c[]) a shader can read: vertex shaders have c[0..255],
+    // pixel shaders c[256..511]. Read off the shader's text once: the literal indices, or the whole
+    // of its half when it indexes by the address register (c[n + a0], skinning). Every draw copied
+    // all 8 KB of constants to the GPU, in a scene of a thousand and more draws; most shaders read
+    // a few dozen. NIER_ALL_CONSTANTS=1 copies everything, as before.
+    int ConstantEnd(GuestShader& shader)
+    {
+        if (shader.constantEnd >= 0) return shader.constantEnd;
+        static const bool all = GetEnvironmentVariableA("NIER_ALL_CONSTANTS", nullptr, 0) > 0;
+        const int first = shader.pixel ? 256 : 0;
+        int end = first;
+        const std::string& text = shader.hlsl;
+        for (size_t at = text.find("c["); at != std::string::npos && !all; at = text.find("c[", at + 2))
+        {
+            if (at > 0 && (isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_')) continue;   // another name ending in c
+            char* after = nullptr;
+            const long index = strtol(text.c_str() + at + 2, &after, 10);
+            if (after == text.c_str() + at + 2 || *after != ']') { end = first + 256; break; }   // not a plain number: anything in its half
+            end = (std::max)(end, int(index) + 1);
+        }
+        if (all || end > first + 256 || text.empty()) end = first + 256;
+        return shader.constantEnd = end;
+    }
+    uint64_t gConstantBytesCopied = 0, gIndexBytesCopied = 0;   // since the last [perf] line
+
     void ExecuteDraw(const RendererDraw& draw)
     {
         bool deferred = false;
@@ -1296,8 +1378,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
             gList->ClearDepthStencilView(DepthView(*depth), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
         ArenaBlock constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-        memcpy(constants.cpu, draw.constants.data(), draw.constants.size() * 4);
-        if (gShadowTwelfths != 12)
+        // Only what the two shaders can read (the rest of the block is left as the arena had it).
+        const int vsEnd = draw.vs ? ConstantEnd(*draw.vs) : 256, psEnd = draw.ps ? ConstantEnd(*draw.ps) : 512;
+        memcpy(constants.cpu, draw.constants.data(), size_t(vsEnd) * 16);
+        memcpy(constants.cpu + 256 * 16, draw.constants.data() + 256 * 4, size_t(psEnd - 256) * 16);
+        gConstantBytesCopied += size_t(vsEnd + psEnd - 256) * 16;
+        if (gShadowTwelfths != 12 && psEnd >= 259)
         {
             // The shaders that read a shadow map filter it by hand: nine taps one texel apart, blended
             // by the position inside a texel. The game passes the map's size and the texel steps as
@@ -1348,6 +1434,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         ArenaBlock vertices;
         const auto uploaded = draw.vertexData.empty() ? gFrameVertexUploads.end() : gFrameVertexUploads.find(draw.vertexData.data());
         if (uploaded != gFrameVertexUploads.end()) vertices = uploaded->second;
+        else if (draw.vertexKept && !draw.vertexData.empty() && KeptVertices(draw, vertices)) {}
         else
         {
             UINT64 vertexBytes = std::max<UINT64>(draw.vertexData.size(), 16);
@@ -1356,6 +1443,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
             {
                 memcpy(vertices.cpu, draw.vertexData.data(), draw.vertexData.size());
                 gFrameVertexUploads[draw.vertexData.data()] = vertices;
+                gVertexBytesCopied += draw.vertexData.size();
             }
         }
 
@@ -1412,6 +1500,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         {
             ArenaBlock indices = ArenaAlloc(draw.indices.size() * 4, 4);
             memcpy(indices.cpu, draw.indices.data(), draw.indices.size() * 4);
+            gIndexBytesCopied += draw.indices.size() * 4;
             D3D12_INDEX_BUFFER_VIEW view{ indices.gpu, UINT(draw.indices.size() * 4), DXGI_FORMAT_R32_UINT };
             gList->IASetIndexBuffer(&view);
             gList->DrawIndexedInstanced(UINT(draw.indices.size()), 1, 0, 0, 0);
@@ -3368,6 +3457,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         gExecutingFrame = frame.frame;
         gArenaOffset = 0;
         gFrameVertexUploads.clear();
+        KeptVerticesBeginFrame();
         gDrawSrvUsed = 0;
         ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
         gList->SetDescriptorHeaps(2, heaps);
@@ -4316,6 +4406,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                         else if (value > median) longer++;
                         else shorter++;
                     }
+                    Log("[perf] vertex data: %.0f KB a frame copied to the GPU, %.0f KB drawn from copies kept there (%llu MB kept); constants %.0f KB a frame, index lists %.0f KB\n",
+                        double(gVertexBytesCopied) / 600.0 / 1024.0, double(gVertexBytesKept) / 600.0 / 1024.0, (unsigned long long)(gKeptOffset >> 20),
+                        double(gConstantBytesCopied) / 600.0 / 1024.0, double(gIndexBytesCopied) / 600.0 / 1024.0);
+                    gVertexBytesCopied = gVertexBytesKept = gConstantBytesCopied = gIndexBytesCopied = 0;
                     Log("[perf] present to present: median %.2f ms; %d of 600 within 1 ms of it, %d shorter, %d longer; 1%% each end %.1f and %.1f, longest %.1f; vsync %d, interval %d\n",
                         median, even, shorter, longer, sorted[6], sorted[593], sorted[599], int(vsync), gPaceInterval);
                 }

@@ -86,7 +86,7 @@ namespace
     // Vertex bytes copied for this frame's draws (BuildDraw), and the longest any one packet of each kind took.
     uint64_t gFrameVertexCopied = 0, gFrameVertexKept = 0, gFrameVertexHashed = 0;
     // Vertex copies kept from earlier draws (BuildDraw): by where the bytes came from and their hash.
-    struct VertexKept { ByteBuffer data; uint64_t lastFrame = 0; };
+    struct VertexKept { ByteBuffer data; uint64_t lastFrame = 0, bornFrame = 0; };
     std::unordered_map<uint64_t, VertexKept> gVertexCache;
     uint64_t gVertexCacheBytes = 0;
     // And per place (address, extent, byte order): how often in a row its bytes were new, and until which frame it is just copied.
@@ -1363,7 +1363,7 @@ namespace
         // NIER_VERTEX_CACHE_AB=1 (testing): on and off by turns of 300 frames, to compare within one run
         // (from one run to the next this thread's time differs by more than the cache changes it).
         static const bool alternate = GetEnvironmentVariableA("NIER_VERTEX_CACHE_AB", nullptr, 0) > 0;
-        bool kept = false;
+        bool kept = false, keptOver = false;   // (keptOver: the copy is from an earlier frame)
         uint64_t contentKey = 0;
         VertexRange* range = nullptr;
         if (!noVertexCache && !(alternate && ((frameNow / 300) & 1)) && totalBytes >= 4096)
@@ -1413,6 +1413,7 @@ namespace
                 {
                     draw.vertexData = found->second.data;
                     found->second.lastFrame = frameNow;
+                    keptOver = found->second.bornFrame + 2 <= frameNow;
                     range->misses = 0;
                     kept = true;
                     gFrameVertexKept += totalBytes;
@@ -1424,6 +1425,9 @@ namespace
                 }
             }
         }
+        // Worth keeping on the GPU only once it has outlived a frame: bytes that change every frame
+        // but are drawn twice in each (a posed character's shadow and scene passes) are shared too.
+        draw.vertexKept = kept && keptOver;
         if (!kept)
         {
             draw.vertexData.resize(totalBytes);   // not zero-filled
@@ -1452,6 +1456,7 @@ namespace
             if (entry.data.size()) gVertexCacheBytes -= entry.data.size();
             entry.data = draw.vertexData;
             entry.lastFrame = frameNow;
+            entry.bornFrame = frameNow;
             gVertexCacheBytes += totalBytes;
         }
 
