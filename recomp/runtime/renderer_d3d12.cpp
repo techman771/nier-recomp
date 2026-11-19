@@ -294,7 +294,10 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     // shaders address textures by normalized coordinates, so they need no change. Applied between frames
     // (PC Settings > Resolution, or NIER_RES_SCALE). It is kept in twelfths so that every size
     // offered is exact (854x480 is 8/12, 1600x900 is 15/12, 1920x1080 is 18/12); Scaled() converts
-    // a guest length or coordinate, rounding to the nearest pixel and never to nothing.
+    // a guest length or coordinate, rounding down and never to nothing. Down, not to the nearest:
+    // at a scale where 1280 guest pixels come to a fraction above a half (7/12 is 746.67, also 10/12
+    // and 13/12) the surfaces were a column wider than the picture drawn into them, and that column
+    // showed as a white line down the right edge (seen on the Steam Deck at 420p).
     uint32_t gResTwelfths = 12;
     bool gResolutionLogged = false;
     // The display's own scale (the window against 1280x720) and the scale in force for the command
@@ -306,8 +309,8 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     // are square depth passes that end in a depth copy (see ShadowPasses); the scale applies to
     // their targets and to the resolved depth texture the scene reads.
     uint32_t gShadowTwelfths = 12;
-    inline uint32_t Scaled(uint32_t guest) { return guest ? (std::max)((guest * gActiveTwelfths + 6) / 12, 1u) : 0; }
-    inline int ScaledInt(int guest) { return guest >= 0 ? int((uint32_t(guest) * gActiveTwelfths + 6) / 12) : -int((uint32_t(-guest) * gActiveTwelfths + 6) / 12); }
+    inline uint32_t Scaled(uint32_t guest) { return guest ? (std::max)(guest * gActiveTwelfths / 12, 1u) : 0; }
+    inline int ScaledInt(int guest) { return guest >= 0 ? int(uint32_t(guest) * gActiveTwelfths / 12) : -int(uint32_t(-guest) * gActiveTwelfths / 12); }
 
     struct TargetResource
     {

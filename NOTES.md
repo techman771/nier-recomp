@@ -2129,6 +2129,14 @@ the place"):
   overrides. 420p (7 twelfths, a scale no setting used before) drew correctly in the lighthouse,
   and the Deck's log showed the modes switching. Seen on the Deck with the row's first form (no
   Native, values one lower).
+- White line down the right edge at 420p (Upscaling Quality's Balanced on the Deck; F12 captures
+  from there, replayed on the PC with `NIER_RES_SCALE=0.5833`): at 7/12, 10/12 and 13/12 the
+  1280-wide surfaces come to x.67 pixels and `Scaled()` rounded them up, a column wider than the
+  picture. The last column was black and the one before it about six times too bright, already
+  in the scene before the bloom passes, with upscaling off as well. Which pass leaves the column
+  is not found; `Scaled()` and `ScaledInt()` now round down, and the captured frame is clean at
+  7/12 and 10/12 and unchanged at 8/12, 9/12 and 12/12 (edge columns measured).
+  The user confirmed on the Deck that the edge is gone.
 - Native with FSR 3.1 or 4 is their anti-aliasing alone (Native AA): `UpscalingMode` returns 2 at
   the display's own resolution, the 2D pass is still found (`FindFlatPhase`) so its draws take
   the upscaler's output and no jitter, and `BeginFlatPhase` does nothing when the render-sized
