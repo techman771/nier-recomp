@@ -1352,22 +1352,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
     int ConstantEnd(GuestShader& shader)
     {
         if (shader.constantEnd >= 0) return shader.constantEnd;
-        static const bool all = GetEnvironmentVariableA("NIER_ALL_CONSTANTS", nullptr, 0) > 0;
-        const int first = shader.pixel ? 256 : 0;
-        int end = first;
-        const std::string& text = shader.hlsl;
-        for (size_t at = text.find("c["); at != std::string::npos && !all; at = text.find("c[", at + 2))
-        {
-            if (at > 0 && (isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_')) continue;   // another name ending in c
-            char* after = nullptr;
-            const long index = strtol(text.c_str() + at + 2, &after, 10);
-            if (after == text.c_str() + at + 2 || *after != ']') { end = first + 256; break; }   // not a plain number: anything in its half
-            end = (std::max)(end, int(index) + 1);
-        }
-        if (all || end > first + 256 || text.empty()) end = first + 256;
-        return shader.constantEnd = end;
+        return shader.constantEnd = ShaderConstantEnd(shader.hlsl, shader.pixel);
     }
     uint64_t gConstantBytesCopied = 0, gIndexBytesCopied = 0;   // since the last [perf] line
+    // The constants block last made in this frame, and for which run of draws (ExecuteDraw).
+    ArenaBlock gConstantsBlock{};
+    uint32_t gConstantsGroup = 0;
+    bool gConstantsRestated = false;
+    int gConstantsVsEnd = 0, gConstantsPsEnd = 256;
 
     void ExecuteDraw(const RendererDraw& draw)
     {
@@ -1382,39 +1374,54 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (depth && gActiveTwelfths != gResTwelfths && gFlatDepthsCleared.insert(depth).second)
             gList->ClearDepthStencilView(DepthView(*depth), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
-        ArenaBlock constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-        // Only what the two shaders can read (the rest of the block is left as the arena had it).
+        // Only what the two shaders can read (the rest of the block is left as the arena had it),
+        // and only once for a run of draws the command thread found to have the same constants
+        // (RendererDraw::constantsGroup): the block made for the first of them serves the rest, as
+        // long as it reaches as far as this draw's shaders read and neither draw needs the shadow
+        // map's constants restated (below; that changes the copy).
         const int vsEnd = draw.vs ? ConstantEnd(*draw.vs) : 256, psEnd = draw.ps ? ConstantEnd(*draw.ps) : 512;
-        memcpy(constants.cpu, draw.constants.data(), size_t(vsEnd) * 16);
-        memcpy(constants.cpu + 256 * 16, draw.constants.data() + 256 * 4, size_t(psEnd - 256) * 16);
-        gConstantBytesCopied += size_t(vsEnd + psEnd - 256) * 16;
+        bool restate = false;   // the shadow map's size and texel steps, for a larger map
         if (gShadowTwelfths != 12 && psEnd >= 259)
         {
             // The shaders that read a shadow map filter it by hand: nine taps one texel apart, blended
             // by the position inside a texel. The game passes the map's size and the texel steps as
             // pixel shader constants 257.z (1024), 257.w (1/1024) and 258 (0, 1, 2, 3 texels); with a
             // larger map they are restated for its real size, or the taps skip texels and streak.
-            float* c257 = reinterpret_cast<float*>(constants.cpu) + 257 * 4;
-            float* c258 = c257 + 4;
+            const float* c257 = draw.constants.data() + 257 * 4;
+            const float* c258 = c257 + 4;
             const float size = c257[2];
             const bool shadowConstants = size >= 256.0f && size <= 4096.0f && std::fabs(c257[3] * size - 1.0f) < 0.01f &&
                 c258[0] == 0.0f && std::fabs(c258[1] * size - 1.0f) < 0.01f && std::fabs(c258[2] * size - 2.0f) < 0.01f;
             if (shadowConstants)
-            {
-                bool readsShadowMap = false;
                 for (const TextureBinding& binding : draw.textures)
                     if (binding.valid && !binding.decoded)
                     {
                         auto found = gResolved.find(binding.resolvedBase);
-                        readsShadowMap = readsShadowMap || (found != gResolved.end() && found->second.depth && found->second.twelfths == gShadowTwelfths && found->second.width == found->second.height);
+                        restate = restate || (found != gResolved.end() && found->second.depth && found->second.twelfths == gShadowTwelfths && found->second.width == found->second.height);
                     }
-                if (readsShadowMap)
-                {
-                    const float k = gShadowTwelfths / 12.0f;
-                    c257[2] *= k; c257[3] /= k;
-                    for (int i = 1; i < 4; i++) c258[i] /= k;
-                }
+        }
+        ArenaBlock constants;
+        if (draw.constantsGroup && draw.constantsGroup == gConstantsGroup && !restate && !gConstantsRestated && vsEnd <= gConstantsVsEnd && psEnd <= gConstantsPsEnd)
+            constants = gConstantsBlock;
+        else
+        {
+            constants = ArenaAlloc(draw.constants.size() * 4, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            memcpy(constants.cpu, draw.constants.data(), size_t(vsEnd) * 16);
+            memcpy(constants.cpu + 256 * 16, draw.constants.data() + 256 * 4, size_t(psEnd - 256) * 16);
+            gConstantBytesCopied += size_t(vsEnd + psEnd - 256) * 16;
+            if (restate)
+            {
+                float* c257 = reinterpret_cast<float*>(constants.cpu) + 257 * 4;
+                float* c258 = c257 + 4;
+                const float k = gShadowTwelfths / 12.0f;
+                c257[2] *= k; c257[3] /= k;
+                for (int n = 1; n < 4; n++) c258[n] /= k;
             }
+            gConstantsBlock = constants;
+            gConstantsGroup = draw.constantsGroup;
+            gConstantsRestated = restate;
+            gConstantsVsEnd = vsEnd;
+            gConstantsPsEnd = psEnd;
         }
 
         ArenaBlock system = ArenaAlloc(sizeof(SystemConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -2415,10 +2422,51 @@ float PSMain(float4 position : SV_Position) : SV_Target
     // The second form of a vertex shader and its pipelines are made on a thread of their own
     // (MotionWorker): compiling one on the render thread held a frame for most of a second the first
     // time a shader was met. Until one is ready its draws keep the camera-only vectors.
+    // The motion vector pass (ObjectMotion) looks at every opaque scene draw of the frame, and in a
+    // wide scene that is thousands: on the Steam Deck the village overview's recording went from
+    // 8.9 ms a frame to 13.2 with FSR 3 on. What it did for each draw is now done cheaply: the
+    // shader's record is found through the shader itself, not a table; only the constants the
+    // vertex shader can read are compared, remembered and copied, not 4 KB each time; draws are
+    // matched with last frame's through a table that is emptied by a count, not node by node.
+    //
+    // 64-bit key to 32-bit value, open addressing; Clear() costs nothing (a generation count).
+    struct FlatTable
+    {
+        struct Slot { uint64_t key = 0; uint32_t value = 0, generation = 0; };
+        std::vector<Slot> slots = std::vector<Slot>(4096);
+        uint32_t generation = 1;
+        size_t used = 0;
+        void Clear() { generation++; used = 0; }
+        uint32_t* Find(uint64_t key, bool insert)
+        {
+            if (insert && (used + 1) * 2 > slots.size())
+            {
+                std::vector<Slot> old = std::move(slots);
+                slots.assign(old.size() * 2, Slot{});
+                used = 0;
+                for (const Slot& slot : old) if (slot.generation == generation) *Find(slot.key, true) = slot.value;
+            }
+            const size_t mask = slots.size() - 1;
+            for (size_t at = size_t((key * 0x9E3779B97F4A7C15ull) >> 32) & mask;; at = (at + 1) & mask)
+            {
+                Slot& slot = slots[at];
+                if (slot.generation != generation)
+                {
+                    if (!insert) return nullptr;
+                    slot = { key, 0, generation };
+                    used++;
+                    return &slot.value;
+                }
+                if (slot.key == key) return &slot.value;
+            }
+        }
+    };
+
     struct MotionVariant
     {
         std::vector<int> slots;        // texture slots the vertex shader reads
         std::bitset<256> position;     // vertex constants its output position depends on (PositionConstants)
+        uint32_t constantBytes = 4096; // of the constants, as far as the vertex shader can read (ConstantEnd)
         bool tried = false;
         std::atomic<int> state{ 0 };   // 0 not asked for, 1 being compiled, 2 ready, 3 can't be made
         ComPtr<ID3DBlob> blob;         // touched by the worker only
@@ -2434,7 +2482,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         std::vector<std::pair<int, std::shared_ptr<DecodedTexture>>> textures;
     };
     std::vector<PreviousDraw> gPreviousDraws;                      // last frame's noted draws (the storage is reused)
-    std::unordered_map<uint64_t, uint32_t> gPreviousIndex;         // by key and order among equals
+    FlatTable gPreviousIndex;                                      // by key and order among equals
     std::unordered_map<uint64_t, DecodedResource> gDecodedBefore;   // host textures holding last frame's contents
     struct MotionJobs
     {
@@ -2589,9 +2637,12 @@ float PSMain(float4 position : SV_Position) : SV_Target
 
     MotionVariant& VariantFor(const GuestShader& vs)
     {
+        if (vs.motionVariant) return *static_cast<MotionVariant*>(vs.motionVariant);   // (the table's entries never move)
         MotionVariant& variant = gMotionVariants[vs.hash];
+        vs.motionVariant = &variant;
         if (variant.tried) return variant;
         variant.tried = true;
+        variant.constantBytes = uint32_t(std::clamp(ConstantEnd(const_cast<GuestShader&>(vs)), 0, 256)) * 16;
         const std::string& hlsl = vs.hlsl;
         variant.position = PositionConstants(hlsl);
         if (hlsl.find("TextureCube") != std::string::npos) { variant.state = 3; return variant; }
@@ -2747,20 +2798,39 @@ float2 main(MotionOut input) : SV_Target
         if (off || gSkinnedDraws.empty()) return;
 
         struct Candidate { const SkinnedDraw* record; const PreviousDraw* before; bool skinned; };
-        std::vector<Candidate> candidates;
+        static std::vector<Candidate> candidates;   // (storage reused)
+        candidates.clear();
         candidates.reserve(gSkinnedDraws.size());
-        std::unordered_map<uint64_t, uint32_t> order;
+        static FlatTable order;
+        order.Clear();
         for (const SkinnedDraw& record : gSkinnedDraws)
         {
-            const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
-            auto before = gPreviousIndex.find(key);
-            if (before == gPreviousIndex.end()) continue;
-            candidates.push_back({ &record, &gPreviousDraws[before->second], !VertexTextureSlots(*record.draw->vs)->empty() });
+            const uint64_t key = record.key + (*order.Find(record.key, true))++ * 0x9E3779B97F4A7C15ull;
+            const uint32_t* before = gPreviousIndex.Find(key, false);
+            if (!before) continue;
+            candidates.push_back({ &record, &gPreviousDraws[*before], !VertexTextureSlots(*record.draw->vs)->empty() });
         }
         double inverseNow[16], inverseBefore[16];
         const bool cameras = gCameraNowValid && gCameraBeforeValid && Invert4x4(gCameraNow, inverseNow) && Invert4x4(gCameraBefore, inverseBefore);
         // A combined matrix (four registers, by rows) whose world part is unchanged: only the camera moved.
-        auto cameraOnly = [&](const float* now, const float* before) {
+        // (Asked again and again with the same eight registers, the shared camera in c5-c8 of draw
+        // after draw: the last answer is kept.)
+        float askedNow[16] = {}, askedBefore[16] = {};
+        bool asked = false, answer = false;
+        static const bool exactTest = GetEnvironmentVariableA("NIER_MOTION_EXACT", nullptr, 0) > 0;
+        static const bool why = GetEnvironmentVariableA("NIER_MOTION_WHY", nullptr, 0) > 0;
+        static std::unordered_map<uint64_t, uint32_t> whyCounts;
+        // The camera's own map from this frame's clip space to the last one's.
+        double cameraBack[16] = {};
+        if (cameras)
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                {
+                    double sum = 0;
+                    for (int k = 0; k < 4; k++) sum += gCameraBefore[r * 4 + k] * inverseNow[k * 4 + c];
+                    cameraBack[r * 4 + c] = sum;
+                }
+        auto cameraOnlyWork = [&](const float* now, const float* before) {
             if (!cameras) return false;
             // It has to look like one (as the camera does: the z row is the w row but for its last
             // term); rows of a matrix palette are tried here too and must not pass.
@@ -2768,37 +2838,95 @@ float2 main(MotionOut input) : SV_Target
             const float* w = now + 12;
             const float length = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
             if (length < 1e-6f || std::fabs(z[0] - w[0]) + std::fabs(z[1] - w[1]) + std::fabs(z[2] - w[2]) > 0.02f * length) return false;
-            // Element by element: against the largest element (a translation of hundreds) a slow
-            // rotation would pass for none.
+            if (exactTest)
+            {
+                // Element by element: against the largest element (a translation of hundreds) a slow
+                // rotation would pass for none.
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++)
+                    {
+                        double a = 0, b = 0;
+                        for (int k = 0; k < 4; k++) { a += inverseNow[r * 4 + k] * now[k * 4 + c]; b += inverseBefore[r * 4 + k] * before[k * 4 + c]; }
+                        if (std::fabs(a - b) > 5e-5 * std::max(1.0, std::fabs(a))) return false;
+                    }
+                return true;
+            }
+            // By what it would mean on screen. That test (the world parts, element by element, to
+            // one part in 20,000) called most still objects moving whenever the camera did: the
+            // matrices are single precision with terms in the hundreds, and taking the camera out
+            // of them loses that much. In the village overview's pan 358 of 568 scene draws went
+            // through the motion pass for it, 2.3 ms a frame on the Steam Deck. Here the object's
+            // own map from this frame's clip space to the last one's (its matrix a frame ago times
+            // the inverse of its matrix now) is set against the camera's alone, at fifteen points
+            // of the view, and the object counts as still if no point lands more than three tenths
+            // of a 1280x720 pixel apart. NIER_MOTION_EXACT=1: the old test.
+            double mNow[16], mBefore[16], inverseOwn[16];
+            for (int i = 0; i < 16; i++) { mNow[i] = now[i]; mBefore[i] = before[i]; }
+            if (!Invert4x4(mNow, inverseOwn)) return false;
+            double own[16];
             for (int r = 0; r < 4; r++)
                 for (int c = 0; c < 4; c++)
                 {
-                    double a = 0, b = 0;
-                    for (int k = 0; k < 4; k++) { a += inverseNow[r * 4 + k] * now[k * 4 + c]; b += inverseBefore[r * 4 + k] * before[k * 4 + c]; }
-                    if (std::fabs(a - b) > 5e-5 * std::max(1.0, std::fabs(a))) return false;
+                    double sum = 0;
+                    for (int k = 0; k < 4; k++) sum += mBefore[r * 4 + k] * inverseOwn[k * 4 + c];
+                    own[r * 4 + c] = sum;
                 }
-            return true;
+            static const double kXY[5][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 }, { 0, 0 } };
+            static const double kZ[3] = { 0.9, 0.99, 0.999 };   // 1, 10 and 100 units away with the game's near plane of 0.1
+            int compared = 0;
+            for (const auto& xy : kXY)
+                for (double z : kZ)
+                {
+                    const double clip[4] = { xy[0], xy[1], z, 1.0 };
+                    double a[4], b[4];
+                    for (int r = 0; r < 4; r++)
+                    {
+                        a[r] = own[r * 4] * clip[0] + own[r * 4 + 1] * clip[1] + own[r * 4 + 2] * clip[2] + own[r * 4 + 3] * clip[3];
+                        b[r] = cameraBack[r * 4] * clip[0] + cameraBack[r * 4 + 1] * clip[1] + cameraBack[r * 4 + 2] * clip[2] + cameraBack[r * 4 + 3] * clip[3];
+                    }
+                    if (a[3] < 1e-6 || b[3] < 1e-6) continue;   // behind the camera a frame ago
+                    compared++;
+                    if (std::fabs(a[0] / a[3] - b[0] / b[3]) * 640.0 > 0.3 || std::fabs(a[1] / a[3] - b[1] / b[3]) * 360.0 > 0.3) return false;
+                }
+            return compared != 0;
+        };
+        auto cameraOnly = [&](const float* now, const float* before) {
+            if (asked && memcmp(now, askedNow, 64) == 0 && memcmp(before, askedBefore, 64) == 0) return answer;
+            memcpy(askedNow, now, 64);
+            memcpy(askedBefore, before, 64);
+            asked = true;
+            return answer = cameraOnlyWork(now, before);
         };
         auto rigidMoved = [&](const RendererDraw& draw, const PreviousDraw& old) {
             const float* now = draw.constants.data();
             const float* before = old.constants.data();
-            if (memcmp(now, before, 4096) == 0) return false;
-            const std::bitset<256>& position = VariantFor(*draw.vs).position;
-            for (int r = 0; r < 256;)
+            const MotionVariant& variant = VariantFor(*draw.vs);
+            if (memcmp(now, before, variant.constantBytes) == 0) return false;
+            // The first position register that changed and is not part of four in a row (position
+            // registers all) holding a matrix that changed with the camera only: the object moved.
+            // Stopping there matters: a shader that skins from a palette of matrices in its
+            // constants has two hundred position registers, and every window of four was tried
+            // against the camera before the answer was given (most of this function's own time in
+            // the village overview, where such draws are most of what moves).
+            const std::bitset<256>& position = variant.position;
+            const int last = int(variant.constantBytes / 16);
+            bool explained[260] = {};
+            for (int q = 0; q < last; q++)
             {
-                if (!position[r]) { r++; continue; }
-                int end = r;
-                bool changed[256];
-                bool any = false;
-                for (; end < 256 && position[end]; end++) any |= changed[end] = memcmp(now + end * 4, before + end * 4, 16) != 0;
-                if (any)
+                if (!position[q] || explained[q] || memcmp(now + q * 4, before + q * 4, 16) == 0) continue;
+                bool found = false;
+                for (int start = (std::max)(q - 3, 0); start <= q && start + 4 <= 256 && !found; start++)
+                    if (position[start] && position[start + 1] && position[start + 2] && position[start + 3] && cameraOnly(now + start * 4, before + start * 4))
+                    {
+                        explained[start] = explained[start + 1] = explained[start + 2] = explained[start + 3] = true;
+                        found = true;
+                    }
+                if (!found)
                 {
-                    for (int q = r; q + 4 <= end; q++)
-                        if ((changed[q] || changed[q + 1] || changed[q + 2] || changed[q + 3]) && cameraOnly(now + q * 4, before + q * 4))
-                            changed[q] = changed[q + 1] = changed[q + 2] = changed[q + 3] = false;
-                    for (int q = r; q < end; q++) if (changed[q]) return true;
+                    // NIER_MOTION_WHY=1: which register made a rigid draw count as moving, and in which shader.
+                    if (why) whyCounts[(uint64_t(q) << 56) | (draw.vs->hash & 0x00FFFFFFFFFFFFFFull)]++;
+                    return true;
                 }
-                r = end;
             }
             return false;
         };
@@ -2806,6 +2934,9 @@ float2 main(MotionOut input) : SV_Target
         uint32_t drawn = 0, skinnedCount = 0, rigidCount = 0, waiting = 0;
         const auto started = std::chrono::steady_clock::now();
         D3D12_GPU_DESCRIPTOR_HANDLE plainTable{};   // for draws whose vertex shader reads no textures: the depth copy only, made once
+        // What the command list was last told for this pass. A draw that binds textures may upload
+        // some, which changes the list's state: it sets everything and the next one starts afresh.
+        struct Told { bool valid = false; ID3D12PipelineState* pipeline = nullptr; UINT64 table = 0; D3D12_VIEWPORT viewport{}; D3D12_RECT scissor{}; int strip = -1; } told;
         for (const Candidate& candidate : candidates)
         {
             const SkinnedDraw& record = *candidate.record;
@@ -2868,24 +2999,38 @@ float2 main(MotionOut input) : SV_Target
             }
             // A vertex shader reads the first 256 registers only (the rest are the pixel shader's).
             ArenaBlock constants = ArenaAlloc(2 * 8192, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-            memcpy(constants.cpu, draw.constants.data(), 4096);
-            memcpy(constants.cpu + 8192, old.constants.data(), 4096);
-            gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            gList->RSSetViewports(1, &record.viewport);
-            gList->RSSetScissorRects(1, &record.scissor);
-            BindDrawRoot();
-            gList->SetPipelineState(pipeline);
+            memcpy(constants.cpu, draw.constants.data(), variant.constantBytes);
+            memcpy(constants.cpu + 8192, old.constants.data(), variant.constantBytes);
+            if (!plain) told.valid = false;
+            if (!told.valid)
+            {
+                gList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                BindDrawRoot();
+            }
+            if (!told.valid || memcmp(&told.viewport, &record.viewport, sizeof(D3D12_VIEWPORT)) != 0) { gList->RSSetViewports(1, &record.viewport); told.viewport = record.viewport; }
+            if (!told.valid || memcmp(&told.scissor, &record.scissor, sizeof(D3D12_RECT)) != 0) { gList->RSSetScissorRects(1, &record.scissor); told.scissor = record.scissor; }
+            if (!told.valid || told.pipeline != pipeline) { gList->SetPipelineState(pipeline); told.pipeline = pipeline; }
             gList->SetGraphicsRootConstantBufferView(0, constants.gpu);
             gList->SetGraphicsRootConstantBufferView(1, record.system);
             gList->SetGraphicsRootShaderResourceView(2, record.vertices);
-            gList->SetGraphicsRootDescriptorTable(3, gpu);
-            gList->IASetPrimitiveTopology(draw.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            if (!told.valid || told.table != gpu.ptr) { gList->SetGraphicsRootDescriptorTable(3, gpu); told.table = gpu.ptr; }
+            if (!told.valid || told.strip != int(draw.strip)) { gList->IASetPrimitiveTopology(draw.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); told.strip = int(draw.strip); }
+            told.valid = plain;
             gList->IASetIndexBuffer(&record.indices);
             gList->DrawIndexedInstanced(record.indices.SizeInBytes / 4, 1, 0, 0, 0);
             drawn++;
         }
         static const int every = [] { char v[16]; return GetEnvironmentVariableA("NIER_MOTION_LOG", v, sizeof(v)) ? std::max(1, atoi(v)) : 600; }();
         static uint32_t frames = 0;
+        if (why && frames % 600 == 599)
+        {
+            std::vector<std::pair<uint32_t, uint64_t>> sorted;
+            for (const auto& [key, count] : whyCounts) sorted.emplace_back(count, key);
+            std::sort(sorted.rbegin(), sorted.rend());
+            for (size_t i = 0; i < sorted.size() && i < 12; i++)
+                Log("[fsr3] why moving: register c%u of vertex shader ..%014llX, %u times in 600 frames\n", unsigned(sorted[i].second >> 56), (unsigned long long)(sorted[i].second & 0x00FFFFFFFFFFFFFFull), sorted[i].first);
+            whyCounts.clear();
+        }
         if (frames++ % every == 0)
             Log("[fsr3] object motion: of %zu scene draws (%zu paired with last frame's) %u skinned and %u rigid ones moved; %u drawn, %u waiting for their shader; %.2f ms; %u effect draws in the reactive mask\n",
                 gSkinnedDraws.size(), candidates.size(), skinnedCount, rigidCount, drawn, waiting, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), gReactive.draws);
@@ -2894,18 +3039,20 @@ float2 main(MotionOut input) : SV_Target
     // End of a frame's commands: what the next frame's object motion needs of this one.
     void RememberSkinnedDraws()
     {
-        gPreviousIndex.clear();
+        gPreviousIndex.Clear();
         gPreviousDraws.resize(gSkinnedDraws.size());
-        std::unordered_map<uint64_t, uint32_t> order;
+        static FlatTable order;
+        order.Clear();
         uint32_t index = 0;
         for (const SkinnedDraw& record : gSkinnedDraws)
         {
-            const uint64_t key = record.key + order[record.key]++ * 0x9E3779B97F4A7C15ull;
+            const uint64_t key = record.key + (*order.Find(record.key, true))++ * 0x9E3779B97F4A7C15ull;
             PreviousDraw& kept = gPreviousDraws[index];
-            gPreviousIndex[key] = index++;
-            memcpy(kept.constants.data(), record.draw->constants.data(), sizeof(kept.constants));
+            *gPreviousIndex.Find(key, true) = index++;
+            const MotionVariant& variant = VariantFor(*record.draw->vs);
+            memcpy(kept.constants.data(), record.draw->constants.data(), variant.constantBytes);
             kept.textures.clear();
-            for (int slot : *VertexTextureSlots(*record.draw->vs))
+            for (int slot : variant.slots)
                 if (record.draw->textures[slot].valid && record.draw->textures[slot].decoded) kept.textures.emplace_back(slot, record.draw->textures[slot].decoded);
         }
         gSkinnedDraws.clear();
@@ -3116,6 +3263,9 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 if (pass < shadowPasses.size() && i >= shadowPasses[pass].first) continue;
                 const RendererDraw* draw = std::get_if<RendererDraw>(&frame.commands[i]);
                 if (!draw || !draw->hasColor || !draw->depthBound || !(draw->depthControl & 2)) continue;
+                // (A draw holds its constants only as far as its shaders read them: one that does
+                // not read c5-c8 has nothing there to vote with.)
+                if (!draw->vs || ConstantEnd(*draw->vs) < 9) continue;
                 const float* c = draw->constants.data() + 5 * 4;
                 const float wLength = std::sqrt(c[12] * c[12] + c[13] * c[13] + c[14] * c[14]);
                 const float apart = std::fabs(c[8] - c[12]) + std::fabs(c[9] - c[13]) + std::fabs(c[10] - c[14]);
@@ -3465,6 +3615,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         uint32_t shownCopies = 0;
         gExecutingFrame = frame.frame;
         gArenaOffset = 0;
+        gConstantsGroup = 0;   // (the arena starts again: last frame's block is gone)
         gFrameVertexUploads.clear();
         KeptVerticesBeginFrame();
         gDrawSrvUsed = 0;
@@ -4618,6 +4769,23 @@ void RendererSubmitFrame(RendererFrame&& frame)
         gFrameQueue.push_back(std::move(frame));
     }
     gMailboxChanged.notify_one();
+}
+
+int ShaderConstantEnd(const std::string& text, bool pixel)
+{
+    static const bool all = GetEnvironmentVariableA("NIER_ALL_CONSTANTS", nullptr, 0) > 0;
+    const int first = pixel ? 256 : 0;
+    int end = first;
+    for (size_t at = text.find("c["); at != std::string::npos && !all; at = text.find("c[", at + 2))
+    {
+        if (at > 0 && (isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_')) continue;   // another name ending in c
+        char* after = nullptr;
+        const long index = strtol(text.c_str() + at + 2, &after, 10);
+        if (after == text.c_str() + at + 2 || *after != ']') { end = first + 256; break; }   // not a plain number: anything in its half
+        end = (std::max)(end, int(index) + 1);
+    }
+    if (all || end > first + 256 || text.empty()) end = first + 256;
+    return end;
 }
 
 void RendererDumpStats()

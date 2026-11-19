@@ -587,6 +587,7 @@ namespace
         shader->hash = capture.hash;
         shader->hlsl = entry.info.hlsl;
         shader->pixel = stage == 1;
+        shader->constantEnd = ShaderConstantEnd(shader->hlsl, shader->pixel);   // before anyone else sees the shader: BuildDraw reads it
         entry.shader = shader;
         if (entry.info.ok) RendererPrepareShader(shader);   // compile in the background, ahead of use
         char path[96];
@@ -1638,7 +1639,34 @@ namespace
             gVertexCacheBytes += totalBytes;
         }
 
-        memcpy(draw.constants.data(), &r[0x4000], draw.constants.size() * 4);
+        // Only the constants the draw's two shaders can read (GuestShader::constantEnd): all 8 KB
+        // for every draw was 20 MB a frame in a wide scene, and the renderer passes on no more
+        // than this either. What lies beyond in draw.constants is not set.
+        {
+            const int vsEnd = std::clamp(vs->shader->constantEnd >= 0 ? vs->shader->constantEnd : 256, 0, 256);
+            const int psEnd = std::clamp(ps->shader->constantEnd >= 0 ? ps->shader->constantEnd : 512, 256, 512);
+            memcpy(draw.constants.data(), &r[0x4000], size_t(vsEnd) * 16);
+            memcpy(draw.constants.data() + 256 * 4, &r[0x4000 + 256 * 4], size_t(psEnd - 256) * 16);
+            // Four draws in ten have the same constants as the draw before, as far as they read
+            // them (the passes of one mesh; measured in the lighthouse, 43,000 of 107,000 draws in
+            // 600 frames): those get its group number, and the renderer copies a group's constants
+            // to the GPU once. Compared against the first draw of the group, whose reach covers
+            // this one's or the group ends.
+            static float before[2048];
+            static int beforeVs = 0, beforePs = 256;
+            static uint32_t group = 0;
+            const bool equal = group != 0 && vsEnd <= beforeVs && psEnd <= beforePs && memcmp(before, draw.constants.data(), size_t(vsEnd) * 16) == 0 &&
+                memcmp(before + 1024, draw.constants.data() + 1024, size_t(psEnd - 256) * 16) == 0;
+            if (!equal)
+            {
+                memcpy(before, draw.constants.data(), size_t(vsEnd) * 16);
+                memcpy(before + 1024, draw.constants.data() + 1024, size_t(psEnd - 256) * 16);
+                beforeVs = vsEnd;
+                beforePs = psEnd;
+                if (++group == 0) group = 1;
+            }
+            draw.constantsGroup = group;
+        }
         memcpy(draw.boolConstants.data(), &r[0x4900], draw.boolConstants.size() * 4);
 
         std::set<uint32_t> textureSlots = ps->info.textureSlots, cubeSlots = ps->info.cubeSlots;

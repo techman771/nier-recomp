@@ -21,7 +21,11 @@ struct GuestShader
     std::string hlsl;
     bool pixel = false;
     int constantEnd = -1;   // one past the last float4 of c[] the shader can read (renderer_d3d12.cpp ConstantEnd); -1 not worked out yet
+    mutable void* motionVariant = nullptr;   // the renderer's record of this vertex shader for the motion vector pass (VariantFor), once looked up
 };
+// One past the last constant (float4 of c[]) a shader's text can read: 0-256 for a vertex shader,
+// 256-512 for a pixel shader (renderer_d3d12.cpp; what GuestShader::constantEnd holds).
+int ShaderConstantEnd(const std::string& hlsl, bool pixel);
 
 enum class GuestTextureFormat { RGBA8, BC1, BC2, BC3, R8, RGBA16F, RG16F, R32F, RG32F, RGBA32F };
 
@@ -171,7 +175,11 @@ struct RendererDraw
     ByteBuffer vertexData;                     // byte order already corrected
     bool vertexKept = false;                   // these bytes are a copy shared with earlier draws (gpu.cpp's vertex cache): worth keeping on the GPU
     std::array<uint32_t, 96> vertexBase{};
-    std::array<float, 2048> constants;         // not initialized (see the constructor)
+    std::array<float, 2048> constants;         // not initialized (see the constructor); set only as far as the two shaders read (GuestShader::constantEnd)
+    // Draws with the same number here have the same constants as far as they read them (gpu.cpp
+    // BuildDraw counts on when they change): the renderer copies them to the GPU once for the run
+    // of them. 0: not known (a draw from a capture).
+    uint32_t constantsGroup = 0;
     std::array<uint32_t, 8> boolConstants{};
     TextureSet textures;                       // one per fetch constant
     bool bypassViewport = false;

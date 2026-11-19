@@ -2381,6 +2381,72 @@ the place"):
     motion-vector pass draws the scene's geometry a second time and 6.9 MB of constants are
     copied), the wait for the GPU 9.0. A faster clock will not help it; a cheaper motion pass
     would.
+  - The motion pass made cheaper per draw (2026-11-19; renderer_d3d12.cpp, the comment above
+    `FlatTable`). It looks at every opaque scene draw of the frame, and did for each: three or
+    four look-ups of the shader's record in a table by hash, two node-based tables filled and
+    emptied a frame (`order` twice, gPreviousIndex), and 4 KB of vertex constants compared,
+    remembered for the next frame and, for a moving object, copied twice. Now the record hangs
+    on the shader (`GuestShader::motionVariant`), the tables are one flat one emptied by a
+    count, and the constants go only as far as the vertex shader can read
+    (`MotionVariant::constantBytes`, from ConstantEnd); the "only the camera moved" test keeps
+    its last answer, since draw after draw asks it about the same shared camera registers.
+    Lighthouse replay with FSR 3.1 Native: the pass's counts are the same before and after
+    (101 scene draws, 7 skinned and 28 rigid moved, 35 drawn). That scene has a hundred scene
+    draws and shows no difference in time on the PC; the village overview has thousands and is
+    where it has to be measured. On the Deck in the village overview (900p, FSR 3.1 Native, 40
+    fps, 1300 MHz) it moved little: recording 12.8 ms a frame against 13.2, 38.4 fps against
+    38.6. The pass's own line there: "of 568 scene draws ... 15 skinned and 358 rigid ones
+    moved; 373 drawn ...; 2.29 ms". So the scene has hundreds of scene draws, not thousands,
+    and the cost is the 373 motion draws (6 microseconds each) and working out that they moved.
+  - Why 358 "rigid" draws move there: they are not still objects mistaken for moving ones. A
+    replacement for the camera-only test that judges by position on screen (kept:
+    `cameraOnlyWork`, fifteen points of the view, 0.3 of a pixel; NIER_MOTION_EXACT=1 for the
+    old element-by-element one) changed no count in the lighthouse replay. `NIER_MOTION_WHY=1`
+    logs which register made a draw count as moving: c43, c46 and c0 of a few vertex shaders,
+    and those shaders skin from a palette of matrices in their constants (`c[43 + a0]`). They
+    are animated things posed on the CPU side, and their motion is real. "Rigid" in this code
+    only means "skinned without textures".
+  - So the work per moving draw was cut instead: `rigidMoved` stops at the first position
+    register that changed and no camera-only window explains (it used to try every window of
+    four across a palette shader's two hundred position registers before answering), and the
+    pass sets render target, root signature, viewport, scissor, pipeline, descriptor table and
+    topology only when they differ from the draw before (a draw that binds textures may upload
+    some, so it sets everything and the next starts afresh). Lighthouse replay: the same counts
+    as before (rigid moved 50.7 a reading on average, 57.6 drawn), picture looked at. Not yet
+    run on the Deck in this form.
+  - Shader constants, the rest (2026-11-19). Two things were still copied in full or again:
+    - The command thread copied all 8 KB of constants into every draw (BuildDraw: about 20 MB a
+      frame in a wide scene). It now copies only as far as the draw's two shaders read
+      (`GuestShader::constantEnd`, set when the shader is translated; `ShaderConstantEnd` in
+      renderer_d3d12.cpp does the reading of the text for both sides). What lies beyond in
+      `RendererDraw::constants` is not set; the one reader that looked there, the camera vote
+      in TemporalBeginFrame (c5-c8 of every scene draw), now passes over draws whose vertex
+      shader does not read that far.
+    - Draws with the same constants as the draw before, as far as they read them, are four in
+      ten (lighthouse: 43,000 of 107,000 in 600 frames; the passes of one mesh). BuildDraw gives
+      such a run one `constantsGroup` number (a compare against the run's first draw), and
+      ExecuteDraw makes one block in the arena for the run instead of one a draw, unless the
+      block does not reach as far as this draw's shaders read or either draw needs the shadow
+      map's constants restated (that changes the copy, so the test for it was moved ahead of
+      the copy and reads the draw's own constants).
+    Lighthouse replay at 1080p output with shadows on Ultra: constants copied to the GPU 1410 KB
+    a frame down to 1040 (with the game's own shadow maps more draws could share); a frame
+    captured on the Deck replays pixel for pixel as before; the three verification switches
+    silent; picture looked at. On the Deck, the village overview at 900p with FSR 3.1 Native,
+    40 fps, 1300 MHz, with this and the motion pass changes: 38.8 fps (38.4 before), recording
+    11.9 ms a frame (12.8), the motion pass 1.78 ms for 406 draws (2.29 for 373: 4.4
+    microseconds a draw against 6.1), constants 5.4 MB a frame (6.6), 477 of 600 frames on time
+    with 81 late and the slowest 1% at 46.6 ms (470, 84, 47.6). The user saw lighting and shadows
+    right. Better on every count and still
+    short: the render thread takes 21.5 ms of the 25, recording 11.9 and then waiting 9.6 for
+    the GPU.
+  - Those two add up because the render thread waits for the GPU to finish each frame before it
+    records the next (RenderFrame: WaitForGpu after Present; the arena, the retired resources
+    and the read-backs all count on the GPU being idle when a frame starts). Recording frame
+    N+1 while the GPU draws frame N would make the frame cost the larger of the two, not the
+    sum: 12 ms here instead of 21.5. That is the next large step for this scene, and a deep
+    change (two arenas, resources retired a frame later, read-backs delivered a frame later,
+    settings changes and the kept buffer's drop waiting for the GPU by themselves).
   - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
     display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
     values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as
