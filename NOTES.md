@@ -972,14 +972,14 @@ What is known about the game's time step:
   10 s of running from there at 240 fps, so the teleport is not reproduced in a test run yet.
 
 Kaine's warp reproduced in a test run (17 November 2026, late):
-- The user recorded their input (`run_boot.ps1 14400 -Playtest -Record recompecordings\kaine_desert.input`,
+- The user recorded their input (`run_boot.ps1 14400 -Playtest -Record recompecordings\kaine_desert.input`,
   never committed): load slot 3 (GAME_DATA2, saved in Facade), out the door, run in the desert
-  with Kaine following, 15,000 frames at 240 fps. `toolseplay_input_test.ps1 <seconds> <label>
+  with Kaine following, 15,000 frames at 240 fps. `toolseplay_input_test.ps1 <seconds> <label>
   [<exe>]` replays it muted on the second monitor with a copy of all the saves and the user's
   settings (log: recomp\replay_<label>.log). The route holds
   (desert by frame 9000) and Kaine warps with the white flash several times between frames 9600
   and 11800; the exact frames move by a couple of hundred between runs.
-- Function coverage: `recompuntime\cover.cpp` + `cover_prologue.h`. A coverage build is the
+- Function coverage: `recompuntime\cover.cpp` + `cover_prologue.h`. A coverage build is the
   normal build.ninja copied to recompuild_cover with `/FI../runtime/cover_prologue.h` added to
   the cxx rule (ninja -C recompuild_cover, under a minute), its nier.exe copied to
   recompuild
@@ -1018,6 +1018,29 @@ Kaine's warp at high frame rates: cause found and fixed (18 November 2026, await
   0x85F08458+16): every such test is a 30 fps assumption and a candidate for the other high
   frame rate problems (hair, fishing camera). Tools: NIER_BREAK now logs the guest call chain,
   NIER_WATCH_WRITE logs the full chain too.
+
+Kaine's hair (18 November 2026): not a bug. Her hair streaming sideways while she stands is the
+game's wind (the user's correction); nothing was changed for it.
+
+Fishing camera too fast at 240 fps (18 November 2026): fixed (hook FishingCameraTurn).
+- Repro: `tools\replay_input_test.ps1 78 <label> nier.exe fishing.input` replays the user's input
+  (slot 2, GAME_DATA1; walk to the water at Seafront, fish; recorded at 240 fps; a copy of the
+  saves it was made with is in recomp\recordings\fishing_save). The rod is out by frame 12300;
+  from about frame 12750 the user works the right stick and the camera swung from behind the
+  player to the sky. The replay script pins the recorded frame rate (-FrameRate, 5).
+- How it was found: NIER_BREAK on sub_8258CBC0 (the caller of XamInputGetState) gives the pads'
+  storage: pad 0's XINPUT_STATE at 85F4FCAC, 0x228 bytes a pad, the processed values around it
+  (right stick as floats at 85F4FD18 / 85F4FD1C, read through sub_8258CA90 / sub_8258CAA8).
+  NIER_WATCH_READ=85F4FCA0,552,12800 during the fishing lists the readers: the ordinary camera
+  (sub_821A1850) and sub_821A5830, both from sub_821A7D00.
+- Cause: sub_821A5830 (the fishing camera) turns its angles (+424 across, +452 up/down) into
+  degrees, adds stick * constant * sensitivity setting, and stores them back: a fixed number of
+  degrees a frame with no time step. The hook at 0x821A5B68 multiplies the two stick terms
+  (f29, f30) by step * 30. NIER_FRAME_COUNTS=1 turns it off for comparison.
+- Check: the same replay captured at frame 13300: behind the player looking at the water with
+  the hook, under the player looking at the sky without. Confirmed by the user in a playtest.
+- The coverage build's build.ninja must be regenerated from recomp\build\build.ninja whenever a
+  runtime file is added (it failed to link without highfps.cpp).
 
 ### Other aspect ratios (16:10, ultrawide): findings so far, nothing built
 

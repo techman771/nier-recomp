@@ -2,10 +2,12 @@
 # monitor that replays recorded controller input (run_boot.ps1 -Record) with a copy of all the saves
 # and the player's settings, so the menus and the frame rate are what they were when it was recorded.
 # Other NIER_ switches come from the caller. Log: recomp\replay_<label>.log.
-param([int]$Seconds = 90, [string]$Label = 'replay', [string]$Exe = 'nier.exe', [string]$Recording = 'kaine_desert.input')
+param([int]$Seconds = 90, [string]$Label = 'replay', [string]$Exe = 'nier.exe', [string]$Recording = 'kaine_desert.input', [int]$FrameRate = 5)
 $root = Split-Path $PSScriptRoot -Parent
 $settings = "$root\recomp\replay_settings.ini"
-Copy-Item "$root\recomp\build\settings.ini" $settings -Force
+# The input is replayed by frame number, so the frame rate must be the one it was recorded at
+# (-FrameRate, the setting's index: 5 is 240 fps), with VSync off so the display doesn't cap it.
+(Get-Content "$root\recomp\build\settings.ini") -replace '^frame_rate = .*', "frame_rate = $FrameRate" -replace '^vsync = .*', 'vsync = 0' | Set-Content $settings -Encoding ascii
 $testSave = "$root\recomp\test_save"
 if (Test-Path $testSave) { Remove-Item -Recurse -Force $testSave }
 Copy-Item -Recurse "$root\save" $testSave

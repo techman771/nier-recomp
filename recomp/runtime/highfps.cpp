@@ -61,3 +61,15 @@ void PartnerStuckCadence(PPCRegister& r11, PPCRegister& r31)
 {
     if (!KeepFrameCounts()) r11.u64 = EveryFramesAt30(r31.u32, 0x82214118, 4) ? 0 : 1;
 }
+
+// The fishing camera turning far too fast at high frame rates. Its update (sub_821A5830) turns
+// the camera's angles into degrees, adds the right stick times the sensitivity setting, and
+// stores them back: a fixed number of degrees a frame, where the ordinary camera goes by time.
+// f29, f30: the stick's turn for this frame, across and up/down, in degrees at 30 fps.
+void FishingCameraTurn(PPCRegister& f29, PPCRegister& f30)
+{
+    if (KeepFrameCounts()) return;
+    const double share = double(GameStep()) * 30.0;
+    f29.f64 *= share;
+    f30.f64 *= share;
+}

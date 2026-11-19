@@ -134,3 +134,12 @@ registers = ["r11", "r31"]
 name = "PartnerStuckCadence"
 address = 0x82214118
 registers = ["r11", "r31"]
+
+# High frame rates: the fishing camera (sub_821A5830) adds the right stick to the camera's angles
+# as degrees a frame, with no time step, so at 240 fps it turned eight times as fast as on the
+# console. The hook scales the two stick terms (f29 across, f30 up and down) by the frame's
+# share of a 30 fps frame (runtime: highfps.cpp).
+[[midasm_hook]]
+name = "FishingCameraTurn"
+address = 0x821A5B68
+registers = ["f29", "f30"]
