@@ -2447,6 +2447,55 @@ the place"):
     sum: 12 ms here instead of 21.5. That is the next large step for this scene, and a deep
     change (two arenas, resources retired a frame later, read-backs delivered a frame later,
     settings changes and the kept buffer's drop waiting for the GPU by themselves).
+  - Built (2026-11-19), behind a switch and off unless asked for: `NIER_OVERLAP=1`, or a file
+    `recomp/overlap_on` (for the Deck, where it can be made and removed over SSH between
+    launches; `NIER_OVERLAP=0` wins over the file). Chosen when the renderer starts
+    (renderer_d3d12.cpp `gOverlap`, logged as "overlap on"). What it does:
+    - Everything a frame's commands read that the CPU fills in exists twice, and frames take
+      the two sets in turn (`SwapFrameSet`): the command allocator, the draw descriptor heap,
+      the arena (two of 128 MB in place of one of 256), the list of retired resources, the
+      read-back buffer with its pending list, the stage timer. A frame takes the set of the
+      frame before last once that frame's fence value has passed and its read-backs are
+      delivered; only then are that set's retired resources let go and its stage times read
+      (the [perf] line's GPU stage times are therefore those of two frames earlier).
+    - A frame is handed to the GPU only when the one before has finished there
+      (`WaitForFence(gOtherSetFence)` before ExecuteCommandLists): one frame on the GPU, one
+      being recorded. Without that limit two could queue on the GPU, which gains nothing and
+      let the game run further ahead of its read-backs (1 to 4 frames late at 240 fps, 4 for a
+      third of them).
+    - The read-backs go to the game from a thread of their own (`DeliveryThread`) that waits
+      for the frame's fence value: the moment the GPU has made them, as before. The game may
+      hand over its next frame as soon as this one is with the GPU (`FrameOutOfHand` right
+      after the submit), not after the delivery.
+    - The wait for the swap chain moved from before recording to before Present: with one
+      frame of latency it lasts until the frame before is on screen, and waiting there first
+      would put the recording back behind the GPU.
+    - Still waiting for an idle GPU by themselves: a resolution or shadow setting change
+      (ApplyResolutionSetting), the kept vertex buffer starting again, Resize, the temporal
+      upscaler's context being destroyed, a frame being saved, and movie frames (their
+      textures and upload buffer are reused frame to frame).
+    - "Waiting for the GPU" in the [perf] line is, with overlap on, the time blocked on those
+      two fence waits.
+    Measured on the PC (lighthouse replay, 240 fps cap, 4K FSR 3 shown at 1920x1200): render
+    thread 0.96 ms a frame against 4.14 (the 3.2 ms of GPU time no longer waited for), frame
+    rate at the cap both ways, present to present as even. The debug layer (NIER_D3D_DEBUG=1)
+    reports nothing through the lighthouse. The Deck's captured frame replays to the same
+    file, on and off. Read-backs (NIER_LOG_WRITEBACK=1, frames between the frame a read-back
+    is from and the frame the game is building when it arrives): a steady 2 with overlap off;
+    with it on 1, 2 or 3 in near equal parts, 2.1 on average. Five late was what made the
+    exposure swing (RendererSubmitFrame's comment); three has not been seen to, and has not
+    been looked at long.
+    On the Deck (same day; village overview, 40 fps profile: 900p, FSR 3.1 Native, manual 1300
+    MHz read from steamosctl, Proton-GE, overlap on by the file): 39.9 fps where it was 38.8;
+    present to present 596 and 597 of 600 within 1 ms of 25.00 where 477 were, 3 or 4 long
+    frames in a window where 81 were; render thread recording 9.4-9.6 ms, waiting for the GPU
+    0.02 (it was 11.9 + 9.6), the rest of the 25 ms spent idle before Present. The window
+    after the cutscene: 600 of 600. The user saw the brightness steady.
+    Same cutscene at 60 fps, 720p FSR 3.1 Native, 1300 MHz, overlap on: 59.4-59.5 fps, 584 and
+    588 of 600 within 1 ms of 16.67, 11-13 long frames a window (1% slowest 22 ms, longest
+    31-33); recording 8.8-9.5 ms, GPU stages about 13.9 ms together, the render thread idle 7
+    ms a frame before Present. Neither the render thread nor the GPU fills the 16.7 ms, so the
+    late frames come from somewhere else (not looked into: the game's own threads are the guess).
   - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
     display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
     values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as

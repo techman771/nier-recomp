@@ -128,6 +128,10 @@ float4 PSMain(Interpolated input) : SV_Target
     UINT gRtvStep = 0;
     UINT64 gFenceValue = 0;
     HANDLE gFenceEvent = nullptr, gFrameWait = nullptr;
+    // The next frame is recorded while the GPU still draws the last one (RenderFrame; chosen when
+    // the renderer starts): everything a frame's commands read that the CPU fills in exists twice
+    // and frames take the two sets in turn. Whoever needs the GPU idle calls WaitForGpu first.
+    bool gOverlap = false;
 
     std::set<uint64_t> gFramesToSave;
     std::atomic<uint64_t> gRequestedSave{ 0 };   // from other threads; picked up by the render thread
@@ -184,6 +188,13 @@ float4 PSMain(Interpolated input) : SV_Target
             gFence->SetEventOnCompletion(value, gFenceEvent);
             WaitForSingleObject(gFenceEvent, INFINITE);
         }
+    }
+
+    void WaitForFence(UINT64 value)
+    {
+        if (!value || gFence->GetCompletedValue() >= value) return;
+        gFence->SetEventOnCompletion(value, gFenceEvent);
+        WaitForSingleObject(gFenceEvent, INFINITE);
     }
 
     void AcquireBackBuffers()
@@ -357,10 +368,14 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     std::mutex gOverlayMutex;
     std::shared_ptr<DecodedTexture> gOverlay;   // RendererSetOverlay
     ComPtr<ID3D12DescriptorHeap> gDrawSrvHeap, gTargetRtvHeap, gSamplerHeap;
+    ComPtr<ID3D12DescriptorHeap> gOtherDrawSrvHeap;   // of the set not in use (gOverlap)
 
     // The draw root signature plus its sampler table (root parameter 4).
     void BindDrawRoot();
     ComPtr<ID3D12Resource> gArena;
+    ComPtr<ID3D12Resource> gOtherArena;   // of the set not in use (gOverlap)
+    uint8_t* gOtherArenaCpu = nullptr;
+    UINT64 gArenaBytes = 0;   // kArenaBytes, or half of it for each of two
     constexpr UINT64 kKeptBytes = 160ull * 1024 * 1024;   // vertex bytes that stay on the GPU (KeptVertices)
     ComPtr<ID3D12Resource> gKept;
     uint8_t* gKeptCpu = nullptr;
@@ -434,7 +449,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
     ArenaBlock ArenaAlloc(UINT64 size, UINT64 alignment)
     {
         UINT64 begin = (gArenaOffset + alignment - 1) & ~(alignment - 1);
-        if (begin + size > kArenaBytes) begin = 0;   // only reached if one frame needs the whole arena
+        if (begin + size > gArenaBytes) begin = 0;   // only reached if one frame needs the whole arena
         gArenaOffset = begin + size;
         return { gArenaCpu + begin, gArena->GetGPUVirtualAddress() + begin, begin };
     }
@@ -509,8 +524,16 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (!Check(gDevice->CreateDescriptorHeap(&dsvHeap, IID_PPV_ARGS(&gDepthDsvHeap)), "depth heap")) return false;
         gDepthDsvStep = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
-        gArena = MakeBuffer(kArenaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        gArenaBytes = gOverlap ? kArenaBytes / 2 : kArenaBytes;
+        gArena = MakeBuffer(gArenaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         gArena->Map(0, nullptr, (void**)&gArenaCpu);
+        if (gOverlap)
+        {
+            if (!Check(gDevice->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&gOtherDrawSrvHeap)), "second draw SRV heap")) return false;
+            gOtherArena = MakeBuffer(gArenaBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (!gOtherArena) return false;
+            gOtherArena->Map(0, nullptr, (void**)&gOtherArenaCpu);
+        }
         gKept = MakeBuffer(kKeptBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         if (gKept) gKept->Map(0, nullptr, (void**)&gKeptCpu);
 
@@ -1339,6 +1362,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         if (!gKeptResetWanted && gKeptOffset <= limit) return;
         static int logged = 0;
         if (logged++ < 20) Log("[d3d12] kept vertex data: %llu MB in %zu pieces dropped, to be copied in again as drawn (frame %llu)\n", (unsigned long long)(gKeptOffset >> 20), gKeptUploads.size(), (unsigned long long)gExecutingFrame);
+        if (gOverlap) WaitForGpu();   // the frame before may still be drawing from it
         gKeptUploads.clear();
         gKeptOffset = 0;
         gKeptResetWanted = false;
@@ -3589,6 +3613,102 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         t.readback->Unmap(0, &none);
     }
 
+    // The set not in use (gOverlap), and for each set the fence value its last frame's work ends
+    // with and the number of that frame's read-back delivery (0: none).
+    ComPtr<ID3D12CommandAllocator> gOtherAllocator;
+    std::vector<ComPtr<ID3D12Resource>> gOtherRetired;
+    ComPtr<ID3D12Resource> gOtherWriteBack;
+    std::vector<PendingWriteBack> gOtherPendingWriteBacks;
+    StageTimer gOtherStages;
+    UINT64 gSetFence = 0, gOtherSetFence = 0;
+    uint64_t gSetDelivery = 0, gOtherSetDelivery = 0;
+
+    void SwapFrameSet()
+    {
+        std::swap(gAllocator, gOtherAllocator);
+        std::swap(gDrawSrvHeap, gOtherDrawSrvHeap);
+        std::swap(gArena, gOtherArena);
+        std::swap(gArenaCpu, gOtherArenaCpu);
+        std::swap(gRetired, gOtherRetired);
+        std::swap(gWriteBack, gOtherWriteBack);
+        std::swap(gPendingWriteBacks, gOtherPendingWriteBacks);
+        std::swap(gStages, gOtherStages);
+        std::swap(gSetFence, gOtherSetFence);
+        std::swap(gSetDelivery, gOtherSetDelivery);
+    }
+
+    // The resolves a frame copied into `buffer` go to guest memory (the GPU has made them).
+    void DeliverWriteBacks(ID3D12Resource* buffer, UINT64 used, const std::vector<PendingWriteBack>& pendings, uint64_t guestFrame)
+    {
+        if (pendings.empty()) return;
+        static const bool logged = GetEnvironmentVariableA("NIER_LOG_WRITEBACK", nullptr, 0) > 0;
+        if (logged) Log("[writeback] from guest frame %llu:\n", (unsigned long long)guestFrame);
+        void* mapped = nullptr;
+        D3D12_RANGE range{ 0, SIZE_T(used) };
+        if (FAILED(buffer->Map(0, &range, &mapped))) return;
+        for (const PendingWriteBack& pending : pendings)
+        {
+            const uint8_t* host = static_cast<const uint8_t*>(mapped) + pending.offset;
+            const uint32_t width = pending.resolve.width, height = pending.resolve.height;
+            const uint32_t hostWidth = pending.hostWidth, hostHeight = pending.hostHeight;
+            if (hostWidth == width && hostHeight == height) { GpuWriteResolvedPixels(pending.resolve, host, pending.rowPitch); continue; }
+            // The game expects its own size (it reads the luminance reduction to set exposure):
+            // each guest pixel is the average of the host pixels it covers.
+            std::vector<uint8_t> guest(size_t(width) * height * 4);
+            for (uint32_t y = 0; y < height; y++)
+            {
+                const uint32_t y0 = y * hostHeight / height, y1 = (std::min)((std::max)((y + 1) * hostHeight / height, y0 + 1), hostHeight);
+                for (uint32_t x = 0; x < width; x++)
+                {
+                    const uint32_t x0 = x * hostWidth / width, x1 = (std::min)((std::max)((x + 1) * hostWidth / width, x0 + 1), hostWidth);
+                    uint32_t sum[4] = {}, count = 0;
+                    for (uint32_t sy = (std::min)(y0, hostHeight - 1); sy < (std::max)(y1, (std::min)(y0, hostHeight - 1) + 1); sy++)
+                        for (uint32_t sx = (std::min)(x0, hostWidth - 1); sx < (std::max)(x1, (std::min)(x0, hostWidth - 1) + 1); sx++)
+                        {
+                            const uint8_t* texel = host + size_t(sy) * pending.rowPitch + size_t(sx) * 4;
+                            for (int k = 0; k < 4; k++) sum[k] += texel[k];
+                            count++;
+                        }
+                    for (int k = 0; k < 4; k++) guest[(size_t(y) * width + x) * 4 + k] = uint8_t((sum[k] + count / 2) / count);
+                }
+            }
+            GpuWriteResolvedPixels(pending.resolve, guest.data(), width * 4);
+        }
+        D3D12_RANGE none{ 0, 0 };
+        buffer->Unmap(0, &none);
+    }
+
+    // gOverlap: the render thread does not wait for a frame's GPU work, so this thread does, and
+    // hands the game its read-backs the moment they exist (as early as the render thread did).
+    struct Delivery { UINT64 fence = 0; ComPtr<ID3D12Resource> buffer; UINT64 used = 0; std::vector<PendingWriteBack> pendings; uint64_t guestFrame = 0, number = 0; };
+    std::mutex gDeliveryMutex;
+    std::condition_variable gDeliveryChanged;
+    std::deque<Delivery> gDeliveries;
+    uint64_t gDeliveriesQueued = 0, gDeliveriesDone = 0;
+
+    void DeliveryThread()
+    {
+        HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+        for (;;)
+        {
+            Delivery job;
+            {
+                std::unique_lock lock(gDeliveryMutex);
+                gDeliveryChanged.wait(lock, [] { return !gDeliveries.empty(); });
+                job = std::move(gDeliveries.front());
+                gDeliveries.pop_front();
+            }
+            if (gFence->GetCompletedValue() < job.fence)
+            {
+                gFence->SetEventOnCompletion(job.fence, event);
+                WaitForSingleObject(event, INFINITE);
+            }
+            DeliverWriteBacks(job.buffer.Get(), job.used, job.pendings, job.guestFrame);
+            { std::lock_guard lock(gDeliveryMutex); gDeliveriesDone = job.number; }
+            gDeliveryChanged.notify_all();
+        }
+    }
+
     // Before a draw of the 2D pass: the scene-sized resolved surfaces it samples get their upscaled
     // stand-ins (WriteTextureDescriptor binds them).
     void PrepareUpscaledTextures(const RendererDraw& draw)
@@ -3972,6 +4092,13 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
     bool CreateDeviceObjects()
     {
+        // NIER_OVERLAP=1, or a file recomp\overlap_on (to switch it where the launch options are
+        // not at hand): see gOverlap. NIER_OVERLAP=0 wins over the file.
+        {
+            char v[8];
+            if (GetEnvironmentVariableA("NIER_OVERLAP", v, sizeof(v))) gOverlap = atoi(v) != 0;
+            else gOverlap = GetFileAttributesA("..\\overlap_on") != INVALID_FILE_ATTRIBUTES;
+        }
         char debug[8];
         if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
         {
@@ -4040,6 +4167,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         if (!Check(gDevice->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&gSrvHeap)), "SRV heap")) return false;
 
         if (!Check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gAllocator)), "allocator")) return false;
+        if (gOverlap)
+        {
+            if (!Check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gOtherAllocator)), "second allocator")) return false;
+            std::thread(DeliveryThread).detach();
+            Log("[d3d12] the next frame is recorded while the GPU draws the last one (overlap on)\n");
+        }
         if (!Check(gDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gAllocator.Get(), nullptr, IID_PPV_ARGS(&gList)), "command list")) return false;
         gList->Close();
         if (!Check(gDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gFence)), "fence")) return false;
@@ -4209,6 +4342,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         if (wanted == gResTwelfths && display == gDisplayTwelfths && shadow == gShadowTwelfths && gResolutionLogged) return;
         if (wanted != gResTwelfths || display != gDisplayTwelfths || shadow != gShadowTwelfths)
         {
+            if (gOverlap) WaitForGpu();   // the frame before may still be drawing to them
             gTargets.clear();
             gDepths.clear();
             gResolved.clear();
@@ -4237,7 +4371,32 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     {
         LARGE_INTEGER perfEntered;
         QueryPerformanceCounter(&perfEntered);
-        WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+        // Overlap: this frame takes the set of the frame before last, once that frame's GPU work
+        // is complete and its read-backs are with the game (both long since, unless the GPU is
+        // the slower of the two: then this is where the render thread waits for it). The wait for
+        // the swap chain comes after recording, before the present: with one frame of latency it
+        // lasts until the frame before is on screen, which is the time to record in.
+        const bool overlap = gOverlap;
+        int64_t fenceWaitTicks = 0;
+        double carriedStages[kRendererPerfStages] = {};
+        if (!overlap) WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+        else
+        {
+            LARGE_INTEGER before, after;
+            QueryPerformanceCounter(&before);
+            SwapFrameSet();
+            WaitForFence(gSetFence);
+            if (gSetDelivery)
+            {
+                std::unique_lock lock(gDeliveryMutex);
+                gDeliveryChanged.wait(lock, [] { return gDeliveriesDone >= gSetDelivery; });
+                gSetDelivery = 0;
+            }
+            QueryPerformanceCounter(&after);
+            fenceWaitTicks = after.QuadPart - before.QuadPart;
+            gRetired.clear();   // what that frame and the one after it let go of
+            StageCollect(carriedStages);
+        }
         ApplyResolutionSetting();
         LARGE_INTEGER perfStart;
         QueryPerformanceCounter(&perfStart);
@@ -4364,6 +4523,11 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         LARGE_INTEGER perfRecorded;
         QueryPerformanceCounter(&perfRecorded);
 
+        // Overlap: one frame on the GPU at a time. Handing it a second while it draws the first
+        // gains nothing (it draws them in turn) and let the game run further ahead of its
+        // read-backs: at 240 fps they came 1 to 4 frames late, 4 for a third of them, against a
+        // steady 2 without the overlap. (Counted as waiting for the GPU.)
+        if (overlap) WaitForFence(gOtherSetFence);
         ID3D12CommandList* lists[] = { gList.Get() };
         gQueue->ExecuteCommandLists(1, lists);
         // Resolves the game reads back (its luminance reduction, from which it sets the exposure of the
@@ -4377,49 +4541,34 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const auto deliverWriteBacks = [&]
         {
             if (!gPendingWriteBacks.empty()) WaitForGpu();
-            static const bool logged = GetEnvironmentVariableA("NIER_LOG_WRITEBACK", nullptr, 0) > 0;
-            if (logged && !gPendingWriteBacks.empty()) Log("[writeback] from guest frame %llu:\n", gExecutingFrame);
-            if (!gPendingWriteBacks.empty())
-            {
-                void* mapped = nullptr;
-                D3D12_RANGE range{ 0, SIZE_T(gWriteBackUsed) };
-                if (SUCCEEDED(gWriteBack->Map(0, &range, &mapped)))
-                {
-                    for (const PendingWriteBack& pending : gPendingWriteBacks)
-                    {
-                        const uint8_t* host = static_cast<const uint8_t*>(mapped) + pending.offset;
-                        const uint32_t width = pending.resolve.width, height = pending.resolve.height;
-                        const uint32_t hostWidth = pending.hostWidth, hostHeight = pending.hostHeight;
-                        if (hostWidth == width && hostHeight == height) { GpuWriteResolvedPixels(pending.resolve, host, pending.rowPitch); continue; }
-                        // The game expects its own size (it reads the luminance reduction to set exposure):
-                        // each guest pixel is the average of the host pixels it covers.
-                        std::vector<uint8_t> guest(size_t(width) * height * 4);
-                        for (uint32_t y = 0; y < height; y++)
-                        {
-                            const uint32_t y0 = y * hostHeight / height, y1 = (std::min)((std::max)((y + 1) * hostHeight / height, y0 + 1), hostHeight);
-                            for (uint32_t x = 0; x < width; x++)
-                            {
-                                const uint32_t x0 = x * hostWidth / width, x1 = (std::min)((std::max)((x + 1) * hostWidth / width, x0 + 1), hostWidth);
-                                uint32_t sum[4] = {}, count = 0;
-                                for (uint32_t sy = (std::min)(y0, hostHeight - 1); sy < (std::max)(y1, (std::min)(y0, hostHeight - 1) + 1); sy++)
-                                    for (uint32_t sx = (std::min)(x0, hostWidth - 1); sx < (std::max)(x1, (std::min)(x0, hostWidth - 1) + 1); sx++)
-                                    {
-                                        const uint8_t* texel = host + size_t(sy) * pending.rowPitch + size_t(sx) * 4;
-                                        for (int k = 0; k < 4; k++) sum[k] += texel[k];
-                                        count++;
-                                    }
-                                for (int k = 0; k < 4; k++) guest[(size_t(y) * width + x) * 4 + k] = uint8_t((sum[k] + count / 2) / count);
-                            }
-                        }
-                        GpuWriteResolvedPixels(pending.resolve, guest.data(), width * 4);
-                    }
-                    D3D12_RANGE none{ 0, 0 };
-                    gWriteBack->Unmap(0, &none);
-                }
-                gPendingWriteBacks.clear();
-            }
+            DeliverWriteBacks(gWriteBack.Get(), gWriteBackUsed, gPendingWriteBacks, gExecutingFrame);
+            gPendingWriteBacks.clear();
             gWriteBackUsed = 0;
         };
+        if (overlap)
+        {
+            gSetFence = ++gFenceValue;
+            gQueue->Signal(gFence.Get(), gSetFence);
+            if (!gPendingWriteBacks.empty())
+            {
+                Delivery job;
+                job.fence = gSetFence;
+                job.buffer = gWriteBack;
+                job.used = gWriteBackUsed;
+                job.pendings = std::move(gPendingWriteBacks);
+                job.guestFrame = gExecutingFrame;
+                gPendingWriteBacks.clear();
+                std::lock_guard lock(gDeliveryMutex);
+                job.number = gSetDelivery = ++gDeliveriesQueued;
+                gDeliveries.push_back(std::move(job));
+                gDeliveryChanged.notify_all();
+            }
+            gWriteBackUsed = 0;
+            QueryPerformanceCounter(&perfWrittenBack);
+            FrameOutOfHand();   // the game may hand over its next frame: it is recorded while this one is drawn
+            WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+        }
+        else
         if (!lateWriteBack) { deliverWriteBacks(); QueryPerformanceCounter(&perfWrittenBack); FrameOutOfHand(); }
         const bool vsync = SettingsVsync();
         const bool tear = !vsync && (gSwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
@@ -4510,16 +4659,21 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * k, gPaceQueued, gPaceInterval, gPaceGpuMs);
             last = perfPresented;
         }
-        WaitForGpu();
+        // (Overlap: a movie frame reuses its textures and upload buffer for the next, and a frame
+        // being saved is read straight after: those wait as every frame does without it.)
+        if (!overlap || movie || saving) WaitForGpu();
         if (logPacing)
         {
             LARGE_INTEGER waited, frequency;
             QueryPerformanceCounter(&waited);
             QueryPerformanceFrequency(&frequency);
-            gPaceGpuMs = double(waited.QuadPart - perfPresented.QuadPart) * 1000.0 / double(frequency.QuadPart);
+            gPaceGpuMs = double(overlap ? fenceWaitTicks : waited.QuadPart - perfPresented.QuadPart) * 1000.0 / double(frequency.QuadPart);
         }
-        gRetired.clear();   // the frame's GPU work is complete
-        if (lateWriteBack) deliverWriteBacks();
+        if (!overlap)
+        {
+            gRetired.clear();   // the frame's GPU work is complete
+            if (lateWriteBack) deliverWriteBacks();
+        }
         {
             // Every 600 frames: the frame rate and where the time went, on average: the render thread's
             // (it waits for the GPU to finish each frame, so that wait is the GPU's time unless the
@@ -4531,7 +4685,9 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             QueryPerformanceCounter(&perfDone);
             const double ms = 1000.0 / double(frequency.QuadPart);
             double stages[kRendererPerfStages] = {};
-            StageCollect(stages);
+            // (Overlap: the stage times of the frame before last, read when its set was taken.)
+            if (overlap) memcpy(stages, carriedStages, sizeof(stages));
+            else StageCollect(stages);
             const int mode = UpscalingMode();
             {
                 std::lock_guard lock(gPerfMutex);
@@ -4540,7 +4696,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                     perf->frames++;
                     perf->recordMs += double(perfRecorded.QuadPart - perfStart.QuadPart) * ms;
                     perf->presentMs += double(perfPresented.QuadPart - perfWrittenBack.QuadPart) * ms;
-                    perf->gpuWaitMs += double(perfDone.QuadPart - perfPresented.QuadPart + perfWrittenBack.QuadPart - perfRecorded.QuadPart) * ms;
+                    perf->gpuWaitMs += double(perfDone.QuadPart - perfPresented.QuadPart + perfWrittenBack.QuadPart - perfRecorded.QuadPart + fenceWaitTicks) * ms;
                     for (int i = 0; i < kRendererPerfStages; i++) perf->stageMs[i] += stages[i];
                     perf->slowestMs = (std::max)(perf->slowestMs, double(perfDone.QuadPart - perfStart.QuadPart) * ms);
                 }
