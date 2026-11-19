@@ -143,3 +143,11 @@ registers = ["r11", "r31"]
 name = "FishingCameraTurn"
 address = 0x821A5B68
 registers = ["f29", "f30"]
+
+# Recorded input (test runs): the main loop (sub_82496D00) is about to simulate the time step in
+# f31. The hook counts the loop's turns and, with a recording, writes each step or hands the game
+# the recorded one, so a replay simulates what was recorded tick for tick (runtime: gametick.cpp).
+[[midasm_hook]]
+name = "GameStepHook"
+address = 0x82496E60
+registers = ["f31"]

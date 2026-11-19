@@ -8,6 +8,7 @@ param([int]$Seconds = 15, [switch]$Trace, [int]$DumpAfter = 0, [string]$SaveFram
 Remove-Item Env:NIER_60FPS, Env:NIER_30FPS -ErrorAction SilentlyContinue
 if ($Playtest) {
     $Sound = $true
+    $env:NIER_LOG_STALLS = '1'   # a stall of the game's main loop (100 ms) logs what every guest thread was doing
     Remove-Item Env:NIER_MONITOR, Env:NIER_FULLSCREEN, Env:NIER_SETTINGS_FILE -ErrorAction SilentlyContinue
 } else {
     $env:NIER_FULLSCREEN = '0'

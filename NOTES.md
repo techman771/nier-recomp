@@ -1042,6 +1042,36 @@ Fishing camera too fast at 240 fps (18 November 2026): fixed (hook FishingCamera
 - The coverage build's build.ninja must be regenerated from recomp\build\build.ninja whenever a
   runtime file is added (it failed to link without highfps.cpp).
 
+Recorded input replays tick for tick (18 November 2026). The user, watching a replay walk off
+course: "there got to be someway to make these better".
+- Why a replay drifted: the game simulates each turn of its main loop with the real time the last
+  one took, and the two runs' frame times are never the same (the user's run dipped to 204 fps in
+  one stretch, the replay in another), so the camera and the movement came out different and the
+  same stick input walked somewhere else. Going by time instead of frame number did not fix it.
+- Now (recomp/runtime/gametick.cpp, hook GameStepHook at 0x82496E60 in sub_82496D00, f31 = the
+  step about to be simulated): from a recording's last route marker on, every step is written to
+  <recording>.steps (one float a tick); pad lines and the marker carry the tick; a replay hands
+  the game the recorded steps and looks the pad up by tick. NIER_REPLAY_BY_FRAME=1: the old way.
+  Recordings without ticks (kaine_desert, fishing) are replayed by time of day.
+- tools\replay_input_test.ps1: -Saves <folder in recomp\recordings> uses the snapshot of the
+  saves taken with a recording (the fishing recording no longer reaches the water with today's
+  slot 2); -Record <file> records the replay itself (to test replays).
+- Check: lighthouse.input (slot 2, 240 fps, 15,744 ticks) replays into the lighthouse and up its
+  floors, where the by-frame and by-time replays of the first recording ran into a hillside.
+- When launching a playtest, don't redirect run_boot.ps1's output to recomp\playtest.log: that
+  is the game's own log and the redirect overwrites it when the run ends.
+
+Lighthouse hitching (18 November 2026): NOT reproduced, cause unknown.
+- The earlier capture (seq_f165656, 17 November, 11 minutes into a session): 178, 148 and 154 ms
+  frames inside the lighthouse tower (side view) as the camera moves between floors; no shader
+  or pipeline waits.
+- The user's recording run of 18 November through the same floors: "it was smooth", and its
+  steps file agrees: after the load no tick over 10 ms in 67 seconds. The replay is as smooth.
+- So it needs something that run didn't have (a long session, a first visit, what came before).
+- For when it comes back: NIER_LOG_STALLS=1 (gametick.cpp; run_boot.ps1 -Playtest sets it): when
+  the main loop has not turned for 100 ms the log gets "[stall] ..." and every guest thread's
+  stack (the first 25 stalls of a run). Look for [stall] in recomp\playtest.log.
+
 ### Other aspect ratios (16:10, ultrawide): findings so far, nothing built
 
 SET ASIDE by the user for later (16 November 2026, after these findings): "let's have this for
@@ -2018,3 +2048,47 @@ muted its music. It now writes 0 to both (the title controls playback, as Xenia 
   DataPasses, FindFlatPhase), so the split is the same at every setting. `RendererPerfTake` hands the sums out.
 - System load beside the frame rate counter (`NIER_SHOW_LOAD=1`, SampleLoad in renderer_d3d12.cpp): the
   system's CPU and GPU use and the game's RAM and VRAM, sampled twice a second.
+
+## Debugging tools worth taking to another Xbox 360 recompilation
+
+Written 18 November 2026 at the user's request. Most of the tools made here depend on the
+recompiler's runtime (guest memory at g_base, the PPC context, the table of recompiled
+functions), not on NieR. They are spread through recomp/runtime with NIER_ names and with the
+game's addresses inline; for a second game, pull them into a library of their own with the
+per-game addresses in a config file.
+
+Usable as they are:
+- NIER_BREAK=<function>,<from frame> (main.cpp): hardware breakpoint on a recompiled function;
+  logs the guest registers and the guest call chain. NIER_BREAK_MAX, NIER_BREAK_DUMP.
+- NIER_WATCH_WRITE=<address>,<bytes> and NIER_WATCH_READ=<address>,<bytes>,<from frame>
+  (main.cpp): page protection plus single-stepping; logs which guest code writes or reads a
+  range, with the call chain. This is what found Kaine's warp (watch her position) and the
+  fishing camera (watch the pad's storage).
+- Function coverage (cover.cpp, cover_prologue.h, the build_cover build): NIER_COVER=<first
+  frame>,<last frame> lists the functions that ran and the frames a rarely run one ran in.
+- The sampling profiler (profiler.cpp, NIER_PROFILE) and its memory tools: NIER_SCAN_F32,
+  NIER_SCAN_U32, NIER_SCAN_TEXT, NIER_DUMP_RANGE.
+- Guest thread stack dumps (DumpGuestThreads, GuestCallChain) and NIER_LOG_CLOCK (who asks the
+  kernel for the time).
+- Mid-asm hooks (XenonRecomp's own feature, nier_hooks.toml): the way every game-logic fix here
+  was made.
+
+Usable once one address of the new game is found:
+- The main loop's time step. Here: sub_82496D00, hook at 0x82496E60 with the step in f31, and
+  the float the game keeps it in (0x827B8B34). With it come the stall logger (NIER_LOG_STALLS),
+  recorded input replayed tick for tick (gametick.cpp) and the helpers that turn "every N
+  frames" into "every N/30 s" (highfps.cpp). To find it: break on the kernel's time functions,
+  or scan for a float near 1/60 that follows the frame rate.
+- Recorded input (input.cpp): hooks XamInputGetState, which every game calls. The marker for
+  "gameplay began after a loading screen" is a draw-count rule tuned to this game.
+- Scripted input for test runs (NIER_AUTO_PRESS, NIER_AUTO_MOVE, NIER_AUTO_STICK) and
+  NIER_FPS_AT: general, but the routes are this game's.
+
+Tied to this GPU layer rather than to the game:
+- Frame captures and their replay (framecapture.cpp, tools/replay_frame.ps1, NIER_CAPTURE_AT,
+  NIER_RECORD_AT): they record the Xbox 360 GPU command stream, so they work for any game run
+  through this renderer and not with another one.
+
+Not reusable: the fixes themselves and anything keyed to NieR's objects or script tables. The
+method is: watch the memory that goes wrong, take the call chain, find the per-frame assumption,
+hook it and scale it by the time step.

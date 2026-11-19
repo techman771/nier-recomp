@@ -44,6 +44,8 @@ uint64_t FixedElapsed100ns();   // NIER_FIXED_TIME's elapsed time
 std::string GuestCallChain(int depth);   // current thread's guest call chain (debugging)
 void DumpGuestThreads();  // logs every guest thread's stack and last imports
 void WatchInit();
+uint64_t GameTick();      // turns of the game's main loop so far (gametick.cpp)
+void GameTickMarker();    // a recorded route begins now: its time steps are recorded or replayed from here
 void BreakInit();           // NIER_BREAK=<guest function>,<frame>: log registers when it runs           // NIER_WATCH_WRITE=<guest address>,<bytes>: log the guest code writing there
 void LogSetCaptureFile(FILE* file);   // also copy log output to this file (null to stop)
 bool PresenterHasFocus();
