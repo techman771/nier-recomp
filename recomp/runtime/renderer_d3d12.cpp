@@ -3026,7 +3026,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     int UpscalingQuality()
     {
         static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING_QUALITY", v, sizeof(v)) ? atoi(v) : -1; }();
-        return std::clamp(forced >= 0 ? forced : Settings().upscalingQuality.load(), 0, 6);
+        return std::clamp(forced >= 0 ? forced : Settings().upscalingQuality.load(), 1, 6);   // (0, the old "Custom", is Native)
     }
 
     // 0 plain filtering, 1 FSR 1, 2 temporal (the FSR 3.1 and FSR 4 settings: TemporalWantsNewest).
@@ -4008,14 +4008,14 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             return GetEnvironmentVariableA("NIER_RES_SCALE", value, sizeof(value)) ? atof(value) : 0.0;
         }();
         static const uint32_t kSettingTwelfths[] = { 6, 8, 9, 12, 15, 18, 24, 30, 36, 48 };   // 360p 480p 540p 720p 900p 1080p 1440p 1800p 2160p 2880p
-        const int quality = UpscalingQuality();
-        if (forced <= 0.0 && quality > 0 && UpscalingSetting() != 0)
-        {
-            static const double kFactors[] = { 1.0, 1.0, 1.3, 1.5, 1.7, 2.0, 3.0 };
-            return uint32_t(std::clamp(int(displayTwelfths / kFactors[quality] + 0.5), 6, 48));
-        }
-        const double asked = forced > 0.0 ? forced : kSettingTwelfths[std::clamp(Settings().resolutionScale.load(), 0, 9)] / 12.0;
-        return uint32_t(std::clamp(int(asked * 12.0 + 0.5), 6, 48));
+        if (forced > 0.0) return uint32_t(std::clamp(int(forced * 12.0 + 0.5), 6, 48));
+        // A drawn resolution stated outright (settings.h resolutionScale: tests and measurements).
+        const int stated = Settings().resolutionScale.load();
+        if (stated >= 0) return kSettingTwelfths[std::clamp(stated, 0, 9)];
+        // Otherwise it follows from the output: the same with Upscaling off, a share of it with it on.
+        if (UpscalingSetting() == 0) return displayTwelfths;
+        static const double kFactors[] = { 1.0, 1.0, 1.3, 1.5, 1.7, 2.0, 3.0 };
+        return uint32_t(std::clamp(int(displayTwelfths / kFactors[UpscalingQuality()] + 0.5), 6, 48));
     }
 
     // Applies a changed resolution between frames (the GPU is idle: the last frame waited for it).
@@ -4038,9 +4038,22 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
     void ApplyResolutionSetting()
     {
-        // The display's scale: the largest 16:9 picture that fits the window, against 1280x720.
+        // The output's scale against 1280x720: the Output Resolution setting, or with "Screen's own"
+        // the largest 16:9 picture that fits the window. (The picture is fitted to the window when
+        // it is shown, BlitScanout, so the two need not agree.) NIER_OUTPUT=<0-7> overrides the setting.
+        static const int forcedOutput = [] { char v[8]; return GetEnvironmentVariableA("NIER_OUTPUT", v, sizeof(v)) ? atoi(v) : -1; }();
+        static const uint32_t kOutputTwelfths[8] = { 0, 12, 15, 18, 24, 30, 36, 48 };
+        const int output = std::clamp(forcedOutput >= 0 ? forcedOutput : Settings().outputResolution.load(), 0, 7);
         const double fit = (std::min)(gWidth / 1280.0, gHeight / 720.0);
-        const uint32_t display = uint32_t(std::clamp(int(fit * 12.0 + 0.5), 6, 48));
+        const uint32_t display = output ? kOutputTwelfths[output] : uint32_t(std::clamp(int(fit * 12.0 + 0.5), 6, 48));
+        // A window takes the output's size (present.cpp; nothing happens while borderless).
+        static int windowAsked = -1;
+        if (output != windowAsked)
+        {
+            windowAsked = output;
+            if (output) PresenterSetWindowSize(int(1280 * kOutputTwelfths[output] / 12), int(720 * kOutputTwelfths[output] / 12));
+            else PresenterSetWindowSize(0, 0);
+        }
         const uint32_t wanted = ResolutionWanted(display), shadow = ShadowWanted();
         if (wanted == gResTwelfths && display == gDisplayTwelfths && shadow == gShadowTwelfths && gResolutionLogged) return;
         if (wanted != gResTwelfths || display != gDisplayTwelfths || shadow != gShadowTwelfths)

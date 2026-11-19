@@ -14,6 +14,40 @@ namespace
     WINDOWPLACEMENT gWindowedPlacement{ sizeof(WINDOWPLACEMENT) };
 
     constexpr UINT WM_SET_FULLSCREEN = WM_APP + 1;   // wParam: on
+    constexpr UINT WM_SET_WINDOW_SIZE = WM_APP + 2;  // wParam: width, lParam: height of the inside (0: none asked for)
+    int gWantedWidth = 0, gWantedHeight = 0;
+
+    // Output Resolution with a window: the window's inside takes that size, as far as the
+    // monitor's working area lets it (beyond that the picture is scaled down into what fits).
+    void ApplyWindowSize()
+    {
+        if (gFullscreen || !gWindow || gWantedWidth <= 0 || gWantedHeight <= 0) return;
+        MONITORINFO info{ sizeof(info) };
+        GetMonitorInfoA(MonitorFromWindow(gWindow, MONITOR_DEFAULTTONEAREST), &info);
+        RECT frame{ 0, 0, 0, 0 };
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        const int roomX = int(info.rcWork.right - info.rcWork.left) - int(frame.right - frame.left), roomY = int(info.rcWork.bottom - info.rcWork.top) - int(frame.bottom - frame.top);
+        int width = gWantedWidth, height = gWantedHeight;
+        if (width > roomX || height > roomY)
+        {
+            const double fit = (std::min)(double(roomX) / width, double(roomY) / height);
+            width = (std::max)(int(width * fit), 320);
+            height = (std::max)(int(height * fit), 180);
+        }
+        RECT inside{};
+        GetClientRect(gWindow, &inside);
+        if (inside.right == width && inside.bottom == height) return;
+        RECT outer{ 0, 0, width, height };
+        AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+        RECT placed{};
+        GetWindowRect(gWindow, &placed);
+        // Kept on the monitor: grown from its top left corner, moved back in if that runs off the edge.
+        int x = placed.left, y = placed.top;
+        const int outerWidth = outer.right - outer.left, outerHeight = outer.bottom - outer.top;
+        if (x + outerWidth > info.rcWork.right) x = (std::max)(int(info.rcWork.left), int(info.rcWork.right) - outerWidth);
+        if (y + outerHeight > info.rcWork.bottom) y = (std::max)(int(info.rcWork.top), int(info.rcWork.bottom) - outerHeight);
+        SetWindowPos(gWindow, nullptr, x, y, outerWidth, outerHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     std::atomic<int> gMouseX{ 0 }, gMouseY{ 0 };
 
     // The mouse drives the camera while the game window is focused and Mouse Sensitivity isn't 0
@@ -53,6 +87,7 @@ namespace
             SetWindowLongA(gWindow, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
             SetWindowPlacement(gWindow, &gWindowedPlacement);
             SetWindowPos(gWindow, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            ApplyWindowSize();
         }
     }
 
@@ -145,6 +180,11 @@ namespace
         case WM_SET_FULLSCREEN:
             SetFullscreen(w != 0);
             return 0;
+        case WM_SET_WINDOW_SIZE:
+            gWantedWidth = int(w);
+            gWantedHeight = int(l);
+            ApplyWindowSize();
+            return 0;
         case WM_CLOSE:
             fflush(stdout);
             TerminateProcess(GetCurrentProcess(), 0);
@@ -236,6 +276,11 @@ namespace
 void PresenterSetFullscreen(bool on)
 {
     if (gWindow) PostMessageA(gWindow, WM_SET_FULLSCREEN, on ? 1 : 0, 0);
+}
+
+void PresenterSetWindowSize(int width, int height)
+{
+    if (gWindow) PostMessageA(gWindow, WM_SET_WINDOW_SIZE, WPARAM(width), LPARAM(height));
 }
 
 // NIER_FAKE_MOUSE=<frame>,<x>,<y>[,<click frame>] stands in for the pointer in test runs (game

@@ -2328,6 +2328,59 @@ the place"):
     was gone. The kept vertex buffer stood at 101-106 MB there, near its 120 MB drop.
     Open: doing it without a launch option (the game could not start steamosctl from inside
     Proton with CreateProcess; other ways not tried), and whether a lower fixed clock would do.
+  - Output Resolution in place of Resolution (2026-11-19, the user's design: "an option to
+    change window / output resolution ... the custom resolutions can be removed in favour of
+    output resolution. Let the upscaler handle the rest"). What prompted it: with Resolution on
+    1080p and Upscaling Quality on Native the game drew 720p on the Deck, and nothing in the
+    menu said the quality mode had replaced Resolution. Now one setting says how big the
+    picture is and the drawn size follows from it:
+    - `output_resolution` (settings.h): 0 "Screen's own" (the largest 16:9 picture that fits the
+      window; borderless, the monitor), then 720p, 900p, 1080p, 1440p, 1800p, 2160p, 2880p. The
+      menu stops at the last one not over twice the screen's height (a Deck: 1440p). It sets
+      gDisplayTwelfths (`ApplyResolutionSetting`); the picture is fitted to the window when shown
+      (BlitScanout always did that), so a larger output is drawn big and scaled down. A window
+      is given the output's size (present.cpp `ApplyWindowSize`, as far as the monitor's working
+      area allows). `NIER_OUTPUT=<0-7>` overrides.
+    - The drawn size (`ResolutionWanted`): the output's with Upscaling off; the output's divided
+      by the quality's factor with it on. Upscaling Quality lost "Custom" and starts at Native
+      (stored values 1-6 as before; 0 is read as Native).
+    - `resolutionScale` is no setting any more: -1 unless test or measuring code states a drawn
+      size outright (NIER_RES_AT and the like), which then wins as before.
+    - A settings file from before is carried over on loading: its Resolution counted only with
+      Upscaling off or on Custom; 900p and up become that Output Resolution, below 720p becomes
+      FSR 1 (if upscaling was off) at the nearest factor (540p Ultra Quality, 480p Quality, 360p
+      Performance); 720p becomes Screen's own, which on a large monitor draws more than before.
+    Checked on the PC (1920x1200 screen): window 1280x720 draws 720p; NIER_OUTPUT=3 draws
+    1080p, with FSR 1 Quality 720p inside a 1080p picture, with FSR 3 Native 1080p; Screen's
+    own with FSR 1 Performance 360p; NIER_OUTPUT=2 resizes the window to 1600x900; output 1440p
+    borderless on the 1200p screen draws correctly scaled down (lighthouse frame looked at); the
+    user's own file (resolution_scale 8, FSR 3, no quality entry) comes out as 2160p output. The
+    menu rows have not been seen on screen. On the Deck the user's file came out as Output
+    Resolution 1080p with FSR 3.1 Native, and it worked as meant (`[fsr3] upscaler ready:
+    3.1.6, 1920x1080 -> 1920x1080`, "1920x1080 shown at 1280x800"); the user changed the rows
+    from the menu (the log shows 1493x840 inside 1080p, Ultra Quality, before that). At 40 fps
+    with the GPU held at 1100 MHz it does not hold: 24.1 fps in play, the render thread 24.9 ms
+    a frame (recording 8.1, waiting for the GPU 16.7, the upscaler alone 8.95), 7.0 W. One
+    ten-second window. 1080p is 2.25 times the pixels of the screen's own 720p, where the same
+    profile took 15.6 ms.
+    Output 900p with FSR 3.1 Native, same clock: 39.5 fps in play, the render thread 20.8 ms of
+    the 25 (recording 8.9, waiting for the GPU 11.9, the upscaler 6.7), 557 of 600 frames on
+    time and 30 late, the slowest 1% at 44.7 ms (a few doubled), 9.2 W. Holds, with little
+    room: a heavier scene would not.
+    The same at 1300 MHz (the user's setting, read back as manual 1300): 39.7-39.8 fps, the
+    render thread 18.6-19.1 ms (waiting for the GPU 9.9-10.6, the upscaler 5.9), 559-565 of 600
+    on time, 21-26 late, the slowest 1% at 27.5-28.8 ms (none doubled any more), 9.5 W against
+    9.2. So 200 MHz more buys the doubled frames away for 0.3 W.
+    At 1400 MHz: 39.8 fps, the render thread 17.8-18.0 ms in the heavier windows (waiting for
+    the GPU 9.0-9.5, the upscaler 5.4-5.6), 571-576 of 600 on time, 15-17 late, the slowest 1%
+    at 26.6-27.8 ms, 10.3 W. A little evener again than 1300, for 0.8 W more.
+    The user settled on 1300 MHz. The village overview there (900p, FSR 3.1 Native, 40 fps):
+    38.6 fps, the render thread 22.3 ms of the 25, 467 of 600 on time, 87 late, the slowest 1%
+    at 46.8 ms (doubled frames), 9.1 W. It is the CPU that runs out, not the GPU: recording is
+    13.2 ms a frame in that scene with FSR 3 on (8.9 without it at the same draw count: the
+    motion-vector pass draws the scene's geometry a second time and 6.9 MB of constants are
+    copied), the wait for the GPU 9.0. A faster clock will not help it; a cheaper motion pass
+    would.
   - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
     display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
     values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as
@@ -2362,7 +2415,7 @@ the place"):
   - Recommended Steam Deck settings, DRAFT (to be measured as two whole profiles; the figures
     are from separate runs of 2026-11-18/19):
     - 60 fps: Deck refresh 60 Hz, the Deck's limiter on or off, GPU clock automatic; in PC
-      Settings Frame Rate 60 fps, Resolution 720p, Upscaling Off, Shadow Quality High (VSync
+      Settings Frame Rate 60 fps, Output Resolution Screen's own, Upscaling Off, Shadow Quality High (VSync
       does nothing in Game Mode). Measured in the Aerie on Proton-GE Latest at the automatic
       1040 MHz: 59.7-59.8 fps, slowest 1% about 20 ms, 8.6 W. The village overview is heavier
       at the automatic 1040 MHz (real state read as auto, limiter on): 59.2-59.4 fps, 530-534
@@ -2370,10 +2423,12 @@ the place"):
       core. With the clock forced to 1600 MHz it read 59.7-59.9 fps, 562-571 on time, slowest 1%
       18.6-19.5 ms at 12.7 W. So forcing the clock buys a slightly evener heaviest scene for
       about 4 W: optional, not part of the profile (tools/deck-launch.sh does it).
-    - 40 fps with FSR 3.1: Deck refresh 40 Hz; Frame Rate 40 fps, VSync On, Resolution 720p,
-      Upscaling FSR 3.1, Upscaling Quality Native (anti-aliasing at the screen's resolution),
-      Shadow Quality High. Not run as a profile yet. Native with FSR 3.1 read 41-49 fps in the
-      heavy scene uncapped at 1600 MHz, so it should hold 40 there; power at 40 fps unknown.
+    - 40 fps with FSR 3.1 (the user's choice, 2026-11-19): Deck refresh 40 Hz; Frame Rate 40
+      fps, Output Resolution 900p, Upscaling FSR 3.1, Upscaling Quality Native, Shadow Quality
+      High; GPU held at 1300 MHz (`NIER_GPU_CLOCK=1300` before tools/deck-launch.sh in the launch
+      options). In play 39.7-39.8 fps, slowest 1% about 28 ms, 9.5 W. In the village overview
+      38.6 fps with some frames doubled (short of CPU time there, see above). Fallback: Output
+      Resolution Screen's own at 1100 MHz, 39.9-40.0 fps with the slowest 1% at 27 ms, 8.5 W.
     Proton: both draw without launch options; the user found Proton-GE Latest smoother than
     Proton Experimental at the same clock (60 against 57 fps in play, in runs that were not of
     the same spot).

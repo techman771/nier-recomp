@@ -11,15 +11,25 @@ struct PcSettings
     // meaning; the menu shows it between 30 and 60).
     std::atomic<int> frameRate60{ 1 };
     std::atomic<int> vsync{ 1 };
-    // Internal resolution (applied between frames): 0 640x360, 1 854x480, 2 960x540, 3 1280x720 (the original),
-    // 4 1600x900, 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880.
-    std::atomic<int> resolutionScale{ 3 };
+    // Output Resolution: the size of the picture the game makes, which is then fitted to the window
+    // or screen. 0 the screen's own (the largest 16:9 picture that fits the window; borderless, the
+    // monitor), 1 1280x720, 2 1600x900, 3 1920x1080, 4 2560x1440, 5 3200x1800, 6 3840x2160,
+    // 7 5120x2880. A window is given that size. What the game is drawn at follows from it: the
+    // output itself with Upscaling off, the output divided by the Upscaling Quality's factor with
+    // it on. (Before 2026-11-19 a Resolution setting chose the drawn size directly and a quality
+    // mode replaced it; nothing in the menu said which of the two was in force.)
+    std::atomic<int> outputResolution{ 0 };
+    // A drawn resolution stated outright, in place of the rule above (-1: none). Not a setting any
+    // more: test and measuring code sets it (0 640x360, 1 854x480, 2 960x540, 3 1280x720, 4 1600x900,
+    // 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880).
+    std::atomic<int> resolutionScale{ -1 };
     std::atomic<int> upscaling{ 0 };           // how a lower render resolution is enlarged: 0 plain filtering, 1 FSR 1, 2 FSR 3.1, 3 FSR 4 (temporal)
-    // Upscaling Quality: with Upscaling on, the render resolution as a share of the display's instead of
-    // the Resolution setting: 0 custom (Resolution), 1 Native (the display's own; with FSR 3.1 or 4 that
-    // is their anti-aliasing alone, "Native AA"), 2 Ultra Quality (display / 1.3), 3 Quality (1.5),
-    // 4 Balanced (1.7), 5 Performance (2.0), 6 Ultra Performance (3.0). FSR's own factors.
-    std::atomic<int> upscalingQuality{ 0 };
+    // Upscaling Quality: with Upscaling on, the drawn resolution as a share of the output's:
+    // 1 Native (the output's own; with FSR 3.1 or 4 that is their anti-aliasing alone, "Native
+    // AA"), 2 Ultra Quality (output / 1.3), 3 Quality (1.5), 4 Balanced (1.7), 5 Performance
+    // (2.0), 6 Ultra Performance (3.0). FSR's own factors. (0 was "Custom", the old Resolution
+    // setting: read as Native.)
+    std::atomic<int> upscalingQuality{ 1 };
     std::atomic<int> showFps{ 0 };             // frame rate counter in the top left corner
     std::atomic<int> savePage{ 1 };            // which page of three game saves the save list shows (1-10)
     std::atomic<int> shadowQuality{ 0 };       // shadow map size: 0 the original 1024, 1 2048, 2 3072, 3 4096
@@ -49,6 +59,7 @@ void SettingsPollPage();   // live values while the PC Settings page is open (ca
 
 // Applying settings that need more than a read at the point of use.
 void PresenterSetFullscreen(bool on);   // present.cpp; safe from any thread
+void PresenterSetWindowSize(int width, int height);   // the window's inside, when it is a window (0, 0: left as it is); safe from any thread
 void PresenterTakeMouseMotion(int& dx, int& dy);   // mouse movement since the last call, in device counts
 
 // Menu pointer (present.cpp): the cursor in the game's 1280x720 screen space and what the mouse did
