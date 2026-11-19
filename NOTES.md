@@ -2496,6 +2496,10 @@ the place"):
     31-33); recording 8.8-9.5 ms, GPU stages about 13.9 ms together, the render thread idle 7
     ms a frame before Present. Neither the render thread nor the GPU fills the 16.7 ms, so the
     late frames come from somewhere else (not looked into: the game's own threads are the guess).
+    The same again with overlap off (file removed, no "overlap on" line in the log, 1300 MHz):
+    36.9-42.8 fps in the cutscene, median present to present 19-31 ms, 42-157 of 600 on the
+    median; recording 8.9-10.9 ms plus 6.5-7.2 waiting for the GPU. So the overlap is not what
+    makes the remaining late frames: without it this scene is nowhere near 60.
   - Frame Rate row (2026-11-19, at the user's word): 40 fps added, for a handheld on a 40 Hz
     display, and 90 fps taken off. The row reads 30, 40, 60, 120, 144, 240, Uncapped. Stored
     values keep their old meaning (pcsettings.cpp `MenuValue` / `StoredValue`): 40 is stored as
