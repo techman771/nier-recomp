@@ -31,6 +31,7 @@
 #include "glyphs.h"
 
 bool RendererFsr4Available();   // renderer.h
+bool RendererDlssAvailable();
 
 extern "C" PPC_FUNC(__imp__sub_824197A8);
 extern "C" PPC_FUNC(__imp__sub_824178D0);
@@ -60,7 +61,7 @@ namespace
             { "vsync", &gSettings.vsync, 0, 1 },
             { "output_resolution", &gSettings.outputResolution, 0, 7 },
             { "shadow_quality", &gSettings.shadowQuality, 0, 3 },
-            { "upscaling", &gSettings.upscaling, 0, 3 },
+            { "upscaling", &gSettings.upscaling, 0, 4 },
             { "upscaling_quality", &gSettings.upscalingQuality, 0, 6 },
             { "save_page", &gSettings.savePage, 1, 10 },
             { "show_fps", &gSettings.showFps, 0, 1 },
@@ -92,6 +93,7 @@ namespace
         T_UpQuality, T_UpQualityHelp, T_UpCustom, T_UpUltraQuality, T_UpQualityMode, T_UpBalanced, T_UpPerformance, T_UpUltraPerformance, T_UpNative,
         T_40fps,
         T_OutputRes, T_OutputResHelp, T_OutScreen,
+        T_UpscalingDlss, T_UpscalingHelpDlss,
         T_Count
     };
     const char* kStrings[T_Count - kTextBase] = {
@@ -127,6 +129,7 @@ namespace
         "40 fps",
         "Output Resolution", "The size of the picture. Screen's own fits the display;\na larger one is drawn bigger and scaled down to it.",
         "Screen's own",
+        "DLSS", "Choose how a resolution below the screen's is enlarged.\nDLSS (NVIDIA RTX) rebuilds detail over several frames.",
     };
     uint32_t gStrings[T_Count - kTextBase] = {};   // guest copies
     std::once_flag gStringsOnce;
@@ -172,7 +175,7 @@ namespace
         { 62, 2, &gSettings.vsync, 1, T_VSync, T_VSyncHelp, { T_Off, T_On } },
         { 74, 2, &gSettings.showFps, 1, T_FpsCounter, T_FpsCounterHelp, { T_Off, T_On } },
         { 67, 4, &gSettings.outputResolution, 7, T_OutputRes, T_OutputResHelp, { T_OutScreen, T_Res720, T_Res900, T_Res1080, T_Res1440, T_Res1800, T_Res2160, T_Res2880 } },
-        { 69, 4, &gSettings.upscaling, 3, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4 } },
+        { 69, 4, &gSettings.upscaling, 4, T_Upscaling, T_UpscalingHelp, { T_UpscalingOff, T_UpscalingFsr1, T_UpscalingFsr3, T_UpscalingFsr4, T_UpscalingDlss } },   // by stored value: see UpscalingChoices
         { 75, 4, &gSettings.upscalingQuality, 5, T_UpQuality, T_UpQualityHelp, { T_UpNative, T_UpUltraQuality, T_UpQualityMode, T_UpBalanced, T_UpPerformance, T_UpUltraPerformance } },   // stored from 1: see MenuValue
         { 68, 4, &gSettings.shadowQuality, 3, T_Shadows, T_ShadowsHelp, { T_ShadowOriginal, T_ShadowHigh, T_ShadowVeryHigh, T_ShadowUltra } },
         { 63, 6, &gSettings.masterVolume, 10, T_MasterVolume, T_MasterVolumeHelp, {} },
@@ -185,8 +188,26 @@ namespace
     // 2) was taken off the list (it still works when set in settings.ini's place by
     // NIER_FRAME_RATE; a saved 90 is read as 120). The row's position for a stored value, and back.
     // The Upscaling Quality row starts at Native, stored as 1 (0 was "Custom", no longer offered).
+    // The Upscaling row lists only what this system can do: Off, FSR 1, FSR 3.1, then FSR 4 (stored
+    // as 3) where the driver has it and DLSS (stored as 4) on an NVIDIA RTX card with its files.
+    // Fills `stored` with the stored value of each position and returns how many there are.
+    int UpscalingChoices(int stored[5])
+    {
+        int count = 0;
+        stored[count++] = 0; stored[count++] = 1; stored[count++] = 2;
+        if (RendererFsr4Available()) stored[count++] = 3;
+        if (RendererDlssAvailable()) stored[count++] = 4;
+        return count;
+    }
     int MenuValue(const Item& item, int stored)
     {
+        if (item.value == &gSettings.upscaling)
+        {
+            int choices[5];
+            const int count = UpscalingChoices(choices);
+            for (int i = 0; i < count; i++) if (choices[i] == stored) return i;
+            return 2;   // FSR 4 or DLSS saved on a system without it: FSR 3.1 does the work
+        }
         if (item.value == &gSettings.upscalingQuality) return std::clamp(stored, 1, 6) - 1;
         if (item.value != &gSettings.frameRate60) return stored;
         static const int kPosition[8] = { 0, 2, 3, 3, 4, 5, 6, 1 };
@@ -194,6 +215,12 @@ namespace
     }
     int StoredValue(const Item& item, int menu)
     {
+        if (item.value == &gSettings.upscaling)
+        {
+            int choices[5];
+            const int count = UpscalingChoices(choices);
+            return choices[std::clamp(menu, 0, count - 1)];
+        }
         if (item.value == &gSettings.upscalingQuality) return std::clamp(menu, 0, 5) + 1;
         if (item.value != &gSettings.frameRate60) return menu;
         static const int kStored[7] = { 0, 7, 1, 3, 4, 5, 6 };
@@ -205,7 +232,7 @@ namespace
     // that nothing is gained and a small device runs out of memory (5120x2880 on a Steam Deck).
     int ItemMax(const Item& item)
     {
-        if (item.value == &gSettings.upscaling && !RendererFsr4Available()) return 2;
+        if (item.value == &gSettings.upscaling) { int choices[5]; return UpscalingChoices(choices) - 1; }
         if (item.value == &gSettings.outputResolution)
         {
             static const int kHeights[8] = { 0, 720, 900, 1080, 1440, 1800, 2160, 2880 };
@@ -257,7 +284,7 @@ namespace
         for (const Item& item : kItems)
         {
             const int max = ItemMax(item);
-            const Text help = item.value == &gSettings.upscaling && max == 3 ? Text(T_UpscalingHelp4) : item.help;
+            const Text help = item.value != &gSettings.upscaling ? item.help : RendererDlssAvailable() ? Text(T_UpscalingHelpDlss) : RendererFsr4Available() ? Text(T_UpscalingHelp4) : item.help;
             WriteRecord(first + n++ * kRecordSize, item.type, uint8_t((std::min)(MenuValue(item, item.value->load()), max)), 0, uint8_t(max), (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, help);
         }
         WriteRecord(first + n++ * kRecordSize, 10, 0, 0, 0, 0, kItemKeysButtons, T_KeysButtons, T_KeysButtonsHelp);
@@ -464,7 +491,7 @@ bool PcSettingsValueText(PPCRegister& r3)
     const Item* item = FindItem(id);
     if (!item || (item->type != 2 && item->type != 4)) return false;
     const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, ItemMax(*item));
-    r3.u64 = GuestText(item->values[value]);
+    r3.u64 = GuestText(item->values[item->value == &gSettings.upscaling ? StoredValue(*item, value) : value]);
     return true;
 }
 

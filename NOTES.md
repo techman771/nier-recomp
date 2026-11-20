@@ -814,6 +814,58 @@ service thread (`sub_8251AC78`, which self-suspends and is resumed by the game),
 requested in bursts of the device period, and whether the 6-refresh gaps line up with file reads or
 keyframes. They may also be deliberately held frames in the source.
 
+## DLSS (NVIDIA RTX cards), 2026-11-19
+
+The Upscaling setting's fifth value (stored as 4), offered only where it can run. Built on
+NVIDIA's Streamline SDK 2.14.16, chosen over the DLSS SDK itself because Streamline's own code is
+MIT licensed and everything of NVIDIA's is loaded at run time: nothing closed is linked into
+the program, which is GPL-3.0.
+
+- `tools/get_streamline.ps1` fetches the SDK (276 MB, checksum pinned) into `tools/Streamline`
+  (not committed; nothing runs it unasked). `compile_ppc.ps1` builds with DLSS when
+  `tools/Streamline/sdk/include/sl.h` is there (include path, `sl.interposer.lib` with
+  `/DELAYLOAD:sl.interposer.dll`) and copies `sl.interposer.dll`, `sl.common.dll`,
+  `sl.dlss.dll` and `nvngx_dlss.dll` beside nier.exe. Without the SDK `dlss.cpp` compiles to
+  stubs that answer "not available".
+- `recomp/runtime/dlss.cpp` holds everything of Streamline's. `DlssStart` (before the device is
+  made): the four files must be beside the executable, the interposer is loaded by its full
+  path, `slInit` with manual hooking, frame-based tagging, DLSS as the only feature and no
+  over-the-air updates (nothing goes to the network). Not attempted under Wine unless
+  `NIER_DLSS=1`; `NIER_DLSS=0` turns it off anywhere. `DlssSetDevice` hands over the device and
+  asks `slIsFeatureSupported` for the chosen adapter. No application id from NVIDIA: engine
+  "custom", a version and a project GUID of our own, which Streamline accepted.
+- The swap chain is passed through `slUpgradeInterface` right after it is created
+  (`DlssUpgradeInterface`), and the renderer uses what comes back. Without that Streamline
+  logged "presentCommon() was not observed" (its bookkeeping runs on Present). The device and
+  factory are left as they are; with only DLSS upscaling nothing has complained.
+- In the renderer DLSS takes the FSR upscaler's place inside `TemporalUpscaled`
+  (`TemporalWantsDlss`): the same jitter, depth, motion vector texture (screen fractions, so
+  `mvecScale` 1) and reset; no reactive mask (DLSS takes none, so that pass is skipped). The
+  quality modes map one to one, the render sizes being the same factors: Native is DLAA, then
+  Ultra Quality 1.3 (DLSS has no such mode: asking for it fails with "NGX create feature
+  failed" and the picture fell to FSR 1, seen in the 2026-11-19 playtest; it is DLSS's Quality
+  mode given the 1.3 picture), Quality 1.5, Balanced 1.7, Performance 2.0, Ultra Performance 3.0. The
+  picture is declared 8-bit sRGB (`colorBuffersHDR` off), depth not inverted. A setting of 4 on
+  a system without DLSS counts as FSR 3.1 (`UpscalingSetting`).
+- Menu (pcsettings.cpp `UpscalingChoices`): the row lists Off, FSR 1, FSR 3.1, FSR 4 where
+  the driver has it, DLSS where it is available; positions map to stored values through that
+  list. Used in the 2026-11-19 playtest (every quality level; "looks good").
+- Jitter direction: the same values FSR gets. Checked on a captured frame replayed to a still
+  (`replay_frame.ps1`, 720p to 1440p): the picture is sharpest as it is and softer with either
+  axis flipped (`NIER_DLSS_JITTER=<x,y factors>`; edge energy 1.164 against 1.121, 1.155 and
+  1.093 with both flipped; FSR 3.1 1.158). Two consecutive frames of a moving replay did not
+  tell them apart.
+- Measured on the RTX 4090 (lighthouse replay, 240 fps cap, 4K output): DLSS 310.9.16,
+  1.25-1.29 ms a frame for the upscale at Quality and at Native, the same as FSR 3.1 there
+  (1.22-1.28); frame rate at the cap. The D3D12 debug layer reports nothing with DLSS on. The
+  default path's captured frame replays to the same file as before.
+- Open: the NVIDIA licence for `nvngx_dlss.dll` (`nvngx_dlss.license.txt` in the SDK) says the
+  SDK may not be used in a way that makes it subject to an open source licence, and asks for
+  NVIDIA's marks in an application's credits. Whether a GPL-3.0 program may ship that file
+  beside it is not for these notes to settle; until it is, releases should not include the
+  NVIDIA files (a player with an RTX card can fetch them with the script).
+- `NIER_DLSS_LOG=1` passes all of Streamline's messages to the log (warnings and errors always).
+
 ## Portability plan
 
 Target: Windows, Linux and a macOS Universal binary, with D3D12 first and Vulkan tested later.

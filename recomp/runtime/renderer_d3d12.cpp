@@ -33,6 +33,7 @@
 #include "guest.h"
 #include "renderer.h"
 #include "settings.h"
+#include "dlss.h"
 #include <xxHash/xxhash.h>   // shader cache keys
 #include <cfloat>
 #include <api/include/dx12/ffx_api_dx12.h>   // AMD FSR SDK (tools/get_fsr_sdk.ps1)
@@ -3092,6 +3093,7 @@ float2 main(MotionOut input) : SV_Target
         int state = 0;   // 0 not tried, 1 loaded, -1 unavailable
         ffxContext context = nullptr;
         bool newest = false;   // the context was made for the FSR 4 setting (else FSR 3.1)
+        bool dlss = false;     // no FSR context: DLSS does the upscaling (dlss.cpp)
         uint32_t renderWidth = 0, renderHeight = 0, outWidth = 0, outHeight = 0;
         ComPtr<ID3D12Resource> motion, output;
         D3D12_RESOURCE_STATES outputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3190,7 +3192,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     int UpscalingSetting()
     {
         static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING", v, sizeof(v)) ? atoi(v) : -1; }();
-        return forced >= 0 ? forced : Settings().upscaling.load();
+        const int setting = forced >= 0 ? forced : Settings().upscaling.load();
+        return setting == 4 && !DlssAvailable() ? 2 : setting;   // DLSS chosen on a system without it: FSR 3.1
     }
 
     // The Upscaling Quality setting (settings.h); NIER_UPSCALING_QUALITY=<0-6> overrides it.
@@ -3212,7 +3215,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         return mode;
     }
 
-    bool TemporalWantsNewest() { return UpscalingSetting() >= 3; }
+    bool TemporalWantsNewest() { return UpscalingSetting() == 3; }
+    // The DLSS setting (NVIDIA RTX cards, dlss.cpp): it takes the place of the FSR upscaler inside
+    // TemporalUpscaled and uses everything else made for it (the jitter, the motion vectors).
+    bool TemporalWantsDlss() { return UpscalingSetting() == 4; }
 
     // The upscaler version to ask the FSR loader for. Left to itself it picks the newest it can find,
     // and an AMD driver supplies FSR 4 in place of 3.1: a far heavier upscaler, which on an integrated
@@ -3370,12 +3376,17 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const uint32_t outWidth = (surface.width * gDisplayTwelfths + 6) / 12, outHeight = (surface.height * gDisplayTwelfths + 6) / 12;
         if (gDrawSrvUsed + kTextureSlots > kDrawDescriptors) return nullptr;
 
-        const bool newest = TemporalWantsNewest();
-        if (!t.context || t.renderWidth != renderWidth || t.renderHeight != renderHeight || t.outWidth != outWidth || t.outHeight != outHeight || t.newest != newest)
+        const bool newest = TemporalWantsNewest(), dlss = TemporalWantsDlss();
+        if ((dlss ? !t.output : !t.context) || t.renderWidth != renderWidth || t.renderHeight != renderHeight || t.outWidth != outWidth || t.outHeight != outHeight || t.newest != newest || t.dlss != dlss)
         {
             if (t.context) { WaitForGpu(); t.destroy(&t.context, nullptr); t.context = nullptr; }
+            if (t.dlss) { WaitForGpu(); DlssRelease(); }
             if (t.motion) gRetired.push_back(std::move(t.motion));
             if (t.output) gRetired.push_back(std::move(t.output));
+            t.dlss = dlss;
+            ffxQueryGetProviderVersion provider{};
+            if (!dlss)
+            {
             ffxCreateBackendDX12Desc backend{};
             backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
             backend.device = gDevice.Get();
@@ -3399,9 +3410,9 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 t.state = -1;
                 return nullptr;
             }
-            ffxQueryGetProviderVersion provider{};
             provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
             t.query(&t.context, &provider.header);
+            }
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
@@ -3426,8 +3437,16 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             t.outWidth = outWidth;
             t.outHeight = outHeight;
             t.history = false;
-            Log("[fsr3] upscaler ready: %s, %ux%u -> %ux%u\n", provider.versionName ? provider.versionName : "unknown version", renderWidth, renderHeight, outWidth, outHeight);
-            gTemporalName = std::string("FSR ") + (provider.versionName ? provider.versionName : "3.1");
+            if (dlss)
+            {
+                Log("[dlss] upscaler ready: %s, %ux%u -> %ux%u\n", DlssName(), renderWidth, renderHeight, outWidth, outHeight);
+                gTemporalName = DlssName();
+            }
+            else
+            {
+                Log("[fsr3] upscaler ready: %s, %ux%u -> %ux%u\n", provider.versionName ? provider.versionName : "unknown version", renderWidth, renderHeight, outWidth, outHeight);
+                gTemporalName = std::string("FSR ") + (provider.versionName ? provider.versionName : "3.1");
+            }
         }
 
         // Motion vectors: last frame's camera applied to this frame's positions.
@@ -3478,7 +3497,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             gList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             gList->DrawInstanced(3, 1, 0, 0);
             ObjectMotion(rtv, depthFound->second.texture.Get());   // moving geometry: its own movement on top
-            reactive = ReactiveMask(renderWidth, renderHeight);    // blended effects
+            if (!dlss) reactive = ReactiveMask(renderWidth, renderHeight);    // blended effects (DLSS takes no such mask)
             D3D12_RESOURCE_BARRIER barriers[2] = { Transition(t.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead), {} };
             UINT count = 1;
             if (t.outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) barriers[count++] = Transition(t.output.Get(), t.outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3491,6 +3510,42 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         const double* m = gCameraNow;
         const double nearPlane = std::max(m[15] - m[11], 1e-3);
         const double yScale = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+        if (dlss)
+        {
+            // NIER_DLSS_JITTER=<x,y factors> (testing): the jitter handed to DLSS times these.
+            static const float jitterScale[2] = {
+                [] { char v[32]; return GetEnvironmentVariableA("NIER_DLSS_JITTER", v, sizeof(v)) ? float(atof(v)) : 1.0f; }(),
+                [] { char v[32]; const char* comma = GetEnvironmentVariableA("NIER_DLSS_JITTER", v, sizeof(v)) ? strchr(v, ',') : nullptr; return comma ? float(atof(comma + 1)) : 1.0f; }() };
+            DlssFrame frame;
+            frame.list = gList.Get();
+            frame.color = surface.texture.Get(); frame.colorState = UINT(kShaderRead);
+            frame.depth = depthFound->second.texture.Get(); frame.depthState = UINT(kShaderRead);
+            frame.motion = t.motion.Get(); frame.motionState = UINT(kShaderRead);
+            frame.output = t.output.Get(); frame.outputState = UINT(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            frame.renderWidth = renderWidth; frame.renderHeight = renderHeight;
+            frame.outWidth = outWidth; frame.outHeight = outHeight;
+            frame.jitterX = gJitterPixels[0] * jitterScale[0]; frame.jitterY = gJitterPixels[1] * jitterScale[1];
+            frame.reset = !t.history || !reprojected || t.base != base;
+            frame.quality = gResTwelfths == gDisplayTwelfths ? 1 : std::clamp(UpscalingQuality(), 2, 6);
+            frame.clipToPrevClip = reprojected ? reproject : nullptr;
+            frame.nearPlane = float(nearPlane);
+            frame.fovY = float(2.0 * std::atan(1.0 / std::max(yScale, 1e-3)));
+            frame.frame = gExecutingFrame;
+            const bool done = DlssEvaluate(frame);
+            // Streamline leaves its own heaps and pipeline on the command list.
+            ID3D12DescriptorHeap* heaps[] = { gDrawSrvHeap.Get(), gSamplerHeap.Get() };
+            gList->SetDescriptorHeaps(2, heaps);
+            auto toRead = Transition(t.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+            gList->ResourceBarrier(1, &toRead);
+            t.outputState = kShaderRead;
+            if (!done) { t.history = false; return nullptr; }
+            t.history = true;
+            t.frame = gExecutingFrame;
+            t.base = base;
+            t.source = surface.texture.Get();
+            t.version = surface.version;
+            return t.output.Get();
+        }
         ffxDispatchDescUpscale dispatch{};
         dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
         dispatch.commandList = gList.Get();
@@ -4110,6 +4165,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             if (GetEnvironmentVariableA("NIER_OVERLAP", v, sizeof(v))) gOverlap = atoi(v) != 0;
             else gOverlap = GetFileAttributesA("..\\overlap_off") == INVALID_FILE_ATTRIBUTES;
         }
+        DlssStart();   // before anything of DXGI or D3D12 is made
         char debug[8];
         if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
         {
@@ -4131,6 +4187,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             adapter.As(&gAdapter3);
         }
         if (!Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&gDevice)), "device")) return false;
+        {
+            DXGI_ADAPTER_DESC1 chosen{};
+            if (SUCCEEDED(adapter->GetDesc1(&chosen))) DlssSetDevice(gDevice.Get(), &chosen.AdapterLuid, sizeof(chosen.AdapterLuid));
+        }
         if (GetEnvironmentVariableA("NIER_D3D_DEBUG", debug, sizeof(debug)))
         {
             ComPtr<ID3D12InfoQueue1> queue;
@@ -4161,6 +4221,12 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
         ComPtr<IDXGISwapChain1> swapChain;
         if (!Check(factory->CreateSwapChainForHwnd(gQueue.Get(), gWindow, &swapDesc, nullptr, nullptr, &swapChain), "swap chain")) return false;
         factory->MakeWindowAssociation(gWindow, DXGI_MWA_NO_ALT_ENTER);
+        {
+            // With DLSS, Streamline's stand-in for the swap chain (it must see each Present).
+            void* raw = swapChain.Detach();
+            DlssUpgradeInterface(&raw);
+            swapChain.Attach(static_cast<IDXGISwapChain1*>(raw));
+        }
         if (!Check(swapChain.As(&gSwapChain), "swap chain interface")) return false;
         gSwapChain->SetMaximumFrameLatency(1);
         gFrameWait = gSwapChain->GetFrameLatencyWaitableObject();
@@ -5253,6 +5319,8 @@ void RendererPrewarmBoost(bool on)
         gPipelineJobs.work.notify_all();
     }
 }
+
+bool RendererDlssAvailable() { return DlssAvailable(); }
 
 bool RendererFsr4Available()
 {

@@ -39,6 +39,7 @@
 /dlc/
 /tools/SDL3/
 /tools/FidelityFX/
+/tools/Streamline/
 
 # Recorded controller input for test runs (run_boot.ps1 -Record)
 /recomp/recordings/

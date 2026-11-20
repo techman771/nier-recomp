@@ -244,6 +244,7 @@ RendererPerf RendererPerfTake();
 const char* RendererPerfStageName(int stage);
 // Whether this system has an FSR 4 upscaler (it comes with the AMD driver, for the GPUs it supports).
 bool RendererFsr4Available();
+bool RendererDlssAvailable();   // an NVIDIA RTX card with DLSS's files beside the executable (dlss.cpp)
 bool RendererDisplayTicksOff();      // the display's refreshes don't come at its reported rate: not a clock for the game
 bool RendererWaitDisplayVblank();   // waits one 60 Hz period of the display's own refreshes; false if it can't
 bool RendererReady();

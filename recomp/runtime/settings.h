@@ -23,7 +23,7 @@ struct PcSettings
     // more: test and measuring code sets it (0 640x360, 1 854x480, 2 960x540, 3 1280x720, 4 1600x900,
     // 5 1920x1080, 6 2560x1440, 7 3200x1800, 8 3840x2160, 9 5120x2880).
     std::atomic<int> resolutionScale{ -1 };
-    std::atomic<int> upscaling{ 0 };           // how a lower render resolution is enlarged: 0 plain filtering, 1 FSR 1, 2 FSR 3.1, 3 FSR 4 (temporal)
+    std::atomic<int> upscaling{ 0 };           // how a lower render resolution is enlarged: 0 plain filtering, 1 FSR 1, 2 FSR 3.1, 3 FSR 4, 4 DLSS (the last three temporal)
     // Upscaling Quality: with Upscaling on, the drawn resolution as a share of the output's:
     // 1 Native (the output's own; with FSR 3.1 or 4 that is their anti-aliasing alone, "Native
     // AA"), 2 Ultra Quality (output / 1.3), 3 Quality (1.5), 4 Balanced (1.7), 5 Performance

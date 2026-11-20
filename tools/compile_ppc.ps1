@@ -20,6 +20,12 @@ $lib = '../../tools/build'
 $sdl = '../../tools/SDL3'   # tools/get_sdl3.ps1 fetches it; SDL3.dll is copied beside nier.exe below
 if (-not (Test-Path (Join-Path $PSScriptRoot 'SDL3\include\SDL3\SDL.h'))) { & (Join-Path $PSScriptRoot 'get_sdl3.ps1') }
 if (-not (Test-Path (Join-Path $PSScriptRoot 'FidelityFX/sdk/upscalers/include/ffx_upscale.h'))) { & (Join-Path $PSScriptRoot 'get_fsr_sdk.ps1') | Out-Null }
+# NVIDIA Streamline (DLSS; tools/get_streamline.ps1 fetches it, nothing does so unasked: it is 276 MB).
+# With it the runtime is built with DLSS (recomp/runtime/dlss.cpp); without it, without.
+$sl = '../../tools/Streamline/sdk'
+$haveSl = Test-Path (Join-Path $PSScriptRoot 'Streamline/sdk/include/sl.h')
+$slInclude = if ($haveSl) { "-I$sl/include" } else { '' }
+$slLink = if ($haveSl) { "$sl/lib/x64/sl.interposer.lib /DELAYLOAD:sl.interposer.dll" } else { '' }
 $libs = "$sdl/lib/x64/SDL3.lib $lib/XenonUtils/XenonUtils.lib $lib/thirdparty/disasm/disasm.lib $lib/thirdparty/fmt/fmt.lib $lib/thirdparty/xxHash/cmake_unofficial/xxhash.lib"
 $ninja = @(
     "rule cxx",
@@ -27,11 +33,11 @@ $ninja = @(
     "  description = `$in",
     "",
     "rule rt",
-    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$sdl/include -I../../tools/FidelityFX/sdk -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
+    "  command = clang-cl $common $RuntimeOpt /Z7 /EHsc -I../runtime -I$sdl/include -I../../tools/FidelityFX/sdk $slInclude -I$x/XenonUtils -I$x/thirdparty -I$x/thirdparty/disasm `$in /Fo:`$out",
     "  description = `$in",
     "",
     "rule link",
-    "  command = lld-link /nologo /OUT:`$out /SUBSYSTEM:CONSOLE /STACK:0x10000000,0x100000 @`$out.rsp $libs gdi32.lib gdiplus.lib user32.lib winmm.lib ole32.lib xinput.lib d3d12.lib dxgi.lib d3dcompiler.lib dxguid.lib dbghelp.lib advapi32.lib delayimp.lib /DELAYLOAD:d3dcompiler_47.dll /DEBUG:FULL",
+    "  command = lld-link /nologo /OUT:`$out /SUBSYSTEM:CONSOLE /STACK:0x10000000,0x100000 @`$out.rsp $libs gdi32.lib gdiplus.lib user32.lib winmm.lib ole32.lib xinput.lib d3d12.lib dxgi.lib d3dcompiler.lib dxguid.lib dbghelp.lib advapi32.lib delayimp.lib /DELAYLOAD:d3dcompiler_47.dll $slLink /DEBUG:FULL",
     "  rspfile = `$out.rsp",
     "  rspfile_content = `$in",
     "  description = linking `$out",
@@ -55,6 +61,11 @@ Copy-Item (Join-Path $PSScriptRoot 'FidelityFX/fsr1/*') (Join-Path $build 'fsr1'
 # AMD's FSR SDK DLLs (the Upscaling setting's FSR 3.1); copied when missing or changed, they are large.
 foreach ($dll in 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll') {
     $from = Join-Path $PSScriptRoot "FidelityFX/sdk/signedbin/$dll"; $to = Join-Path $build $dll
+    if ((Test-Path $from) -and (-not (Test-Path $to) -or (Get-Item $from).Length -ne (Get-Item $to).Length)) { Copy-Item $from $to -Force }
+}
+# NVIDIA Streamline and the DLSS model, when the SDK is there (the DLSS entry of the Upscaling setting).
+foreach ($dll in 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'nvngx_dlss.dll') {
+    $from = Join-Path $PSScriptRoot "Streamline/sdk/bin/x64/$dll"; $to = Join-Path $build $dll
     if ((Test-Path $from) -and (-not (Test-Path $to) -or (Get-Item $from).Length -ne (Get-Item $to).Length)) { Copy-Item $from $to -Force }
 }
 # Button glyph atlases (PlayStation, Xbox Series, keyboard), drawn by make_glyphs.ps1.
