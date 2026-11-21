@@ -9,19 +9,21 @@
 #    Deck's GPU between 200 and about 1040 MHz under this game (the GPU is idle for part of every
 #    frame, waiting for the game's CPU work, so it is clocked down and up again all the time), and
 #    the frames that catch it on the way up come late: 60 fps with a slight judder. At a fixed
-#    1100 MHz, about what the automatic setting reaches anyway, the judder goes and the Deck draws
-#    a little less (7.8 W against 8.6 in the same scene). The clock is set through steamosctl, the
-#    same service the Performance menu's "Manual GPU Clock" uses, and what was set before is put
-#    back when the game exits. NIER_GPU_CLOCK=<MHz> asks for another clock (1600 is a little evener
-#    still in the heaviest scenes, for about 4 W more), NIER_GPU_CLOCK=max for the highest the
-#    device allows, NIER_GPU_CLOCK=auto leaves the setting alone.
+#    clock the judder goes. The default is 1300 MHz, which the recommended settings (720p with
+#    FSR 3.1, 60 fps) need; 1600 brought nothing more there: the GPU's work took as long, the Deck
+#    ran hotter and the CPU was slowed. Without upscaling 1100 is enough, about what the automatic
+#    setting reaches anyway, and the Deck then draws a little less than on automatic (7.8 W
+#    against 8.6 in the same scene). The clock is set through steamosctl, the same service the
+#    Performance menu's "Manual GPU Clock" uses, and what was set before is put back when the
+#    game exits. NIER_GPU_CLOCK=<MHz> asks for another clock, NIER_GPU_CLOCK=max for the highest
+#    the device allows, NIER_GPU_CLOCK=auto leaves the setting alone.
 #
 # 2. Makes Proton load the d3dcompiler_47.dll shipped beside nier.exe (Wine's own cannot compile
 #    the game's shaders: only videos would draw).
 #
 # Without steamosctl (another Linux, an older SteamOS) only the second step happens.
 
-clock=${NIER_GPU_CLOCK:-1100}
+clock=${NIER_GPU_CLOCK:-1300}
 restore=
 
 value() { sed -n 's/^[^:]*: *//p' | head -n 1; }   # "GPU performance level: auto" -> "auto"

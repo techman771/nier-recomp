@@ -864,6 +864,13 @@ the program, which is GPL-3.0.
   NVIDIA's marks in an application's credits. Whether a GPL-3.0 program may ship that file
   beside it is not for these notes to settle; until it is, releases should not include the
   NVIDIA files (a player with an RTX card can fetch them with the script).
+- Decided 2026-11-21: NVIDIA's files are not shipped. `tools/get_dlss.ps1` (with `get_dlss.cmd` to
+  double-click; `compile_ppc.ps1` copies both beside nier.exe) is what a player runs: it downloads
+  the same SDK zip, checks its checksum, keeps the four DLLs and `nvngx_dlss.license.txt` beside
+  nier.exe (each DLL checked too) and deletes the zip. `-Zip <file>` takes a copy already
+  downloaded, which is how it was tested; the download itself was not run from this script (the
+  address is the one `get_streamline.ps1` used). A release must be built with the SDK present,
+  or nier.exe has only the stubs.
 - `NIER_DLSS_LOG=1` passes all of Streamline's messages to the log (warnings and errors always).
 
 ## Portability plan
@@ -2642,6 +2649,11 @@ the place"):
       options). In play 39.7-39.8 fps, slowest 1% about 28 ms, 9.5 W. In the village overview
       38.6 fps with some frames doubled (short of CPU time there, see above). Fallback: Output
       Resolution Screen's own at 1100 MHz, 39.9-40.0 fps with the slowest 1% at 27 ms, 8.5 W.
+    - Decided by the user, 2026-11-21: with the renderer's overlap the 40 fps profile is no
+      longer needed, and the README gives one profile: Deck refresh 60 Hz, Frame Rate 60, Output
+      Resolution 720p, Upscaling FSR 3.1 Native, Shadow Quality High, GPU at 1300 MHz. That
+      clock is now `tools/deck-launch.sh`'s default (was 1100); 1600 is not recommended (see the
+      1600 MHz run above). The two profiles above stay here as what was measured.
     Proton: both draw without launch options; the user found Proton-GE Latest smoother than
     Proton Experimental at the same clock (60 against 57 fps in play, in runs that were not of
     the same spot).

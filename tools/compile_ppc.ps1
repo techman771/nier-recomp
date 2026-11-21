@@ -68,6 +68,8 @@ foreach ($dll in 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'nvngx_dls
     $from = Join-Path $PSScriptRoot "Streamline/sdk/bin/x64/$dll"; $to = Join-Path $build $dll
     if ((Test-Path $from) -and (-not (Test-Path $to) -or (Get-Item $from).Length -ne (Get-Item $to).Length)) { Copy-Item $from $to -Force }
 }
+# The script a player runs to fetch those files (they are NVIDIA's and are not shipped): beside nier.exe.
+Copy-Item (Join-Path $PSScriptRoot 'get_dlss.ps1'), (Join-Path $PSScriptRoot 'get_dlss.cmd') $build -Force
 # Button glyph atlases (PlayStation, Xbox Series, keyboard), drawn by make_glyphs.ps1.
 $glyphScript = Join-Path $PSScriptRoot 'make_glyphs.ps1'
 $glyphOut = Join-Path $build 'glyphs\xbox.rgba'
