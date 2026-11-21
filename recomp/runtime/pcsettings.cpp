@@ -199,6 +199,26 @@ namespace
         if (RendererDlssAvailable()) stored[count++] = 4;
         return count;
     }
+    // The Upscaling Quality row for an Upscaling setting (stored value): Native (stored as 1), Ultra
+    // Quality (2) only with FSR 1 or with Upscaling off, then Quality to Ultra Performance (3-6).
+    // The temporal upscalers (FSR 3.1, FSR 4, DLSS) are not offered Ultra Quality: DLSS has no such
+    // mode, and the renderer counts a stored 2 as Quality for all three (UpscalingQuality).
+    int QualityChoices(int upscaling, int stored[6])
+    {
+        int count = 0;
+        stored[count++] = 1;
+        if (upscaling < 2) stored[count++] = 2;
+        for (int q = 3; q <= 6; q++) stored[count++] = q;
+        return count;
+    }
+    int QualityPosition(int upscaling, int stored)
+    {
+        int choices[6];
+        const int count = QualityChoices(upscaling, choices);
+        stored = std::clamp(stored, 1, 6);
+        for (int i = 0; i < count; i++) if (choices[i] == stored) return i;
+        return 1;   // Ultra Quality saved, with a temporal upscaler: Quality
+    }
     int MenuValue(const Item& item, int stored)
     {
         if (item.value == &gSettings.upscaling)
@@ -208,7 +228,7 @@ namespace
             for (int i = 0; i < count; i++) if (choices[i] == stored) return i;
             return 2;   // FSR 4 or DLSS saved on a system without it: FSR 3.1 does the work
         }
-        if (item.value == &gSettings.upscalingQuality) return std::clamp(stored, 1, 6) - 1;
+        if (item.value == &gSettings.upscalingQuality) return QualityPosition(gSettings.upscaling.load(), stored);
         if (item.value != &gSettings.frameRate60) return stored;
         static const int kPosition[8] = { 0, 2, 3, 3, 4, 5, 6, 1 };
         return kPosition[std::clamp(stored, 0, 7)];
@@ -221,7 +241,12 @@ namespace
             const int count = UpscalingChoices(choices);
             return choices[std::clamp(menu, 0, count - 1)];
         }
-        if (item.value == &gSettings.upscalingQuality) return std::clamp(menu, 0, 5) + 1;
+        if (item.value == &gSettings.upscalingQuality)
+        {
+            int choices[6];
+            const int count = QualityChoices(gSettings.upscaling.load(), choices);
+            return choices[std::clamp(menu, 0, count - 1)];
+        }
         if (item.value != &gSettings.frameRate60) return menu;
         static const int kStored[7] = { 0, 7, 1, 3, 4, 5, 6 };
         return kStored[std::clamp(menu, 0, 6)];
@@ -233,6 +258,7 @@ namespace
     int ItemMax(const Item& item)
     {
         if (item.value == &gSettings.upscaling) { int choices[5]; return UpscalingChoices(choices) - 1; }
+        if (item.value == &gSettings.upscalingQuality) { int choices[6]; return QualityChoices(gSettings.upscaling.load(), choices) - 1; }
         if (item.value == &gSettings.outputResolution)
         {
             static const int kHeights[8] = { 0, 720, 900, 1080, 1440, 1800, 2160, 2880 };
@@ -262,6 +288,9 @@ namespace
     uint32_t gCaptureRow = 0;
     std::vector<uint8_t> gSavedRecords;
     uint32_t gSavedCount = 0, gSavedScroll = 0, gSavedCursorRow = 0;
+    // Upscaling went to or from Off while the PC page was open: the page's rows are written again
+    // (the Upscaling Quality row is there only with Upscaling on). Done by PcSettingsTick.
+    std::atomic<bool> gRefillPc{ false };
 
     void WriteRecord(uint32_t record, uint8_t type, uint8_t value, uint8_t min, uint8_t max, uint8_t flag, uint32_t item, uint32_t label, uint32_t help)
     {
@@ -283,6 +312,7 @@ namespace
         uint32_t n = 0;
         for (const Item& item : kItems)
         {
+            if (item.value == &gSettings.upscalingQuality && gSettings.upscaling.load() == 0) continue;   // nothing to choose with Upscaling off
             const int max = ItemMax(item);
             const Text help = item.value != &gSettings.upscaling ? item.help : RendererDlssAvailable() ? Text(T_UpscalingHelpDlss) : RendererFsr4Available() ? Text(T_UpscalingHelp4) : item.help;
             WriteRecord(first + n++ * kRecordSize, item.type, uint8_t((std::min)(MenuValue(item, item.value->load()), max)), 0, uint8_t(max), (item.type == 2 || item.type == 4) ? 1 : 0, item.id, item.label, help);
@@ -326,13 +356,58 @@ namespace
     // would switch while scrolling past it); the rest apply as they change.
     void ReadPcRecords(uint32_t menu, bool includeDisplayMode)
     {
+        const int upscalingBefore = gSettings.upscaling.load();
+        uint32_t qualityRecord = 0;
         for (uint32_t i = 0; i < kRecordCount; i++)
         {
             const uint32_t record = menu + kRecords + i * kRecordSize;
             const Item* item = FindItem(R32(record + 40));
             if (!item || (!includeDisplayMode && item->value == &gSettings.borderless)) continue;
+            if (item->value == &gSettings.upscalingQuality) { qualityRecord = record; continue; }
             item->value->store(StoredValue(*item, std::clamp(int(int8_t(R8(record + 1))), 0, ItemMax(*item))));
         }
+        if (qualityRecord)
+        {
+            // The Upscaling Quality row's list depends on the Upscaling row (QualityChoices): its
+            // position is read by the list it was shown with, and when Upscaling has just changed
+            // the row's record is given the new list's position and length.
+            int choices[6];
+            const int count = QualityChoices(upscalingBefore, choices);
+            const int stored = choices[std::clamp(int(int8_t(R8(qualityRecord + 1))), 0, count - 1)];
+            const int upscaling = gSettings.upscaling.load();
+            const int position = QualityPosition(upscaling, stored), max = QualityChoices(upscaling, choices) - 1;
+            gSettings.upscalingQuality.store(choices[position]);
+            if (R8(qualityRecord + 1) != position) { W8(qualityRecord + 1, uint8_t(position)); W8(qualityRecord + 4, uint8_t(position)); }
+            if (R8(qualityRecord + 3) != max) W8(qualityRecord + 3, uint8_t(max));
+        }
+        if ((upscalingBefore == 0) != (gSettings.upscaling.load() == 0)) gRefillPc = true;
+    }
+
+    // Writes the PC page's rows again after Upscaling went to or from Off (the caller lays the page
+    // out). The Display Mode row keeps the value shown (it is applied only on Return), and the
+    // cursor stays on its row.
+    void RefillPcRecords(uint32_t menu)
+    {
+        auto displayMode = [&]() -> uint32_t {
+            for (uint32_t i = 0; i < kRecordCount; i++)
+            {
+                const uint32_t record = menu + kRecords + i * kRecordSize;
+                const Item* item = FindItem(R32(record + 40));
+                if (item && item->value == &gSettings.borderless) return record;
+            }
+            return 0;
+        };
+        uint32_t record = displayMode();
+        const int shown = record ? R8(record + 1) : -1;
+        const uint32_t count = FillPcRecords(menu);
+        W32(menu + kRecordsInUse, count);
+        record = displayMode();
+        if (record && shown >= 0) W8(record + 1, uint8_t(shown));
+        constexpr uint32_t kVisibleRows = 9;
+        const uint32_t row = R32(menu + kScroll) + R32(menu + kCursorRow);
+        const uint32_t scroll = (std::min)(R32(menu + kScroll), count > kVisibleRows ? count - kVisibleRows : 0u);
+        W32(menu + kScroll, scroll);
+        W32(menu + kCursorRow, (std::min)(row, count - 1) - scroll);
     }
 
     // Lays the page out again from its records: the calls the builder makes after filling them
@@ -491,7 +566,7 @@ bool PcSettingsValueText(PPCRegister& r3)
     const Item* item = FindItem(id);
     if (!item || (item->type != 2 && item->type != 4)) return false;
     const int value = std::clamp(int(int8_t(R8(r3.u32 + 1))), 0, ItemMax(*item));
-    r3.u64 = GuestText(item->values[item->value == &gSettings.upscaling ? StoredValue(*item, value) : value]);
+    r3.u64 = GuestText(item->values[item->value == &gSettings.upscaling ? StoredValue(*item, value) : item->value == &gSettings.upscalingQuality ? StoredValue(*item, value) - 1 : value]);
     return true;
 }
 
@@ -717,8 +792,21 @@ void PcSettingsTick(PPCRegister& r3)
     {
         bool capturing;
         { std::lock_guard lock(gPageMutex); capturing = gCaptureAction >= 0; }
-        if (!capturing) MenuPointer(menu);
+        // The mouse pointer on the settings pages is switched off (2026-11-21: it did not work as
+        // it should in play); NIER_MENU_MOUSE=1 brings it back for work on it. Without it the
+        // mouse is what it is in the game's other menus: no cursor, its buttons their bindings.
+        static const bool pointer = GetEnvironmentVariableA("NIER_MENU_MOUSE", nullptr, 0) > 0;
+        if (!pointer) {}
+        else if (!capturing) MenuPointer(menu);
         else InputKeepPointerMode();
+    }
+    {
+        bool refilled = false;
+        {
+            std::lock_guard lock(gPageMutex);
+            if (gPcMenu == menu && gPage == Page::Pc && gRefillPc.exchange(false)) { RefillPcRecords(menu); refilled = true; }
+        }
+        if (refilled) LayOutPage(menu);
     }
     bool changed = false;
     {

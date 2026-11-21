@@ -3200,7 +3200,8 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
     int UpscalingQuality()
     {
         static const int forced = [] { char v[8]; return GetEnvironmentVariableA("NIER_UPSCALING_QUALITY", v, sizeof(v)) ? atoi(v) : -1; }();
-        return std::clamp(forced >= 0 ? forced : Settings().upscalingQuality.load(), 1, 6);   // (0, the old "Custom", is Native)
+        const int quality = std::clamp(forced >= 0 ? forced : Settings().upscalingQuality.load(), 1, 6);   // (0, the old "Custom", is Native)
+        return quality == 2 && UpscalingSetting() >= 2 ? 3 : quality;   // Ultra Quality is FSR 1's alone (the menu offers it only there): Quality
     }
 
     // 0 plain filtering, 1 FSR 1, 2 temporal (the FSR 3.1 and FSR 4 settings: TemporalWantsNewest).

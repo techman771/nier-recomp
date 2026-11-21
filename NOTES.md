@@ -871,6 +871,13 @@ the program, which is GPL-3.0.
   downloaded, which is how it was tested; the download itself was not run from this script (the
   address is the one `get_streamline.ps1` used). A release must be built with the SDK present,
   or nier.exe has only the stubs.
+- Ultra Quality is offered only with FSR 1 or with Upscaling off (the user's request, 2026-11-21;
+  pcsettings.cpp `QualityChoices`). With FSR 3.1, FSR 4 or DLSS the Upscaling Quality row goes
+  Native, Quality, Balanced, Performance, Ultra Performance, and the renderer counts a stored 2
+  as Quality (`UpscalingQuality`), so an old settings.ini or `NIER_UPSCALING_QUALITY=2` gives
+  1.5 there. The row's record is rewritten (position and length) when the Upscaling row changes
+  while the page is open (`ReadPcRecords`). Checked by replay: DLSS with a stored 2 draws
+  2560x1440 for 4K, FSR 1 still 2986x1680. The menu itself has not been seen yet.
 - `NIER_DLSS_LOG=1` passes all of Streamline's messages to the log (warnings and errors always).
 
 ## Portability plan
@@ -1987,7 +1994,9 @@ mouse movement (WM_INPUT in present.cpp, while the window is focused and Mouse S
 the cursor is hidden and clipped to the window) becomes right-stick deflection in input.cpp
 (speed-based, lifted over the dead zone; untested by hand so the scale may need tuning). Mouse
 buttons are bindable like keys (VK 1, 2, 4, 5, 6) and have their own icons; defaults: Attack =
-left, Heavy Attack = right, Reset Camera = middle. Menu pointer (first
+left, Heavy Attack = right, Reset Camera = middle. The menu pointer described next is switched
+off since 2026-11-21 (the user: "it's not working as it should"; what went wrong was not said):
+PcSettingsTick calls it only with `NIER_MENU_MOUSE=1`. Menu pointer (first
 screens: the settings pages, kinds 4-7): PcSettingsTick calls MenuPointer each frame the page is
 open; it keeps "pointer mode" on (cursor shown, no camera, mouse buttons not game controls),
 maps the cursor to a row (rows 38 px apart from y 172, x 240-905 in 1280x720 space, 9 visible),
