@@ -1,4 +1,6 @@
-// Process startup, logging and crash reporting.
+﻿// Process startup, logging and crash reporting.
+#include <chrono>
+#include <condition_variable>
 #include <windows.h>
 #include <timeapi.h>
 #include <dbghelp.h>
@@ -16,7 +18,6 @@
 
 namespace
 {
-    std::mutex gLogMutex;
     bool gTraceImports = false;
     constexpr int kRing = 24;
     thread_local const char* tRecent[kRing];
@@ -126,36 +127,92 @@ namespace { FILE* gCaptureLog = nullptr; }
 // output went: under Proton the output of a program started from Steam is not kept anywhere useful.
 namespace { FILE* gRunLog = nullptr; }
 
+// Log lines are queued by Log and written by a thread of their own. Written and flushed where they
+// were logged, a line could hold a game thread for as long as the disk took: in play the main loop
+// stopped for 100 ms and more on the frames the periodic lines are logged at (every 300th;
+// 2026-11-21, 22 stalls in three minutes, all on such frames). NIER_LOG_SYNC=1 writes each line
+// before Log returns, as before (for a crash that takes the process down without a word).
+namespace
+{
+    std::mutex gLogQueueMutex;              // gLogPending
+    std::string gLogPending;
+    std::condition_variable gLogWake;
+    std::timed_mutex gLogWriteMutex;        // the files, and the order lines are written in
+
+    void WritePending()
+    {
+        std::string text;
+        {
+            std::lock_guard lock(gLogQueueMutex);
+            text.swap(gLogPending);
+        }
+        if (text.empty()) return;
+        if (gCaptureLog) fwrite(text.data(), 1, text.size(), gCaptureLog);
+        if (gRunLog)
+        {
+            fwrite(text.data(), 1, text.size(), gRunLog);
+            fflush(gRunLog);
+        }
+        fwrite(text.data(), 1, text.size(), stdout);
+        fflush(stdout);
+    }
+
+    void LogWriter()
+    {
+        for (;;)
+        {
+            {
+                std::unique_lock lock(gLogQueueMutex);
+                gLogWake.wait(lock, [] { return !gLogPending.empty(); });
+            }
+            std::lock_guard lock(gLogWriteMutex);
+            WritePending();
+        }
+    }
+}
+
+// Writes what is waiting, in the caller's thread. Before the process ends (guest.h wraps
+// ExitProcess and TerminateProcess), and in the crash handler: if the writer cannot be waited
+// for (it is the thread that crashed), the lines are written anyway.
+void LogFlush()
+{
+    std::unique_lock lock(gLogWriteMutex, std::chrono::milliseconds(500));
+    WritePending();
+}
+
 void LogSetCaptureFile(FILE* file)
 {
-    std::lock_guard lock(gLogMutex);
+    LogFlush();
+    std::lock_guard lock(gLogWriteMutex);
     if (gCaptureLog) fclose(gCaptureLog);
     gCaptureLog = file;
 }
 
 void Log(const char* format, ...)
 {
-    std::lock_guard lock(gLogMutex);
-    va_list arguments;
+    static const bool synchronous = GetEnvironmentVariableA("NIER_LOG_SYNC", nullptr, 0) > 0;
+    char local[1024];
+    va_list arguments, copy;
     va_start(arguments, format);
-    if (gCaptureLog)
+    va_copy(copy, arguments);
+    const int length = vsnprintf(local, sizeof(local), format, copy);
+    va_end(copy);
+    if (length < 0) { va_end(arguments); return; }
+    std::string longer;
+    if (size_t(length) >= sizeof(local))
     {
-        va_list copy;
-        va_copy(copy, arguments);
-        vfprintf(gCaptureLog, format, copy);
-        va_end(copy);
+        longer.resize(size_t(length) + 1);
+        vsnprintf(longer.data(), longer.size(), format, arguments);
     }
-    if (gRunLog)
-    {
-        va_list copy;
-        va_copy(copy, arguments);
-        vfprintf(gRunLog, format, copy);
-        va_end(copy);
-        fflush(gRunLog);
-    }
-    vprintf(format, arguments);
     va_end(arguments);
-    fflush(stdout);
+    {
+        std::lock_guard lock(gLogQueueMutex);
+        gLogPending.append(longer.empty() ? local : longer.data(), size_t(length));
+    }
+    if (synchronous) { LogFlush(); return; }
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(LogWriter).detach(); });
+    gLogWake.notify_one();
 }
 
 void TraceImport(const char* name, PPCContext& ctx)

@@ -144,6 +144,15 @@ name = "FishingCameraTurn"
 address = 0x821A5B68
 registers = ["f29", "f30"]
 
+# High frame rates: the wind on hair and cloth chains (sub_82186448, called once a frame for each
+# chain of a character) adds a fixed push to every link's velocity, with no time step, so at
+# 240 fps the wind pushed eight times as hard as on the console. The hook scales the push (f26,
+# about to be used by fmuls f0,f6,f26) by the frame's share of a 30 fps frame (runtime: highfps.cpp).
+[[midasm_hook]]
+name = "ChainWindPush"
+address = 0x8218665C
+registers = ["f26", "r27", "r30"]
+
 # Recorded input (test runs): the main loop (sub_82496D00) is about to simulate the time step in
 # f31. The hook counts the loop's turns and, with a recording, writes each step or hands the game
 # the recorded one, so a replay simulates what was recorded tick for tick (runtime: gametick.cpp).

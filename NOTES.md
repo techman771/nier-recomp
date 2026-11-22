@@ -814,6 +814,40 @@ service thread (`sub_8251AC78`, which self-suspends and is resumed by the game),
 requested in bursts of the device period, and whether the 6-refresh gaps line up with file reads or
 keyframes. They may also be deliberately held frames in the source.
 
+## Crackling sound and log stalls, 2026-11-21
+
+- Report (the user, 2026-11-19 and again 2026-11-21, playtests only): music crackling and a little
+  slow. First put down to the user's speaker; it was ours.
+- Diagnostics in audio.cpp (`HealthAfterPump`): every 1875 blocks (ten seconds) a line with blocks
+  a second (187.5 keeps up), how often the device ran dry, the longest time between two blocks,
+  the slowest block, blocks that were pure silence straight after one with sound in it, and the
+  timer resolution (`NtQueryTimerResolution`). Logged when any of it is off; `NIER_AUDIO_HEALTH=1`
+  logs every one. `NIER_SILENT_DEVICE=1` (or `NIER_MUTE=2`) runs the real device fed silence, for
+  muted test runs (replay_input_test.ps1 sets NIER_MUTE=1 itself).
+- Seen in the bad playtest: about 150 silent blocks every ten seconds (15 a second), in every
+  window, whatever the frame rate (119 at 236 fps, 150 at 176); longest time between blocks 21 ms
+  in every window, against 12 ms in muted replays on the same output, which had none. The device
+  never ran dry. So the pump thread woke late, found three blocks' worth gone from the queue and
+  asked the game for them back to back; the game's streams had less ready and a block came back
+  silent.
+- Fix (audio.cpp, the device loop): no block sooner than 3/4 of a block's length after the last
+  (1/2 while fewer than three blocks are queued), and the loop's waits are `ShortWait`, a
+  high-resolution waitable timer (Sleep(1) where there is none: Wine, old Windows). Playtest
+  after: 0 silent blocks in 18 windows, 12 ms between blocks; the user: "crackling is gone".
+- NOT explained: why the thread woke late. The guess was a 15.6 ms timer tick (Sleep(1) lasting
+  a tick), but the fixed build read a 0.5 ms resolution all through its playtest, and there is no
+  reading from the bad one. Device period 10.0 ms (now in the "output started" line).
+- Stalls on the log's frames: in that playtest the main loop stopped 22 times in three minutes
+  (140-830 ms, part of that the stall watchdog's own thread dump), every time on a frame that is
+  a multiple of 300, where gpu.cpp logs its periodic lines. `Log` wrote and flushed each line
+  into two files in the caller's thread. Now (main.cpp) `Log` only queues the text and a writer
+  thread writes it; `LogFlush` writes what is waiting, and guest.h wraps `ExitProcess` and
+  `TerminateProcess` so every way out goes through it (include guest.h after windows.h).
+  `NIER_LOG_SYNC=1` is the old behaviour. Muted replay after: the last windows 600 of 600 frames
+  on time, two stalls of 140 ms at loads (none on a multiple of 300), the log complete; the
+  reference frame replays to the same file (541B6019...). Not yet played by the user. Whether
+  the 77 ms hitches of 2026-11-19 were this is a guess: they also came about once a log interval.
+
 ## DLSS (NVIDIA RTX cards), 2026-11-19
 
 The Upscaling setting's fifth value (stored as 4), offered only where it can run. Built on
@@ -877,7 +911,13 @@ the program, which is GPL-3.0.
   as Quality (`UpscalingQuality`), so an old settings.ini or `NIER_UPSCALING_QUALITY=2` gives
   1.5 there. The row's record is rewritten (position and length) when the Upscaling row changes
   while the page is open (`ReadPcRecords`). Checked by replay: DLSS with a stored 2 draws
-  2560x1440 for 4K, FSR 1 still 2986x1680. The menu itself has not been seen yet.
+  2560x1440 for 4K, FSR 1 still 2986x1680. Seen by the user in a playtest: "it works".
+- The Upscaling Quality row is left off the PC page while Upscaling is Off (`FillPcRecords`). The
+  user asked for it greyed out, but the game's settings records have no disabled state (the
+  layout and input routines read only type, value, min, max and the flag at +5), so it is hidden
+  instead. When Upscaling goes to or from Off, `ReadPcRecords` sets `gRefillPc` and
+  `PcSettingsTick` writes the rows again (`RefillPcRecords`: Display Mode keeps the value shown,
+  the cursor its row) and lays the page out. Seen by the user: "it works".
 - `NIER_DLSS_LOG=1` passes all of Streamline's messages to the log (warnings and errors always).
 
 ## Portability plan
@@ -1004,6 +1044,30 @@ without FSR 3 it is the same, so it is in the recorded constants and not the ups
 - NOT shown yet: that two frames is short enough to stop the swing. Standing in the village the
   exposure is steady at any delay; the swing needs the Northern Plains in motion, which no test
   route reaches. For the user to confirm at 240 fps.
+- The swing again, on the Steam Deck in Facade at 60 fps (21 November 2026; the user: "same
+  lighting issue as before but in facade"; 720p, no upscaling, VSync off, overlap on). Five
+  recordings on the Deck (recomp/captures/seq_f56971, f57984, f58958, f59551, f60703; f57984
+  copied to recomp\deck_logs\caps2). Replayed, f57984's mean brightness goes 54 to 144 of 255
+  and back about every 14 frames while the player moves, and is flat (76) once he stands.
+  - Why the Deck and not the PC: with the overlap the game was let go as soon as a frame was
+    handed to the GPU, so it built a whole frame more while the GPU drew. The Deck's [perf]
+    lines show the render thread 12 ms in Present and about 8 ms of GPU work a frame; the PC's
+    GPU is done in 1-3 ms. Read-backs were not logged on the Deck, so "three frames late there"
+    is reasoned from that timing and the 14-frame period, not measured.
+  - Change (RendererSubmitFrame, overlap only): after handing a frame over, the game waits
+    until the read-backs of the frame before it (the one on the GPU) have been delivered, 100 ms
+    at most, before it builds the next. The frame handed over is recorded meanwhile.
+    NIER_READBACK_WAIT=0 is the old behaviour.
+  - Measured on the PC (NIER_LOG_WRITEBACK=1): standing in Facade (slot 3) at 60 fps with the
+    Deck's timing put on (new test switches NIER_SLOW_GPU_MS=8, which holds each delivery back
+    until 8 ms after the frame went to the GPU, and NIER_SLOW_PRESENT_MS=12, a sleep before
+    Present): every read-back 2 frames late without the wait, 1 with it, 60.0 fps both ways.
+    The desert replay at 240 fps: 1 late 58% / 2 late 42% without, 79% / 21% with, 240.0 fps
+    both ways. With only NIER_SLOW_GPU_MS the PC shows 1 late either way (the game's own 60 fps
+    wait hides it), so both switches are needed to imitate the Deck.
+  - NOT shown: that the swing is gone on the Deck. The PC never showed it in Facade, so only
+    the Deck can tell. If it remains, log the read-backs there (NIER_LOG_WRITEBACK=1 in the
+    launch options) before anything else.
 - `NIER_FPS_AT=<frame>,<index>` (test runs) sets the Frame Rate setting at a frame: the scripted
   route to a save is timed for 60 fps and does not arrive at 240.
 
@@ -1087,6 +1151,36 @@ Kaine's warp at high frame rates: cause found and fixed (18 November 2026, await
 
 Kaine's hair (18 November 2026): not a bug. Her hair streaming sideways while she stands is the
 game's wind (the user's correction); nothing was changed for it.
+
+Wind too strong on hair and cloth at high frame rates (21 November 2026): fixed (hook
+ChainWindPush), awaiting the user's check at 240 fps.
+- The user after a two-hour playtest: "the wind at 240fps is blowing quicker which is causing
+  the issues in Kaine's hair and cloth physics". So the 17 November report (strands standing
+  straight out in cutscenes) was the same thing.
+- The code: hair and cloth are "chains" of bones (the only name in the image is the message
+  "[%s] Chain Child Bone Not Exist" at 0x82017F88, used by sub_82185460). A character's update,
+  sub_82205760 (chains at +2504, count +2500), asks for the wind where it stands (sub_82347368:
+  the static object 0x826E1660; sub_82148408 gives the area's wind plus point sources, no clock
+  in it), hands it to each chain with sub_82186448 and then simulates the chain with sub_82187030
+  -> sub_82186710, which does go by time (its step is the game's time step times 60).
+- The cause: sub_82186448 adds to every link's velocity (array at chain+20, 64 bytes a link,
+  velocity at +16) a push along the wind of strength chain+48 x wind speed x 0.01 x a random
+  factor, once a frame, with no time step. Eight times the pushes a second at 240 fps as at 30.
+- The fix: mid-asm hook at 0x8218665C scales the push (f26) by time step x 30, so a second of
+  wind is what it was on the console. Note this also halves the wind at 60 fps compared with
+  the builds before it. NIER_FRAME_COUNTS=1 turns it off like the other highfps.cpp hooks.
+- Measured with NIER_LOG_WIND=1 (logs the pushes and the links' average speed for every two
+  seconds of game time), standing in the Aerie after loading slot 1 with loadsave_args.txt and
+  NIER_FPS_AT=2800,<index>. Push a second for each link / average link speed:
+  with the hook 0.0187 / 0.0052 at 30 fps, 0.0188 / 0.0052 at 60, 0.0190 / 0.0054 at 120;
+  without it 0.0191 / 0.0055 at 30, 0.0932 / 0.0300 at 120. The test monitor held the 240 fps
+  setting to 120, so 240 itself was not measured. Not looked at on screen by me.
+- Not checked: the rest of the chain code for other per-frame terms (sub_82186710 blends each
+  link towards its animated place by the factor at chain+52 once a frame, with no time step).
+- How it was found, for the next one: the frame counter (NIER_WATCH_READ on 0x85F08468) was a
+  wrong turn, the wind does not use it. Searching a dump of the image (NIER_DUMP_RANGE=
+  82000000,0x7C0000 with NIER_PROFILE=900,1,exit) for words found the "Chain" message, and its
+  neighbours in the code were in the profile of a run with Kaine on screen.
 
 Fishing camera too fast at 240 fps (18 November 2026): fixed (hook FishingCameraTurn).
 - Repro: `tools\replay_input_test.ps1 78 <label> nier.exe fishing.input` replays the user's input

@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -28,6 +29,59 @@ namespace
     IAudioRenderClient* gRender = nullptr;
     uint32_t gBufferFrames = 0;
     bool gDeviceOk = false;
+    bool gSilent = false;   // NIER_MUTE=2: the device runs and paces the engine, but is given silence
+
+    // How the output is doing, about every ten seconds (1875 blocks): blocks a second (187.5 when
+    // the engine keeps up with the device), how often the device had nothing left, the longest
+    // time between two blocks and the longest the engine took over one, and blocks that were
+    // silent straight after one that was not (a stream that ran out for a moment). A line is
+    // logged when any of it is off; NIER_AUDIO_HEALTH=1 logs every one.
+    struct Health { int64_t since = 0, lastPump = 0, longestGap = 0, longestPump = 0; uint32_t pumps = 0, dry = 0, dropouts = 0; bool lastLoud = false; } gHealth;
+
+    // The Windows timer resolution this process has right now, in ms (0 if it cannot be asked).
+    // main.cpp asks for 1 ms; at 15.6 a Sleep(1) lasts a whole tick.
+    double TimerResolutionMs()
+    {
+        using Query = LONG (NTAPI*)(ULONG*, ULONG*, ULONG*);
+        static const Query query = (Query)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryTimerResolution");
+        ULONG coarsest = 0, finest = 0, current = 0;
+        return query && query(&coarsest, &finest, &current) >= 0 ? current / 10000.0 : 0.0;
+    }
+
+    // Waits about a millisecond whatever the timer resolution is: a high-resolution waitable timer
+    // (Windows 10 1803 on), or Sleep(1) where there is none (older Windows, Wine).
+    void ShortWait()
+    {
+        static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -10000;   // 1 ms from now, in 100 ns units
+        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 20);
+        else Sleep(1);
+    }
+
+    void HealthAfterPump(int64_t began, int64_t ended, bool dry)
+    {
+        static const bool always = GetEnvironmentVariableA("NIER_AUDIO_HEALTH", nullptr, 0) > 0;
+        static const int64_t frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+        Health& h = gHealth;
+        if (!h.since) h.since = began;
+        if (h.lastPump) h.longestGap = (std::max)(h.longestGap, began - h.lastPump);
+        h.lastPump = began;
+        h.longestPump = (std::max)(h.longestPump, ended - began);
+        h.dry += dry;
+        if (++h.pumps < 1875) return;
+        const double seconds = double(ended - h.since) / double(frequency), rate = h.pumps / seconds, k = 1000.0 / double(frequency);
+        static int logged = 0;
+        const bool off = h.dry > 0 || h.dropouts > 0 || double(h.longestGap) * k > 40.0 || rate < 183.0;
+        if (always || (off && logged++ < 200))
+            Log("[audio] last %.1f s: %.1f blocks a second (187.5 keeps up), the device ran dry %u times, longest %.1f ms between blocks, slowest block %.1f ms, %u silent blocks in mid-sound, timer resolution %.1f ms (frame %llu)\n",
+                seconds, rate, h.dry, double(h.longestGap) * k, double(h.longestPump) * k, h.dropouts, TimerResolutionMs(), (unsigned long long)GpuFrameCount());
+        const bool loud = h.lastLoud;
+        h = Health{};
+        h.lastLoud = loud;
+        h.lastPump = began;
+        h.since = ended;
+    }
 
     // Signal measurements for checking the output without listening to it.
     double gChannelPeak[CHANNELS], gSumSquares = 0, gSumDelta = 0;
@@ -65,7 +119,9 @@ namespace
             Log("[audio] could not start output (0x%08lX); running silently on a timer\n", result);
             return false;
         }
-        Log("[audio] output started: stereo float 48kHz, device buffer %u samples\n", gBufferFrames);
+        REFERENCE_TIME devicePeriod = 0, shortestPeriod = 0;
+        gClient->GetDevicePeriod(&devicePeriod, &shortestPeriod);
+        Log("[audio] output started: stereo float 48kHz, device buffer %u samples, device period %.1f ms\n", gBufferFrames, double(devicePeriod) / 10000.0);
         return true;
     }
 
@@ -86,13 +142,17 @@ namespace
         AttachGuestThread(ctx);
         uint64_t stack = ctx.r1.u64;
         char mute[8];
-        if (GetEnvironmentVariableA("NIER_MUTE", mute, sizeof(mute))) Log("[audio] muted: running on a timer\n");
+        const bool muted = GetEnvironmentVariableA("NIER_MUTE", mute, sizeof(mute)) > 0;
+        gSilent = muted && (mute[0] == '2' || GetEnvironmentVariableA("NIER_SILENT_DEVICE", nullptr, 0) > 0);   // (the test scripts set NIER_MUTE=1 themselves)
+        if (muted && !gSilent) Log("[audio] muted: running on a timer\n");
         else gDeviceOk = OpenDevice();
+        if (gSilent && gDeviceOk) Log("[audio] muted, with the device running (it is given silence)\n");
 
         LARGE_INTEGER frequency, next, now;
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&next);
         const int64_t period = frequency.QuadPart * SAMPLES_PER_FRAME / SAMPLE_RATE;
+        int64_t lastPump = 0;
 
         while (true)
         {
@@ -108,11 +168,37 @@ namespace
                 }
                 if (queued + SAMPLES_PER_FRAME > TARGET_QUEUED)
                 {
-                    Sleep(1);
+                    ShortWait();
                     continue;
                 }
-                if (queued == 0 && gCallbacks.load() > 16) gUnderfed++;
+                // Blocks are asked of the game at an even pace, never several at once. When this
+                // thread wakes late (a Sleep(1) that lasts a 15.6 ms timer tick: seen in play
+                // 2026-11-21, 21 ms between blocks) the queue has gone down by three blocks, and
+                // filling it back up in one go asked the game for them within a millisecond: its
+                // streams had only so much ready, and blocks came back silent (about 15 a second:
+                // crackling, and music that ran slow). So no block sooner than three quarters of a
+                // block's length after the last (half, while the queue is low), and the waits are
+                // ShortWait's, which do not depend on the timer resolution.
+                {
+                    LARGE_INTEGER sinceLast;
+                    QueryPerformanceCounter(&sinceLast);
+                    const int64_t spacing = queued < SAMPLES_PER_FRAME * 3 ? period / 2 : period * 3 / 4;
+                    const int64_t remaining = lastPump ? lastPump + spacing - sinceLast.QuadPart : 0;
+                    if (remaining > 0)
+                    {
+                        if (remaining > frequency.QuadPart / 500) ShortWait();
+                        else SwitchToThread();
+                        continue;
+                    }
+                }
+                const bool dry = queued == 0 && gCallbacks.load() > 16;
+                if (dry) gUnderfed++;
+                LARGE_INTEGER began, ended;
+                QueryPerformanceCounter(&began);
+                lastPump = began.QuadPart;
                 Pump(ctx, stack);
+                QueryPerformanceCounter(&ended);
+                HealthAfterPump(began.QuadPart, ended.QuadPart, dry);
                 continue;
             }
 
@@ -125,7 +211,11 @@ namespace
                 if (remaining > frequency.QuadPart / 500) Sleep(1);
                 else SwitchToThread();
             }
+            LARGE_INTEGER began, ended;
+            QueryPerformanceCounter(&began);
             Pump(ctx, stack);
+            QueryPerformanceCounter(&ended);
+            HealthAfterPump(began.QuadPart, ended.QuadPart, false);
         }
     }
 
@@ -252,6 +342,13 @@ GUEST_IMPORT(XAudioSubmitRenderDriverFrame)
     const PcSettings& settings = Settings();
     const bool focused = PresenterHasFocus();
     const float target = (settings.muteInBackground && !focused) ? 0.0f : settings.masterVolume / 10.0f;
+    {
+        // A block of pure silence straight after one with sound in it: counted (gHealth).
+        bool loud = false;
+        for (uint32_t i = 0; i < SAMPLES_PER_FRAME && !loud; i++) loud = left[i] != 0.0f || right[i] != 0.0f;
+        if (!loud && gHealth.lastLoud) gHealth.dropouts++;
+        gHealth.lastLoud = loud;
+    }
     float out[SAMPLES_PER_FRAME * 2];
     double outSquares = 0, inSquares = 0;
     for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++)
@@ -286,7 +383,7 @@ GUEST_IMPORT(XAudioSubmitRenderDriverFrame)
         if (SUCCEEDED(gRender->GetBuffer(SAMPLES_PER_FRAME, &destination)))
         {
             memcpy(destination, out, sizeof(out));
-            gRender->ReleaseBuffer(SAMPLES_PER_FRAME, 0);
+            gRender->ReleaseBuffer(SAMPLES_PER_FRAME, gSilent ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
         }
     }
     ctx.r3.u64 = 0;

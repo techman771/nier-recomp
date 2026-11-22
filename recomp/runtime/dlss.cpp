@@ -1,4 +1,5 @@
 // NVIDIA DLSS through Streamline: see dlss.h.
+#include <windows.h>   // before guest.h, which wraps ExitProcess and TerminateProcess
 #include "dlss.h"
 #include "guest.h"
 

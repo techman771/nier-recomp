@@ -92,6 +92,12 @@ void SaveRootRemove(const std::string& name);
 bool SaveRootFind(const std::string& name, std::string& directory);
 
 void Log(const char* format, ...);
+// Log lines are written by a thread of their own (main.cpp). LogFlush writes what is still waiting,
+// and every way out of the process goes through it: ExitProcess and TerminateProcess are wrapped
+// here, so include this header after <windows.h>.
+void LogFlush();
+#define ExitProcess(code) (LogFlush(), ExitProcess(code))
+#define TerminateProcess(process, code) (LogFlush(), TerminateProcess(process, code))
 void RegisterGuestThread(PPCContext* ctx);
 void TraceImport(const char* name, PPCContext& ctx);
 void StubHit(const char* name, PPCContext& ctx);

@@ -3769,6 +3769,21 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                 QueryPerformanceCounter(&done);
                 gGpuDone[job.sequence & 7] = done.QuadPart;
             }
+            // NIER_SLOW_GPU_MS=<ms> (test runs): the GPU is taken to need that long for a frame,
+            // as a slower one does (the Steam Deck: about 8 at 60 fps), for the read-backs' timing.
+            static const int slowGpuMs = [] { char v[8]; return GetEnvironmentVariableA("NIER_SLOW_GPU_MS", v, sizeof(v)) ? atoi(v) : 0; }();
+            if (slowGpuMs > 0)
+            {
+                LARGE_INTEGER now, frequency;
+                QueryPerformanceFrequency(&frequency);
+                for (;;)
+                {
+                    QueryPerformanceCounter(&now);
+                    const int64_t left = gTraceHanded[job.sequence & 7] + frequency.QuadPart * slowGpuMs / 1000 - now.QuadPart;
+                    if (left <= 0) break;
+                    Sleep(left > frequency.QuadPart / 500 ? 1 : 0);
+                }
+            }
             DeliverWriteBacks(job.buffer.Get(), job.used, job.pendings, job.guestFrame);
             { std::lock_guard lock(gDeliveryMutex); gDeliveriesDone = job.number; }
             gDeliveryChanged.notify_all();
@@ -4655,6 +4670,10 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
             QueryPerformanceCounter(&perfWrittenBack);
             FrameOutOfHand();   // the game may hand over its next frame: it is recorded while this one is drawn
             WaitForSingleObjectEx(gFrameWait, 1000, TRUE);
+            // NIER_SLOW_PRESENT_MS=<ms> (test runs): Present is taken to block that long, as it
+            // does on the Steam Deck (about 12 ms of a 60 fps frame in its [perf] lines).
+            static const int slowPresentMs = [] { char v[8]; return GetEnvironmentVariableA("NIER_SLOW_PRESENT_MS", v, sizeof(v)) ? atoi(v) : 0; }();
+            if (slowPresentMs > 0) Sleep(DWORD(slowPresentMs));
             QueryPerformanceCounter(&perfSwapChain);
         }
         else
@@ -5086,6 +5105,23 @@ void RendererSubmitFrame(RendererFrame&& frame)
         gFrameQueue.push_back(std::move(frame));
     }
     gMailboxChanged.notify_one();
+    // Overlap: the game goes on to build its next frame only once the read-backs of the frame
+    // now on the GPU (the one before the frame just handed over) have reached it. The frame just
+    // handed over is recorded meanwhile, so nothing is lost; without this wait the game built a
+    // whole frame more while the GPU drew, and where the GPU takes most of a frame (the Steam
+    // Deck at 60 fps: about 8 ms) each measurement reached it three frames late instead of two:
+    // the exposure swung between dark and white in Facade (2026-11-21, the Deck's seq_f57984).
+    // NIER_READBACK_WAIT=0: as it was (for comparing).
+    if (gOverlap)
+    {
+        static const bool wait = [] { char v[8]; return !GetEnvironmentVariableA("NIER_READBACK_WAIT", v, sizeof(v)) || atoi(v) != 0; }();
+        if (wait)
+        {
+            std::unique_lock lock(gDeliveryMutex);
+            const uint64_t handed = gDeliveriesQueued;
+            gDeliveryChanged.wait_for(lock, std::chrono::milliseconds(100), [&] { return gDeliveriesDone >= handed || !gReady; });
+        }
+    }
 }
 
 int ShaderConstantEnd(const std::string& text, bool pixel)

@@ -2,6 +2,7 @@
 // did at the console's 30 frames a second. Mid-asm hooks (recomp/config/nier_hooks.toml).
 #include <windows.h>
 #include <cstring>
+#include <cmath>
 #include <unordered_map>
 #include "guest.h"
 
@@ -72,4 +73,41 @@ void FishingCameraTurn(PPCRegister& f29, PPCRegister& f30)
     const double share = double(GameStep()) * 30.0;
     f29.f64 *= share;
     f30.f64 *= share;
+}
+
+// Wind blowing hair and cloth too hard at high frame rates (Kaine's hair and clothes at 240 fps).
+// A character's update (sub_82205760) asks for the wind where it stands (sub_82347368) and gives
+// it to each of its chains (sub_82186448) before the chain is simulated (sub_82187030, which does
+// go by time): every link's velocity gets a push along the wind, the same push every frame
+// whatever the frame's length. So the push came eight times as often at 240 fps as at the
+// console's 30, and each one counted in full.
+// f26: the push's strength for this link (the chain's wind factor times the wind's speed);
+// r27: the chain, r30: the link's offset in the chain's array of links (+20, 64 bytes a link,
+// velocity at +16).
+// NIER_LOG_WIND=1 (test runs) logs, for every two seconds of game time, the pushes given and how
+// fast the links were moving: the figures should not depend on the frame rate.
+void ChainWindPush(PPCRegister& f26, PPCRegister& r27, PPCRegister& r30)
+{
+    const float step = GameStep();
+    if (!KeepFrameCounts() && step > 0.0f) f26.f64 *= double(step) * 30.0;
+
+    static const bool log = GetEnvironmentVariableA("NIER_LOG_WIND", nullptr, 0) > 0;
+    if (!log) return;
+    static double pushes = 0.0, speeds = 0.0, time = 0.0;
+    static uint32_t links = 0, firstChain = 0, firstLink = 0;
+    const uint32_t velocity = R32(r27.u32 + 20) + r30.u32 + 16;
+    float v[3];
+    for (int i = 0; i < 3; i++) { const uint32_t bits = R32(velocity + i * 4); memcpy(&v[i], &bits, 4); }
+    pushes += f26.f64;
+    speeds += sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+    links++;
+    // time goes by the first link seen: it comes round once a frame
+    if (!firstChain) { firstChain = r27.u32; firstLink = r30.u32; }
+    if (r27.u32 != firstChain || r30.u32 != firstLink) return;
+    time += step;
+    if (time < 2.0) return;
+    Log("[wind] %.2f s at %.0f fps: push %.5f a second for each link, links moving at %.5f on average (frame %llu)\n",
+        time, step > 0.0f ? 1.0 / step : 0.0, pushes / time / (links / (time / step)), speeds / links, (unsigned long long)GpuFrameCount());
+    pushes = speeds = time = 0.0;
+    links = 0; firstChain = 0;
 }
