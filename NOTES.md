@@ -2233,6 +2233,37 @@ muted its music. It now writes 0 to both (the title controls playback, as Xenia 
 - System load beside the frame rate counter (`NIER_SHOW_LOAD=1`, SampleLoad in renderer_d3d12.cpp): the
   system's CPU and GPU use and the game's RAM and VRAM, sampled twice a second.
 
+### Banners black on the Ally (AMD's Windows driver), 2026-11-25: fixed
+
+- The user's first session on the Ally with the 22 November package: in the Aerie the orange
+  banners were black, and smeared into streaks with FSR 3.1 or FSR 4 on (the user: it happens
+  "with fsr 3.1 too, and without upscaling"; not on the Steam Deck). Captures frame_f15775 and
+  frame_f24874 (copies in recomp\ally_logs\1125, never committed). Replayed on the PC (NVIDIA)
+  the same captures have orange banners; replayed on the Ally they are black, with no upscaler.
+- The banners are the draws with vs B878E81138C20777 / ps BCF41B24EB51D74A (two 13-vertex draws
+  a banner). Their pixel shader ends its specular term with the game's NaN guard: a division by
+  a constant that can be 0, then `x - x` (NaN where x is infinite or NaN) and a compare of that
+  with itself to choose between x and a constant. The translator wrote both as arithmetic marked
+  `precise`; AMD's Windows driver folds them all the same, the NaN reaches the colour, and a NaN
+  colour is black (and a temporal upscaler spreads it).
+- Fix (xenos_shader.cpp): both halves of the idiom are emitted as tests of the float's bits
+  (`asuint`), which cannot be folded. Checked: both captures replayed on the Ally have orange
+  banners; on the PC the Deck's frame_f13414 replays to the same file (541B6019304390B2) and
+  frame_f24874 to the same file as before the change. NOT yet seen in play on the Ally.
+- Other shaders with the same idiom get the same treatment; none was looked for by hand.
+- Testing on the Ally from the PC (scripts in recomp\ally_logs\tools, copies on the Ally in
+  recomp\): a replay needs a display, which an SSH session there does not have (swap chain
+  0x887A0022). `ally_run.ps1 -Capture <file>` registers a one-off scheduled task that runs
+  `ally_replay.ps1` in the logged-in session, waits and removes the task; switches go in
+  recomp\ally_extra.txt as NAME=value lines; the picture is recomp\frames\f40.ppm. `probe.sh
+  <label> [<NAME=value>...]` does all of it from Git Bash and fetches the picture. Patches and
+  debug expressions use `r[N]` (a patch written with `r0` matches nothing, silently).
+- Wrong turns: FSR 4 was blamed first (it only spread the black); bisecting draws by `-Skip`
+  ranges with an "orange pixels" count pointed at ps 97E2554800B94422, whose draws are not the
+  banners. Painting a candidate shader magenta (NIER_PS_DEBUG) is the reliable test.
+- Also from that session's log: FSR 4.1.2 at 1080p with Shadows High ran at 38-48 fps there
+  (its pass 3.5-8 ms), FSR 1 from 720p held 60.
+
 ## Steam Deck (LCD, AMD Van Gogh) through Proton, first run 2026-11-18
 
 What it took to run (Proton Experimental):

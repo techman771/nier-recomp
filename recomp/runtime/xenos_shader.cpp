@@ -358,11 +358,21 @@ float3 CubeDirection(float3 c)
             else
             {
                 // The game's NaN test is x - x (an add of a value and its negation) followed by a
-                // compare of the result with itself. Both are marked `precise`, or the compiler and
-                // the driver may fold them to 0 and "equal" and the NaN gets through.
+                // compare of the result with itself. Written as arithmetic, a compiler or a driver may
+                // fold them to 0 and "equal" and the NaN gets through: `precise` stopped FXC and
+                // NVIDIA's driver doing it but not AMD's on Windows (Radeon 890M, 2026-11-25: the
+                // Aerie's banners came out black, and smeared by a temporal upscaler). So both are
+                // written as tests of the bits, which nothing may fold: x - x is NaN where x is
+                // infinite or NaN and 0 elsewhere, and x == x is false only for a NaN.
                 const std::string a = Source(1, w), b = Source(2, w);
-                const bool nanTest = (vectorOp == 0 && (a == "(-" + b + ")" || b == "(-" + a + ")")) || (vectorOp == 4 && a == b);
-                body += std::string("        ") + (nanTest ? "precise " : "") + "float4 v_ = " + VectorExpression(vectorOp, a, b, Source(3, w)) + ";\n";
+                const bool nanSubtract = vectorOp == 0 && (a == "(-" + b + ")" || b == "(-" + a + ")");
+                const bool nanCompare = vectorOp == 4 && a == b;
+                if (nanSubtract)
+                    body += "        float4 v_ = asfloat(((asuint(" + (a.size() < b.size() ? a : b) + ") & 0x7F800000u) == 0x7F800000u) ? (uint4)0x7FC00000u : (uint4)0u);\n";
+                else if (nanCompare)
+                    body += "        float4 v_ = float4((asuint(" + a + ") & 0x7FFFFFFFu) <= 0x7F800000u);\n";
+                else
+                    body += "        float4 v_ = " + VectorExpression(vectorOp, a, b, Source(3, w)) + ";\n";
             }
             scalarAfter.clear();
             body += "        float s_ = " + ScalarExpression(scalarOp, w) + ";\n";
