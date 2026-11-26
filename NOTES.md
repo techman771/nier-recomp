@@ -1065,8 +1065,10 @@ without FSR 3 it is the same, so it is in the recorded constants and not the ups
     The desert replay at 240 fps: 1 late 58% / 2 late 42% without, 79% / 21% with, 240.0 fps
     both ways. With only NIER_SLOW_GPU_MS the PC shows 1 late either way (the game's own 60 fps
     wait hides it), so both switches are needed to imitate the Deck.
-  - NOT shown: that the swing is gone on the Deck. The PC never showed it in Facade, so only
-    the Deck can tell. If it remains, log the read-backs there (NIER_LOG_WRITEBACK=1 in the
+  - The user on the Deck, 2026-11-22: "facade is better"; 2026-11-25: what is left "reflects
+    how it is on Xbox Series", which shows it too when the camera is aimed a certain way. So the
+    remaining swing in Facade is the game's own and is left alone.
+  - (Before that check: the PC never showed it in Facade, so only the Deck could tell.) If it remains, log the read-backs there (NIER_LOG_WRITEBACK=1 in the
     launch options) before anything else.
 - `NIER_FPS_AT=<frame>,<index>` (test runs) sets the Frame Rate setting at a frame: the scripted
   route to a save is timed for 60 fps and does not arrive at 240.
@@ -1153,7 +1155,8 @@ Kaine's hair (18 November 2026): not a bug. Her hair streaming sideways while sh
 game's wind (the user's correction); nothing was changed for it.
 
 Wind too strong on hair and cloth at high frame rates (21 November 2026): fixed (hook
-ChainWindPush), awaiting the user's check at 240 fps.
+ChainWindPush). Confirmed by the user 2026-11-25: "wind and hair physics are good" (so the
+per-frame blend at chain+52 noted below needs no work).
 - The user after a two-hour playtest: "the wind at 240fps is blowing quicker which is causing
   the issues in Kaine's hair and cloth physics". So the 17 November report (strands standing
   straight out in cutscenes) was the same thing.
@@ -2249,7 +2252,8 @@ muted its music. It now writes 0 to both (the title controls playback, as Xenia 
 - Fix (xenos_shader.cpp): both halves of the idiom are emitted as tests of the float's bits
   (`asuint`), which cannot be folded. Checked: both captures replayed on the Ally have orange
   banners; on the PC the Deck's frame_f13414 replays to the same file (541B6019304390B2) and
-  frame_f24874 to the same file as before the change. NOT yet seen in play on the Ally.
+  frame_f24874 to the same file as before the change. Confirmed in play by the user
+  2026-11-25 ("black banners are fixed").
 - Other shaders with the same idiom get the same treatment; none was looked for by hand.
 - Testing on the Ally from the PC (scripts in recomp\ally_logs\tools, copies on the Ally in
   recomp\): a replay needs a display, which an SSH session there does not have (swap chain
@@ -2852,3 +2856,14 @@ Tied to this GPU layer rather than to the game:
 Not reusable: the fixes themselves and anything keyed to NieR's objects or script tables. The
 method is: watch the memory that goes wrong, take the call chain, find the per-frame assumption,
 hook it and scale it by the time step.
+
+## Shelved by the user, 2026-11-25
+
+- Late frames (the 25-60 ms frames at 60 fps on the Deck, the late-session 70 ms hitches and
+  the stall clusters on the PC): shelved "for now since performance has been rock solid
+  otherwise". Not to be worked on until the user brings them back.
+- DLSS at 4K falling under 240 fps at times: not a concern for now (performance on the 4090
+  "in general ... is great").
+- The charge attack's flame missing in the Aerie on the Ally: a false alarm (it shows in the
+  village); recordings seq_f5407 and seq_f9218 in recomp/ally_logs/1125b.
+- Still shelved from before: the mouse pointer in menus.
