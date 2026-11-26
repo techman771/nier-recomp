@@ -380,6 +380,15 @@ float4 PSCopy(Interpolated input) : SV_Target { return source.Sample(linearClamp
     constexpr UINT64 kKeptBytes = 160ull * 1024 * 1024;   // vertex bytes that stay on the GPU (KeptVertices)
     ComPtr<ID3D12Resource> gKept;
     uint8_t* gKeptCpu = nullptr;
+    // The kept bytes live in the graphics card's own memory (a default heap), filled by copies from
+    // the arena. They were in an upload heap, which is system memory: a card in a slot reads that
+    // quickly, but one on a Thunderbolt or USB4 cable fetched every vertex it drew across the
+    // cable each frame (17 to 30 MB; an RTX 3080 Ti in a dock took 10 ms for a scene whatever
+    // the resolution). A buffer goes back to the common state when a command list has run, so
+    // the state starts there in each list.
+    bool gKeptLocal = false;
+    constexpr D3D12_RESOURCE_STATES kKeptRead = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_RESOURCE_STATES gKeptState = D3D12_RESOURCE_STATE_COMMON;
     ComPtr<ID3DBlob> gRectBlob;
     uint8_t* gArenaCpu = nullptr;
     UINT64 gArenaOffset = 0;
@@ -535,8 +544,14 @@ float PSMain(float4 position : SV_Position) : SV_Target
             if (!gOtherArena) return false;
             gOtherArena->Map(0, nullptr, (void**)&gOtherArenaCpu);
         }
-        gKept = MakeBuffer(kKeptBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (gKept) gKept->Map(0, nullptr, (void**)&gKeptCpu);
+        // In the card's own memory unless NIER_KEPT_IN_SYSTEM_MEMORY=1 (how it was until 2026-11-26).
+        gKeptLocal = GetEnvironmentVariableA("NIER_KEPT_IN_SYSTEM_MEMORY", nullptr, 0) == 0;
+        if (gKeptLocal) gKept = MakeBuffer(kKeptBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        else
+        {
+            gKept = MakeBuffer(kKeptBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (gKept) gKept->Map(0, nullptr, (void**)&gKeptCpu);
+        }
 
         ComPtr<ID3DBlob> shaderErrors;
         if (FAILED(D3DCompile(kRectGeometry, sizeof(kRectGeometry) - 1, "rect", nullptr, nullptr, "main", "gs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &gRectBlob, &shaderErrors)))
@@ -1327,11 +1342,24 @@ float PSMain(float4 position : SV_Position) : SV_Target
     std::unordered_map<const uint8_t*, KeptUpload> gKeptUploads;
     uint64_t gVertexBytesCopied = 0, gVertexBytesKept = 0;   // since the last [perf] line
 
+    void KeptTransition(D3D12_RESOURCE_STATES wanted)
+    {
+        if (!gKeptLocal || gKeptState == wanted) return;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = gKept.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = gKeptState;
+        barrier.Transition.StateAfter = wanted;
+        gList->ResourceBarrier(1, &barrier);
+        gKeptState = wanted;
+    }
+
     // (Index lists shared with earlier frames are kept the same way: RendererDraw::indicesKept.)
     bool KeptBytes(const uint8_t* bytes, size_t size, const std::shared_ptr<void>& owner, ArenaBlock& block, uint64_t& copied)
     {
         static const bool off = GetEnvironmentVariableA("NIER_NO_KEPT_VERTICES", nullptr, 0) > 0;
-        if (off || !gKeptCpu) return false;
+        if (off || !gKept) return false;
         auto found = gKeptUploads.find(bytes);
         // (The address alone is no identity: once the owner has gone it can be handed out again.)
         if (found != gKeptUploads.end() && found->second.size == size && found->second.owner.lock() == owner)
@@ -1342,8 +1370,15 @@ float PSMain(float4 position : SV_Position) : SV_Target
         const UINT64 begin = (gKeptOffset + 15) & ~15ull;
         if (begin + size > kKeptBytes) { gKeptResetWanted = true; return false; }
         gKeptOffset = begin + size;
-        block = { gKeptCpu + begin, gKept->GetGPUVirtualAddress() + begin, begin };
-        memcpy(block.cpu, bytes, size);
+        block = { gKeptLocal ? nullptr : gKeptCpu + begin, gKept->GetGPUVirtualAddress() + begin, begin };
+        if (gKeptLocal)
+        {
+            const ArenaBlock staged = ArenaAlloc(size, 16);
+            memcpy(staged.cpu, bytes, size);
+            KeptTransition(D3D12_RESOURCE_STATE_COPY_DEST);
+            gList->CopyBufferRegion(gKept.Get(), begin, gArena.Get(), staged.offset, size);
+        }
+        else memcpy(block.cpu, bytes, size);
         gKeptUploads[bytes] = { owner, size, block };
         copied += size;
         return true;
@@ -1531,6 +1566,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
         D3D12_INDEX_BUFFER_VIEW lastIndexView{};
         if (draw.indices.empty())
         {
+            KeptTransition(kKeptRead);
             gList->DrawInstanced(draw.vertexCount, 1, 0, 0);
         }
         else
@@ -1543,6 +1579,7 @@ float PSMain(float4 position : SV_Position) : SV_Target
                 gIndexBytesCopied += draw.indices.size() * 4;
             }
             D3D12_INDEX_BUFFER_VIEW view{ indices.gpu, UINT(draw.indices.size() * 4), DXGI_FORMAT_R32_UINT };
+            KeptTransition(kKeptRead);
             gList->IASetIndexBuffer(&view);
             gList->DrawIndexedInstanced(UINT(draw.indices.size()), 1, 0, 0, 0);
             lastIndexView = view;
@@ -3866,6 +3903,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
                     ID3D12CommandList* lists[] = { gList.Get() };
                     gQueue->ExecuteCommandLists(1, lists);
                     gList->Reset(gAllocator.Get(), nullptr);
+                    gKeptState = D3D12_RESOURCE_STATE_COMMON;
                     gList->SetDescriptorHeaps(2, heaps);
                     QueryPerformanceCounter(&submitted);
                 }
@@ -4497,6 +4535,7 @@ float2 PSMain(float4 position : SV_Position) : SV_Target
 
         gAllocator->Reset();
         gList->Reset(gAllocator.Get(), nullptr);
+        gKeptState = D3D12_RESOURCE_STATE_COMMON;
         StageBegin();
 
         if (movie)

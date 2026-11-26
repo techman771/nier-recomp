@@ -2857,6 +2857,21 @@ Not reusable: the fixes themselves and anything keyed to NieR's objects or scrip
 method is: watch the memory that goes wrong, take the call chain, find the per-frame assumption,
 hook it and scale it by the time step.
 
+### Slow on a graphics card in a dock (eGPU), 2026-11-26: kept geometry moved into the card's memory
+
+The user's Ally with an RTX 3080 Ti in a dock ran no faster than the Ally's own Radeon, and changing the
+resolution or the upscaler made no difference: the scene took 7 to 10 ms from 720p to 4K. A replay of one
+captured frame there showed the copies cost nothing and the 629 draws cost all of it.
+
+The cause: the vertex and index bytes kept between frames (KeptVertices) were in an upload heap, which is
+system memory. A card in a slot reads that fast; one on a Thunderbolt/USB4 cable fetched everything it drew
+across the cable every frame (17 to 30 MB a frame in play, about 2.3 GB/s). They are now in a default heap
+(the card's memory), filled by copies from the arena; `NIER_KEPT_IN_SYSTEM_MEMORY=1` is the old way.
+Replay of `frame_f24874` on the eGPU at 720p, with its geometry kept between frames as in play: scene 9.2 ms before, 3.9 ms after. Same picture on the PC, byte for byte.
+
+Not done: the per-frame arena (constants, 2 to 5 MB a frame, and geometry that changes) is still system
+memory, likely most of the 3.9 ms that is left there.
+
 ## Shelved by the user, 2026-11-25
 
 - Late frames (the 25-60 ms frames at 60 fps on the Deck, the late-session 70 ms hitches and
